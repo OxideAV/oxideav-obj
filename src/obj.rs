@@ -265,23 +265,49 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 }
             }
             "g" => {
-                let name: String = tokens.collect::<Vec<_>>().join(" ");
-                if name.is_empty() {
+                // The spec (Wavefront *Advanced Visualizer* Appendix B,
+                // §"Grouping") explicitly permits multiple group names
+                // on one line: `g group_name1 group_name2 …`. Each
+                // whitespace-separated token is its own group; the
+                // following elements belong to ALL listed groups.
+                let names: Vec<String> = tokens.map(|t| t.to_string()).collect();
+                if names.is_empty() {
                     continue;
                 }
                 let mesh = doc.meshes.last_mut().unwrap();
                 let prim = mesh.current_or_new();
-                if !prim.groups.iter().any(|g| g == &name) {
-                    prim.groups.push(name);
+                for name in names {
+                    if !prim.groups.iter().any(|g| g == &name) {
+                        prim.groups.push(name);
+                    }
                 }
             }
             "s" => {
+                // `s 0` and `s off` both mean "no smoothing"; preserve
+                // the operator's chosen spelling verbatim for round-trip.
                 let v: String = tokens.collect::<Vec<_>>().join(" ");
                 if v.is_empty() {
                     continue;
                 }
                 let mesh = doc.meshes.last_mut().unwrap();
-                mesh.current_or_new().smoothing_group = Some(v);
+                let last = mesh.current_or_new();
+                if last.elements.is_empty() {
+                    // No elements yet — overwrite the pending value.
+                    last.smoothing_group = Some(v);
+                } else if last.smoothing_group.as_deref() != Some(v.as_str()) {
+                    // Smoothing changed mid-stream; spec says it's
+                    // state-setting and applies to subsequent
+                    // elements, so split into a new primitive that
+                    // inherits the current material + groups.
+                    let mat = last.material.clone();
+                    let groups = last.groups.clone();
+                    mesh.primitives.push(PrimAccum {
+                        material: mat,
+                        smoothing_group: Some(v),
+                        groups,
+                        elements: Vec::new(),
+                    });
+                }
             }
             "usemtl" => {
                 let name: String = tokens.collect::<Vec<_>>().join(" ");
@@ -570,6 +596,36 @@ pub fn parse_obj(text: &str) -> Result<Scene3D> {
     parse_obj_with_resolver(text, |_path| Ok(Vec::new()))
 }
 
+/// Parse an OBJ document at `path`, resolving `mtllib` references
+/// against the OBJ file's parent directory.
+///
+/// Convenience wrapper around [`parse_obj_with_resolver`] for the
+/// overwhelmingly common case of "I have a path, please load it and
+/// follow the MTL references". Each `mtllib foo.mtl` directive becomes
+/// a sibling-file read; missing libraries surface the underlying
+/// [`std::io::Error`] (wrapped in [`Error::invalid`]) rather than
+/// silently dropping. If you want lenient missing-MTL handling, use
+/// [`parse_obj_with_resolver`] directly.
+pub fn parse_obj_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<Scene3D> {
+    let path = path.as_ref();
+    let bytes =
+        std::fs::read(path).map_err(|e| Error::invalid(format!("OBJ read {path:?}: {e}")))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| Error::invalid(format!("OBJ {path:?} contained non-UTF-8 bytes")))?;
+    let parent = path.parent().map(std::path::Path::to_path_buf);
+    parse_obj_with_resolver(text, |libname| {
+        // Empty / absolute / parent-relative library names are honoured
+        // verbatim; bare names are resolved against the OBJ's parent
+        // directory.
+        let lib_path = match &parent {
+            Some(dir) => dir.join(libname),
+            None => std::path::PathBuf::from(libname),
+        };
+        std::fs::read(&lib_path)
+            .map_err(|e| Error::invalid(format!("mtllib read {lib_path:?}: {e}")))
+    })
+}
+
 /// Parse an OBJ document, calling `resolve` once per `mtllib` entry to
 /// fetch the bytes of the named material library. Each library is
 /// parsed via [`parse_mtl`] and its materials merged into the resulting
@@ -604,12 +660,47 @@ where
     build_scene(doc)
 }
 
+/// Serialiser configuration. Keeps the public free-function signature
+/// stable while letting the [`crate::ObjEncoder`] thread richer options
+/// through.
+#[derive(Clone, Debug, Default)]
+pub struct SerializeOptions<'a> {
+    /// Reference an external MTL file via an `mtllib <basename>.mtl`
+    /// header line. Equivalent to the `mtl_basename` parameter on
+    /// [`serialize_obj`].
+    pub mtl_basename: Option<&'a str>,
+    /// When `true`, emit face/line vertex indices in the relative
+    /// negative-index form (`f -1 -2 -3`) instead of absolute 1-based.
+    /// Round-trips verbatim back through the parser; useful when the
+    /// caller wants their re-encoded OBJ to mirror an input that used
+    /// negative indices throughout.
+    pub negative_indices: bool,
+}
+
 /// Serialise a [`Scene3D`] to OBJ format.
 ///
 /// `mtl_basename`, when supplied, emits an `mtllib <basename>.mtl`
 /// directive at the top so a sibling MTL file (written separately via
 /// [`crate::mtl::serialize_mtl`]) is referenced.
 pub fn serialize_obj(scene: &Scene3D, mtl_basename: Option<&str>) -> Result<Vec<u8>> {
+    serialize_obj_with_options(
+        scene,
+        &SerializeOptions {
+            mtl_basename,
+            ..SerializeOptions::default()
+        },
+    )
+}
+
+/// Serialise a [`Scene3D`] to OBJ format with explicit options.
+///
+/// See [`SerializeOptions`] for the supported knobs.
+pub fn serialize_obj_with_options(
+    scene: &Scene3D,
+    options: &SerializeOptions<'_>,
+) -> Result<Vec<u8>> {
+    let mtl_basename = options.mtl_basename;
+    let negative = options.negative_indices;
     use std::fmt::Write;
     let mut out = String::new();
     writeln!(out, "# OBJ generated by oxideav-obj").unwrap();
@@ -813,7 +904,17 @@ pub fn serialize_obj(scene: &Scene3D, mtl_basename: Option<&str>) -> Result<Vec<
                             }
                             tri_pos += n_tris;
 
-                            write_face(&mut out, &verts, prim_globals, has_uv, has_normal);
+                            write_face(
+                                &mut out,
+                                &verts,
+                                prim_globals,
+                                has_uv,
+                                has_normal,
+                                negative,
+                                positions.len() as u32,
+                                texcoords.len() as u32,
+                                normals.len() as u32,
+                            );
                         }
                         // Any leftover triangles after the recorded arities
                         // (e.g. a primitive grew after the arity vector was
@@ -828,7 +929,17 @@ pub fn serialize_obj(scene: &Scene3D, mtl_basename: Option<&str>) -> Result<Vec<
                                 face_indices[tri * 3 + 1],
                                 face_indices[tri * 3 + 2],
                             ];
-                            write_face(&mut out, &verts, prim_globals, has_uv, has_normal);
+                            write_face(
+                                &mut out,
+                                &verts,
+                                prim_globals,
+                                has_uv,
+                                has_normal,
+                                negative,
+                                positions.len() as u32,
+                                texcoords.len() as u32,
+                                normals.len() as u32,
+                            );
                         }
                     } else {
                         for tri in 0..(face_indices.len() / 3) {
@@ -837,7 +948,17 @@ pub fn serialize_obj(scene: &Scene3D, mtl_basename: Option<&str>) -> Result<Vec<
                                 face_indices[tri * 3 + 1],
                                 face_indices[tri * 3 + 2],
                             ];
-                            write_face(&mut out, &verts, prim_globals, has_uv, has_normal);
+                            write_face(
+                                &mut out,
+                                &verts,
+                                prim_globals,
+                                has_uv,
+                                has_normal,
+                                negative,
+                                positions.len() as u32,
+                                texcoords.len() as u32,
+                                normals.len() as u32,
+                            );
                         }
                     }
                 }
@@ -847,10 +968,13 @@ pub fn serialize_obj(scene: &Scene3D, mtl_basename: Option<&str>) -> Result<Vec<
                         Some(Indices::U32(v)) => v.clone(),
                         None => (0..prim.positions.len() as u32).collect(),
                     };
+                    let total_v = positions.len() as u32;
                     for w in line_indices.chunks_exact(2) {
                         let a = prim_globals[w[0] as usize];
                         let b = prim_globals[w[1] as usize];
-                        writeln!(out, "l {} {}", a.0, b.0).unwrap();
+                        let av = fmt_index(a.0, total_v, negative);
+                        let bv = fmt_index(b.0, total_v, negative);
+                        writeln!(out, "l {av} {bv}").unwrap();
                     }
                 }
                 other => {
@@ -865,25 +989,48 @@ pub fn serialize_obj(scene: &Scene3D, mtl_basename: Option<&str>) -> Result<Vec<
     Ok(out.into_bytes())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_face(
     out: &mut String,
     verts: &[u32],
     prim_globals: &[(u32, u32, u32)],
     has_uv: bool,
     has_normal: bool,
+    negative: bool,
+    total_v: u32,
+    total_vt: u32,
+    total_vn: u32,
 ) {
     use std::fmt::Write;
     out.push('f');
     for &local in verts {
         let (v, vt, vn) = prim_globals[local as usize];
+        let v_s = fmt_index(v, total_v, negative);
+        let vt_s = fmt_index(vt, total_vt, negative);
+        let vn_s = fmt_index(vn, total_vn, negative);
         match (has_uv, has_normal) {
-            (true, true) => write!(out, " {v}/{vt}/{vn}").unwrap(),
-            (true, false) => write!(out, " {v}/{vt}").unwrap(),
-            (false, true) => write!(out, " {v}//{vn}").unwrap(),
-            (false, false) => write!(out, " {v}").unwrap(),
+            (true, true) => write!(out, " {v_s}/{vt_s}/{vn_s}").unwrap(),
+            (true, false) => write!(out, " {v_s}/{vt_s}").unwrap(),
+            (false, true) => write!(out, " {v_s}//{vn_s}").unwrap(),
+            (false, false) => write!(out, " {v_s}").unwrap(),
         }
     }
     out.push('\n');
+}
+
+/// Render a 1-based positive index as either its absolute form
+/// (`5`) or a negative-from-end form (`-3`, when `total = 7`).
+/// `idx == 0` means "no index" — we always emit `0` regardless of
+/// the negative flag so the parser still treats it as absent.
+fn fmt_index(idx: u32, total: u32, negative: bool) -> String {
+    if idx == 0 || !negative {
+        idx.to_string()
+    } else {
+        // total = 7, idx = 5  ⇒  -3  (i.e. "third from the end").
+        // Parser computes: resolved = total + 1 + raw  ⇒  raw = idx - total - 1.
+        let raw = (idx as i64) - (total as i64) - 1;
+        raw.to_string()
+    }
 }
 
 /// Format a float without scientific notation; trims trailing zeros

@@ -24,6 +24,7 @@ use crate::{mtl, obj};
 #[derive(Debug, Default)]
 pub struct ObjEncoder {
     mtl_basename: Option<String>,
+    negative_indices: bool,
 }
 
 impl ObjEncoder {
@@ -38,11 +39,27 @@ impl ObjEncoder {
         self.mtl_basename = Some(basename.into());
         self
     }
+
+    /// Emit face/line vertex indices in the relative negative-index
+    /// form (`f -3 -2 -1`) instead of the default absolute 1-based
+    /// form. Useful when the consumer wants to mirror an input that
+    /// originally used negative indices, since the parser accepts
+    /// both forms but loses the original spelling.
+    pub fn with_negative_indices(mut self, on: bool) -> Self {
+        self.negative_indices = on;
+        self
+    }
 }
 
 impl Mesh3DEncoder for ObjEncoder {
     fn encode(&mut self, scene: &Scene3D) -> Result<Vec<u8>> {
-        obj::serialize_obj(scene, self.mtl_basename.as_deref())
+        obj::serialize_obj_with_options(
+            scene,
+            &obj::SerializeOptions {
+                mtl_basename: self.mtl_basename.as_deref(),
+                negative_indices: self.negative_indices,
+            },
+        )
     }
 }
 

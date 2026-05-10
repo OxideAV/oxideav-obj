@@ -19,8 +19,12 @@ modern loaders actually load):
 - `l` line elements → `Topology::Lines`.
 - `o <name>` → one `Mesh` per object directive (or a single mesh if the
   file has no `o`).
-- `g <name>` → group-name capture in `Primitive::extras["obj:groups"]`.
-- `s` smoothing groups → `Primitive::extras["obj:smoothing_group"]`.
+- `g name1 name2 …` → multiple group names per line, captured in
+  `Primitive::extras["obj:groups"]` and re-emitted on a single `g` line.
+- `s 1` / `s off` / `s 0` smoothing groups → preserved verbatim in
+  `Primitive::extras["obj:smoothing_group"]`; a smoothing-group change
+  mid-object splits the primitive so each one carries a single
+  consistent assignment.
 - `mtllib <file.mtl> [<file2.mtl> …]` and `usemtl <name>` — each
   `usemtl` switch starts a fresh `Primitive` so a multi-material OBJ
   becomes a `Mesh` with N primitives, each with its own `MaterialId`.
@@ -33,6 +37,10 @@ The companion **MTL** parser/serialiser handles:
 - Transparency (`d` dissolve / `Tr = 1 - d`) → `AlphaMode::Blend`
   + `base_color.a`.
 - Index of refraction (`Ni`) and illumination model (`illum`) → extras.
+- Transmission filter (`Tf r g b`, with `g`/`b` defaulting to `r`),
+  reflection sharpness (`sharpness`), and displacement / decal /
+  reflection maps (`disp` ↔ `map_disp`, `decal` ↔ `map_decal`,
+  `refl` ↔ `map_refl`) round-trip via extras.
 - Texture references (`map_Kd` → `base_color_texture`,
   `map_Bump` → `normal_texture`, `map_d` etc.) emitted as
   `ImageData::External { uri, mime: None }` — the caller resolves
@@ -45,6 +53,13 @@ Both decoders are registered against `Mesh3DRegistry` under the
 default-on `registry` cargo feature; drop the feature for a free-standing
 build that only exposes `ObjDecoder` / `ObjEncoder` and the
 `oxideav_mesh3d` standalone trait surface.
+
+For path-based loading, `obj::parse_obj_from_path` resolves
+`mtllib foo.mtl` references against the OBJ file's parent directory
+(handles multiple MTL files per line). For round-trip mirroring of
+inputs that used negative-from-end indices, the encoder accepts
+`ObjEncoder::new().with_negative_indices(true)` (or the same flag on
+`obj::SerializeOptions`).
 
 ## Sourcing
 
@@ -63,14 +78,18 @@ OBJLoader) was consulted.
 
 ## Status
 
-Round 1 (this commit): polygonal subset + MTL Phong + Wavefront-PBR
-extension. Free-form curves/surfaces (`curv`, `surf`, `parm`, `trim`,
-`hole`, `scrv`, `sp`, `end`), the `vp` parameter-space vertex, the
-`p` point element, the `mg` merging-group, the `bevel` /
-`c_interp` / `d_interp` / `lod` display attributes, and the `.mod`
-binary form are not implemented. Files using only those features will
-decode to an empty scene; files that mix them with polygonal data will
-decode the polygonal part and ignore the rest.
+Round 1: polygonal subset + MTL Phong + Wavefront-PBR extension.
+Round 2: multi-name `g` lines, smoothing-group state-setting (split-on-
+change), `Tf` / `sharpness` / displacement-map round-trip, path-based
+loader with `mtllib` resolution, and an opt-in negative-index encoder.
+
+Free-form curves/surfaces (`curv`, `surf`, `parm`, `trim`, `hole`,
+`scrv`, `sp`, `end`), the `vp` parameter-space vertex, the `p` point
+element, the `mg` merging-group, the `bevel` / `c_interp` / `d_interp`
+/ `lod` display attributes, and the `.mod` binary form remain
+unimplemented. Files using only those features decode to an empty
+scene; files that mix them with polygonal data decode the polygonal
+part and ignore the rest.
 
 ## License
 

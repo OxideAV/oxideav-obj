@@ -14,9 +14,10 @@
 //!   format itself (`v` / `vt` / `vn` / `f` / `l` / `o` / `g` / `s` /
 //!   `usemtl` / `mtllib`).
 //! * [`mtl`] — line-oriented parser and serialiser for the material
-//!   library (`newmtl` / `Ka` / `Kd` / `Ks` / `Ns` / `Ni` / `d` /
-//!   `Tr` / `illum` / `map_*` and the Wavefront-PBR extension
-//!   `Pr` / `Pm` / `Pc` / `Ps` / `map_Pr` / `map_Pm`).
+//!   library (`newmtl` / `Ka` / `Kd` / `Ks` / `Ke` / `Ns` / `Ni` /
+//!   `d` / `Tr` / `Tf` / `sharpness` / `illum` / `map_*` and the
+//!   Wavefront-PBR extension `Pr` / `Pm` / `Pc` / `Ps` / `map_Pr` /
+//!   `map_Pm`).
 //! * [`decoder`] — [`ObjDecoder`] type wired to the
 //!   [`Mesh3DDecoder`](oxideav_mesh3d::Mesh3DDecoder) trait.
 //! * [`encoder`] — [`ObjEncoder`] type wired to the

@@ -9,7 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Initial scaffold: Wavefront OBJ + companion MTL parser/serialiser implementing
+- Multi-name `g` lines: `g name1 name2 …` captures every name as a
+  distinct group entry in `Primitive::extras["obj:groups"]` and the
+  encoder re-emits them on a single `g` line.
+- Smoothing-group state-setting: a mid-object `s` change splits the
+  current primitive so each `Primitive` carries a single
+  `obj:smoothing_group` value; `s 0` and `s off` are preserved verbatim
+  through the round-trip.
+- MTL `Tf r g b` (transmission filter, with `g` / `b` defaulting to
+  `r`) and `sharpness <value>` directives parse into
+  `Material::extras` and re-emit on serialisation.
+- MTL `disp` ↔ `map_disp`, `decal` ↔ `map_decal`, and `refl` ↔
+  `map_refl` keyword aliases land in extras with the original
+  spelling preserved as the key.
+- `obj::parse_obj_from_path` convenience loader resolves `mtllib`
+  references (single or multi-file per line) against the OBJ's parent
+  directory; missing libraries surface a clean `Error::invalid` with
+  the offending path.
+- `ObjEncoder::with_negative_indices(true)` (and the underlying
+  `obj::SerializeOptions::negative_indices`) emit face / line vertex
+  indices in relative-from-end form (`f -3 -2 -1`) for round-trip
+  parity with inputs that used negative indices.
+
+### Initial scaffold
+
+- Wavefront OBJ + companion MTL parser/serialiser implementing
   `oxideav_mesh3d::Mesh3DDecoder` / `Mesh3DEncoder` traits.
 - OBJ decoder: `v` / `vt` / `vn` vertex data, `f` faces (1-based + negative
   indices, all four `v` / `v/vt` / `v//vn` / `v/vt/vn` syntaxes), `l` lines,

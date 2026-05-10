@@ -249,10 +249,31 @@ fn apply_directive(
             mat.emissive_factor = [v[0], v[1], v[2]];
         }
         "Tf" => {
-            // Transmission filter — preserved as-is in extras.
+            // Transmission filter — preserved as an `[r,g,b]` array in
+            // extras (we don't model it as a first-class field; PBR
+            // transmission is its own KHR extension on the glTF side).
+            // Per MTL spec §"Tf r g b", g and b default to r when
+            // omitted; we eagerly normalise to a 3-tuple so the
+            // round-trip emits a canonical line.
             let v = parse_floats(tokens.by_ref(), keyword)?;
+            if v.is_empty() {
+                return Err(Error::invalid("Tf: needs at least 1 float"));
+            }
+            let r = v[0];
+            let g = v.get(1).copied().unwrap_or(r);
+            let b = v.get(2).copied().unwrap_or(r);
             mat.extras
-                .insert("mtl:Tf".to_string(), serde_json::to_value(&v).unwrap());
+                .insert("mtl:Tf".to_string(), serde_json::json!([r, g, b]));
+        }
+        "sharpness" => {
+            // Reflection-map sharpness; spec range 0..1000, default 60.
+            let v: f32 = tokens
+                .next()
+                .ok_or_else(|| Error::invalid("sharpness: missing value"))?
+                .parse()
+                .map_err(|e| Error::invalid(format!("sharpness: bad float ({e})")))?;
+            mat.extras
+                .insert("mtl:sharpness".to_string(), serde_json::json!(v));
         }
         "Ns" => {
             let v: f32 = tokens
@@ -382,8 +403,12 @@ fn apply_directive(
             mat.extras
                 .insert(format!("mtl:{keyword}"), serde_json::Value::String(s));
         }
-        "map_Ka" | "map_Ks" | "map_Ns" | "map_d" | "disp" | "decal" | "refl" => {
+        "map_Ka" | "map_Ks" | "map_Ns" | "map_d" | "disp" | "map_disp" | "decal" | "map_decal"
+        | "refl" | "map_refl" => {
             // Less-PBR-friendly maps preserved in extras for round-trip.
+            // Both the bare (`disp`, `decal`, `refl`) and `map_*`
+            // variants are accepted; the original spelling is kept as
+            // the extras key so the encoder re-emits the same form.
             let s = map_filename(tokens);
             mat.extras
                 .insert(format!("mtl:{keyword}"), serde_json::Value::String(s));
@@ -472,6 +497,23 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
         if let Some(v) = mat.extras.get("mtl:Ni").and_then(|v| v.as_f64()) {
             writeln!(out, "Ni {}", fmt_f(v as f32)).unwrap();
         }
+        // Tf transmission filter (RGB triple).
+        if let Some(serde_json::Value::Array(v)) = mat.extras.get("mtl:Tf") {
+            if let [a, b, c] = v.as_slice() {
+                writeln!(
+                    out,
+                    "Tf {} {} {}",
+                    fmt_f(a.as_f64().unwrap_or(0.0) as f32),
+                    fmt_f(b.as_f64().unwrap_or(0.0) as f32),
+                    fmt_f(c.as_f64().unwrap_or(0.0) as f32)
+                )
+                .unwrap();
+            }
+        }
+        // sharpness — scalar, MTL spec §"sharpness value".
+        if let Some(v) = mat.extras.get("mtl:sharpness").and_then(|v| v.as_f64()) {
+            writeln!(out, "sharpness {}", fmt_f(v as f32)).unwrap();
+        }
         if mat.base_color[3] < 1.0 || matches!(mat.alpha_mode, AlphaMode::Blend) {
             writeln!(out, "d {}", fmt_f(mat.base_color[3])).unwrap();
         }
@@ -518,6 +560,8 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
                 | "mtl:illum"
                 | "mtl:Pc"
                 | "mtl:Ps"
+                | "mtl:Tf"
+                | "mtl:sharpness"
                 | "mtl:displaced_pbr_map" => continue,
                 _ => {}
             }
