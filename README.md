@@ -16,7 +16,9 @@ modern loaders actually load):
   shorthand. Polygons (n-gons) are fan-triangulated on read; the original
   per-face arity is stashed in `Mesh::extras["obj:original_face_arities"]`
   so the encoder can re-emit n-gons rather than triangles.
-- `l` line elements → `Topology::Lines`.
+- `l` line elements → `Topology::Lines`. The encoder rejoins
+  contiguous segment pairs back into one polyline `l v1 v2 v3 …`
+  rather than emitting one `l v1 v2` per pair.
 - `p` point elements → `Topology::Points`. Multi-vertex `p v1 v2 v3 …`
   lines pack onto one element list; mixing point and face/line elements
   under one `usemtl` splits into one primitive per topology.

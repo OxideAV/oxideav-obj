@@ -1207,13 +1207,40 @@ pub fn serialize_obj_with_options(
                         None => (0..prim.positions.len() as u32).collect(),
                     };
                     let total_v = positions.len() as u32;
+                    // Walk segment pairs and join contiguous chains
+                    // (segment N's end == segment N+1's start) into
+                    // one polyline before emit. Saves bytes on the
+                    // common case of a long polyline that round-tripped
+                    // through `Topology::Lines` decomposition.
+                    let mut chain: Vec<u32> = Vec::new();
+                    let flush = |chain: &mut Vec<u32>, out: &mut String| {
+                        if chain.len() < 2 {
+                            chain.clear();
+                            return;
+                        }
+                        let parts: Vec<String> = chain
+                            .iter()
+                            .map(|&local| {
+                                fmt_index(prim_globals[local as usize].0, total_v, negative)
+                            })
+                            .collect();
+                        writeln!(out, "l {}", parts.join(" ")).unwrap();
+                        chain.clear();
+                    };
                     for w in line_indices.chunks_exact(2) {
-                        let a = prim_globals[w[0] as usize];
-                        let b = prim_globals[w[1] as usize];
-                        let av = fmt_index(a.0, total_v, negative);
-                        let bv = fmt_index(b.0, total_v, negative);
-                        writeln!(out, "l {av} {bv}").unwrap();
+                        let (a, b) = (w[0], w[1]);
+                        if chain.is_empty() {
+                            chain.push(a);
+                            chain.push(b);
+                        } else if *chain.last().unwrap() == a {
+                            chain.push(b);
+                        } else {
+                            flush(&mut chain, &mut out);
+                            chain.push(a);
+                            chain.push(b);
+                        }
                     }
+                    flush(&mut chain, &mut out);
                 }
                 Topology::Points => {
                     let pt_indices: Vec<u32> = match &prim.indices {

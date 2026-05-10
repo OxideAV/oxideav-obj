@@ -34,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MTL `d -halo factor` orientation-dependent dissolve is detected on
   parse, surfaced via `Material::extras["mtl:d_halo_factor"]`, and
   re-emitted as `d -halo <factor>` rather than the plain `d` form.
+- Encoder rejoins contiguous `Topology::Lines` segment pairs into a
+  single polyline `l v1 v2 v3 …` line whenever segment N's end index
+  equals segment N+1's start index, rather than emitting one
+  `l v1 v2` per pair (lossless for the typical decode→encode round
+  trip of polyline-heavy OBJ inputs).
 - Multi-name `g` lines: `g name1 name2 …` captures every name as a
   distinct group entry in `Primitive::extras["obj:groups"]` and the
   encoder re-emits them on a single `g` line.
