@@ -11,8 +11,8 @@
 //! # Modules
 //!
 //! * [`obj`] — line-oriented parser and serialiser for the geometry
-//!   format itself (`v` / `vt` / `vn` / `f` / `l` / `o` / `g` / `s` /
-//!   `usemtl` / `mtllib`).
+//!   format itself (`v` / `vt` / `vn` / `f` / `l` / `p` / `o` / `g` /
+//!   `s` / `mg` / `usemtl` / `mtllib`).
 //! * [`mtl`] — line-oriented parser and serialiser for the material
 //!   library (`newmtl` / `Ka` / `Kd` / `Ks` / `Ke` / `Ns` / `Ni` /
 //!   `d` / `Tr` / `Tf` / `sharpness` / `illum` / `map_*` and the

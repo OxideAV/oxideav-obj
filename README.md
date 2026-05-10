@@ -17,6 +17,12 @@ modern loaders actually load):
   per-face arity is stashed in `Mesh::extras["obj:original_face_arities"]`
   so the encoder can re-emit n-gons rather than triangles.
 - `l` line elements → `Topology::Lines`.
+- `p` point elements → `Topology::Points`. Multi-vertex `p v1 v2 v3 …`
+  lines pack onto one element list; mixing point and face/line elements
+  under one `usemtl` splits into one primitive per topology.
+- `mg <group_number> [res]` merging-group state-setting → preserved
+  verbatim in `Primitive::extras["obj:merging_group"]`; a change
+  mid-stream splits the primitive (mirrors `s` behaviour).
 - `o <name>` → one `Mesh` per object directive (or a single mesh if the
   file has no `o`).
 - `g name1 name2 …` → multiple group names per line, captured in
@@ -84,12 +90,11 @@ change), `Tf` / `sharpness` / displacement-map round-trip, path-based
 loader with `mtllib` resolution, and an opt-in negative-index encoder.
 
 Free-form curves/surfaces (`curv`, `surf`, `parm`, `trim`, `hole`,
-`scrv`, `sp`, `end`), the `vp` parameter-space vertex, the `p` point
-element, the `mg` merging-group, the `bevel` / `c_interp` / `d_interp`
-/ `lod` display attributes, and the `.mod` binary form remain
-unimplemented. Files using only those features decode to an empty
-scene; files that mix them with polygonal data decode the polygonal
-part and ignore the rest.
+`scrv`, `sp`, `end`), the `vp` parameter-space vertex, the `bevel` /
+`c_interp` / `d_interp` / `lod` display attributes, and the `.mod`
+binary form remain unimplemented. Files using only those features
+decode to an empty scene; files that mix them with polygonal data
+decode the polygonal part and ignore the rest.
 
 ## License
 

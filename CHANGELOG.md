@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `p v1 v2 v3 …` point elements decode to a `Topology::Points`
+  primitive (multi-vertex `p` lines pack onto one element list);
+  mixing point and face/line elements under one `usemtl` splits into
+  one primitive per topology.
+- `mg <group_number> [res]` merging-group state-setting is preserved
+  verbatim in `Primitive::extras["obj:merging_group"]`; a change
+  mid-stream splits the primitive (mirrors `s` smoothing-group
+  behaviour). The encoder re-emits an `mg <token>` line ahead of the
+  affected elements.
 - Multi-name `g` lines: `g name1 name2 …` captures every name as a
   distinct group entry in `Primitive::extras["obj:groups"]` and the
   encoder re-emits them on a single `g` line.

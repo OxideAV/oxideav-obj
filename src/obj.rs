@@ -29,11 +29,16 @@ struct FaceVert {
     vn: u32,
 }
 
-/// One face-or-line element captured during the first parse pass.
+/// One face / line / point element captured during the first parse pass.
+///
+/// Different element kinds map to different [`Topology`] variants and
+/// can't share a single [`Primitive`]; the accumulator splits into
+/// fresh primitives whenever the kind changes.
 #[derive(Debug)]
 enum Element {
     Face(Vec<FaceVert>),
     Line(Vec<FaceVert>),
+    Point(Vec<FaceVert>),
 }
 
 /// One open primitive — accumulates face/line elements while a single
@@ -46,6 +51,10 @@ struct PrimAccum {
     smoothing_group: Option<String>,
     /// All distinct group names seen during this primitive.
     groups: Vec<String>,
+    /// Last seen merging-group token (`"off"` / `"0"` or `"<n> <res>"`).
+    /// Captured as a single state value rather than per-element since
+    /// `mg` is state-setting per spec §"mg group_number res".
+    merging_group: Option<String>,
 }
 
 /// One open mesh — accumulates primitives while a single `o <name>`
@@ -245,9 +254,81 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 mesh.current_or_new().elements.push(Element::Line(verts));
             }
             "p" => {
-                // Point element — not modelled (mesh3d Topology::Points
-                // exists but OBJ point usage is vanishingly rare).
-                // Silently skip.
+                // Point elements are state-incompatible with face/line
+                // primitives (different `Topology`); mirror the `usemtl`
+                // pattern and split into a fresh primitive whenever the
+                // current one already holds incompatible elements.
+                let n_pos = doc.positions.len() as i64;
+                let n_tex = doc.texcoords.len() as i64;
+                let n_norm = doc.normals.len() as i64;
+                // `p` only takes vertex references (no `/vt` or `//vn`),
+                // but parse_face_vertex degrades gracefully when the
+                // separators are absent.
+                let verts: Vec<FaceVert> = tokens
+                    .map(|t| parse_face_vertex(t, n_pos, n_tex, n_norm))
+                    .collect::<Result<Vec<_>>>()?;
+                if verts.is_empty() {
+                    return Err(Error::invalid("p: needs ≥1 vertex"));
+                }
+                let mesh = doc.meshes.last_mut().unwrap();
+                let prim = mesh.current_or_new();
+                if prim
+                    .elements
+                    .iter()
+                    .any(|e| !matches!(e, Element::Point(_)))
+                {
+                    // Mixed-kind elements aren't representable; open a
+                    // fresh primitive that inherits material + groups +
+                    // smoothing/merging state.
+                    let mat = prim.material.clone();
+                    let groups = prim.groups.clone();
+                    let smoothing = prim.smoothing_group.clone();
+                    let merging = prim.merging_group.clone();
+                    mesh.primitives.push(PrimAccum {
+                        material: mat,
+                        groups,
+                        smoothing_group: smoothing,
+                        merging_group: merging,
+                        elements: vec![Element::Point(verts)],
+                    });
+                } else {
+                    prim.elements.push(Element::Point(verts));
+                }
+            }
+            "mg" => {
+                // Merging group — `mg <group_number> [res]` or `mg off`
+                // / `mg 0`. Like `s`, it's state-setting; preserve the
+                // operator's spelling verbatim. The semantic value
+                // (smoothing across surface joins for free-form
+                // surfaces) is meaningless without the free-form
+                // surface support, but the round-trip preservation
+                // matters for tools that round-trip mesh data through
+                // us.
+                let v: String = tokens.collect::<Vec<_>>().join(" ");
+                if v.is_empty() {
+                    continue;
+                }
+                let mesh = doc.meshes.last_mut().unwrap();
+                let last = mesh.current_or_new();
+                if last.elements.is_empty() {
+                    // No elements yet — overwrite the pending value.
+                    last.merging_group = Some(v);
+                } else if last.merging_group.as_deref() != Some(v.as_str()) {
+                    // Merging-group changed mid-stream; split into a
+                    // fresh primitive so each one carries one
+                    // consistent assignment (mirrors smoothing-group
+                    // behaviour).
+                    let mat = last.material.clone();
+                    let groups = last.groups.clone();
+                    let smoothing = last.smoothing_group.clone();
+                    mesh.primitives.push(PrimAccum {
+                        material: mat,
+                        smoothing_group: smoothing,
+                        groups,
+                        merging_group: Some(v),
+                        elements: Vec::new(),
+                    });
+                }
             }
             "o" => {
                 let name: String = tokens.collect::<Vec<_>>().join(" ");
@@ -298,13 +379,16 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                     // Smoothing changed mid-stream; spec says it's
                     // state-setting and applies to subsequent
                     // elements, so split into a new primitive that
-                    // inherits the current material + groups.
+                    // inherits the current material + groups +
+                    // merging-group.
                     let mat = last.material.clone();
                     let groups = last.groups.clone();
+                    let merging = last.merging_group.clone();
                     mesh.primitives.push(PrimAccum {
                         material: mat,
                         smoothing_group: Some(v),
                         groups,
+                        merging_group: merging,
                         elements: Vec::new(),
                     });
                 }
@@ -450,25 +534,32 @@ fn build_primitive(
     let topology = match first {
         Some(Element::Face(_)) => Topology::Triangles,
         Some(Element::Line(_)) => Topology::Lines,
+        Some(Element::Point(_)) => Topology::Points,
         None => Topology::Triangles,
     };
     for elt in &prim_acc.elements {
         let ok = matches!(
             (&topology, elt),
-            (Topology::Triangles, Element::Face(_)) | (Topology::Lines, Element::Line(_))
+            (Topology::Triangles, Element::Face(_))
+                | (Topology::Lines, Element::Line(_))
+                | (Topology::Points, Element::Point(_))
         );
         if !ok {
             return Err(Error::unsupported(
-                "OBJ primitive mixes face and line elements under one usemtl",
+                "OBJ primitive mixes face / line / point elements under one usemtl",
             ));
         }
     }
 
     let has_uv = prim_acc.elements.iter().any(|elt| match elt {
-        Element::Face(verts) | Element::Line(verts) => verts.iter().any(|fv| fv.vt != 0),
+        Element::Face(verts) | Element::Line(verts) | Element::Point(verts) => {
+            verts.iter().any(|fv| fv.vt != 0)
+        }
     });
     let has_normal = prim_acc.elements.iter().any(|elt| match elt {
-        Element::Face(verts) | Element::Line(verts) => verts.iter().any(|fv| fv.vn != 0),
+        Element::Face(verts) | Element::Line(verts) | Element::Point(verts) => {
+            verts.iter().any(|fv| fv.vn != 0)
+        }
     });
 
     let mut prim = Primitive::new(topology);
@@ -545,6 +636,16 @@ fn build_primitive(
                     local_indices.push(w[1]);
                 }
             }
+            Element::Point(verts) => {
+                // Each `p` line can carry multiple vertex references;
+                // every reference becomes one element index for
+                // `Topology::Points`. Original arities aren't tracked
+                // since a re-emit can pack them on one line freely.
+                for &fv in verts {
+                    let idx = intern(fv, &mut prim, &mut indexer)?;
+                    local_indices.push(idx);
+                }
+            }
         }
     }
 
@@ -569,6 +670,12 @@ fn build_primitive(
     if let Some(s) = &prim_acc.smoothing_group {
         prim.extras.insert(
             "obj:smoothing_group".to_string(),
+            serde_json::Value::String(s.clone()),
+        );
+    }
+    if let Some(s) = &prim_acc.merging_group {
+        prim.extras.insert(
+            "obj:merging_group".to_string(),
             serde_json::Value::String(s.clone()),
         );
     }
@@ -847,6 +954,13 @@ pub fn serialize_obj_with_options(
             {
                 writeln!(out, "s {s}").unwrap();
             }
+            if let Some(s) = prim
+                .extras
+                .get("obj:merging_group")
+                .and_then(|v| v.as_str())
+            {
+                writeln!(out, "mg {s}").unwrap();
+            }
 
             // usemtl: prefer extras["obj:usemtl"] (loss-tolerant
             // round-trip name), fall back to the bound material's name.
@@ -975,6 +1089,27 @@ pub fn serialize_obj_with_options(
                         let av = fmt_index(a.0, total_v, negative);
                         let bv = fmt_index(b.0, total_v, negative);
                         writeln!(out, "l {av} {bv}").unwrap();
+                    }
+                }
+                Topology::Points => {
+                    let pt_indices: Vec<u32> = match &prim.indices {
+                        Some(Indices::U16(v)) => v.iter().map(|&x| x as u32).collect(),
+                        Some(Indices::U32(v)) => v.clone(),
+                        None => (0..prim.positions.len() as u32).collect(),
+                    };
+                    let total_v = positions.len() as u32;
+                    if !pt_indices.is_empty() {
+                        // Pack every reference onto a single `p` line —
+                        // the spec explicitly permits the multi-vertex
+                        // form (`p v1 v2 v3 …`) and it's what most
+                        // tools emit.
+                        let parts: Vec<String> = pt_indices
+                            .iter()
+                            .map(|&local| {
+                                fmt_index(prim_globals[local as usize].0, total_v, negative)
+                            })
+                            .collect();
+                        writeln!(out, "p {}", parts.join(" ")).unwrap();
                     }
                 }
                 other => {
