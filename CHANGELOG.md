@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mid-stream splits the primitive (mirrors `s` smoothing-group
   behaviour). The encoder re-emits an `mg <token>` line ahead of the
   affected elements.
+- Display-attribute state-setters `bevel on/off`, `c_interp on/off`,
+  `d_interp on/off`, and `lod <level>` are captured per-primitive in
+  `Primitive::extras["obj:bevel"]` / `["obj:c_interp"]` /
+  `["obj:d_interp"]` / `["obj:lod"]`. Mid-stream changes split the
+  primitive so each one carries one consistent assignment per
+  attribute.
 - Multi-name `g` lines: `g name1 name2 …` captures every name as a
   distinct group entry in `Primitive::extras["obj:groups"]` and the
   encoder re-emits them on a single `g` line.

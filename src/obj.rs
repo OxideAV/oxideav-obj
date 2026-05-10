@@ -55,6 +55,18 @@ struct PrimAccum {
     /// Captured as a single state value rather than per-element since
     /// `mg` is state-setting per spec §"mg group_number res".
     merging_group: Option<String>,
+    /// Display-attribute state — bevel-interpolation flag (`"on"` /
+    /// `"off"`). Spec §"bevel on/off" — state-setting; default off.
+    bevel: Option<String>,
+    /// Color-interpolation flag (`"on"` / `"off"`). Spec
+    /// §"c_interp on/off" — state-setting; default off.
+    c_interp: Option<String>,
+    /// Dissolve-interpolation flag (`"on"` / `"off"`). Spec
+    /// §"d_interp on/off" — state-setting; default off.
+    d_interp: Option<String>,
+    /// Level-of-detail integer (1..100, or 0 / absent for "all").
+    /// Spec §"lod level" — state-setting.
+    lod: Option<String>,
 }
 
 /// One open mesh — accumulates primitives while a single `o <name>`
@@ -279,20 +291,85 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 {
                     // Mixed-kind elements aren't representable; open a
                     // fresh primitive that inherits material + groups +
-                    // smoothing/merging state.
+                    // smoothing/merging/display-attr state.
                     let mat = prim.material.clone();
                     let groups = prim.groups.clone();
                     let smoothing = prim.smoothing_group.clone();
                     let merging = prim.merging_group.clone();
+                    let bevel = prim.bevel.clone();
+                    let c_interp = prim.c_interp.clone();
+                    let d_interp = prim.d_interp.clone();
+                    let lod = prim.lod.clone();
                     mesh.primitives.push(PrimAccum {
                         material: mat,
                         groups,
                         smoothing_group: smoothing,
                         merging_group: merging,
+                        bevel,
+                        c_interp,
+                        d_interp,
+                        lod,
                         elements: vec![Element::Point(verts)],
                     });
                 } else {
                     prim.elements.push(Element::Point(verts));
+                }
+            }
+            "bevel" | "c_interp" | "d_interp" | "lod" => {
+                // Display-attribute state-setting — `bevel on/off`,
+                // `c_interp on/off`, `d_interp on/off`, `lod <level>`.
+                // Captured per-primitive; a mid-stream change splits
+                // the primitive so each one carries one consistent
+                // value (mirrors `s`/`mg`).
+                let v: String = tokens.collect::<Vec<_>>().join(" ");
+                if v.is_empty() {
+                    continue;
+                }
+                let mesh = doc.meshes.last_mut().unwrap();
+                let last = mesh.current_or_new();
+                let current: Option<&str> = match keyword {
+                    "bevel" => last.bevel.as_deref(),
+                    "c_interp" => last.c_interp.as_deref(),
+                    "d_interp" => last.d_interp.as_deref(),
+                    "lod" => last.lod.as_deref(),
+                    _ => unreachable!(),
+                };
+                if last.elements.is_empty() {
+                    // Overwrite the pending value.
+                    match keyword {
+                        "bevel" => last.bevel = Some(v),
+                        "c_interp" => last.c_interp = Some(v),
+                        "d_interp" => last.d_interp = Some(v),
+                        "lod" => last.lod = Some(v),
+                        _ => unreachable!(),
+                    }
+                } else if current != Some(v.as_str()) {
+                    let mat = last.material.clone();
+                    let groups = last.groups.clone();
+                    let smoothing = last.smoothing_group.clone();
+                    let merging = last.merging_group.clone();
+                    let mut bevel = last.bevel.clone();
+                    let mut c_interp = last.c_interp.clone();
+                    let mut d_interp = last.d_interp.clone();
+                    let mut lod = last.lod.clone();
+                    match keyword {
+                        "bevel" => bevel = Some(v),
+                        "c_interp" => c_interp = Some(v),
+                        "d_interp" => d_interp = Some(v),
+                        "lod" => lod = Some(v),
+                        _ => unreachable!(),
+                    }
+                    mesh.primitives.push(PrimAccum {
+                        material: mat,
+                        smoothing_group: smoothing,
+                        merging_group: merging,
+                        groups,
+                        bevel,
+                        c_interp,
+                        d_interp,
+                        lod,
+                        elements: Vec::new(),
+                    });
                 }
             }
             "mg" => {
@@ -321,11 +398,19 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                     let mat = last.material.clone();
                     let groups = last.groups.clone();
                     let smoothing = last.smoothing_group.clone();
+                    let bevel = last.bevel.clone();
+                    let c_interp = last.c_interp.clone();
+                    let d_interp = last.d_interp.clone();
+                    let lod = last.lod.clone();
                     mesh.primitives.push(PrimAccum {
                         material: mat,
                         smoothing_group: smoothing,
                         groups,
                         merging_group: Some(v),
+                        bevel,
+                        c_interp,
+                        d_interp,
+                        lod,
                         elements: Vec::new(),
                     });
                 }
@@ -380,15 +465,23 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                     // state-setting and applies to subsequent
                     // elements, so split into a new primitive that
                     // inherits the current material + groups +
-                    // merging-group.
+                    // merging-group + display attributes.
                     let mat = last.material.clone();
                     let groups = last.groups.clone();
                     let merging = last.merging_group.clone();
+                    let bevel = last.bevel.clone();
+                    let c_interp = last.c_interp.clone();
+                    let d_interp = last.d_interp.clone();
+                    let lod = last.lod.clone();
                     mesh.primitives.push(PrimAccum {
                         material: mat,
                         smoothing_group: Some(v),
                         groups,
                         merging_group: merging,
+                        bevel,
+                        c_interp,
+                        d_interp,
+                        lod,
                         elements: Vec::new(),
                     });
                 }
@@ -679,6 +772,28 @@ fn build_primitive(
             serde_json::Value::String(s.clone()),
         );
     }
+    if let Some(s) = &prim_acc.bevel {
+        prim.extras.insert(
+            "obj:bevel".to_string(),
+            serde_json::Value::String(s.clone()),
+        );
+    }
+    if let Some(s) = &prim_acc.c_interp {
+        prim.extras.insert(
+            "obj:c_interp".to_string(),
+            serde_json::Value::String(s.clone()),
+        );
+    }
+    if let Some(s) = &prim_acc.d_interp {
+        prim.extras.insert(
+            "obj:d_interp".to_string(),
+            serde_json::Value::String(s.clone()),
+        );
+    }
+    if let Some(s) = &prim_acc.lod {
+        prim.extras
+            .insert("obj:lod".to_string(), serde_json::Value::String(s.clone()));
+    }
     if !prim_acc.groups.is_empty() {
         prim.extras.insert(
             "obj:groups".to_string(),
@@ -960,6 +1075,15 @@ pub fn serialize_obj_with_options(
                 .and_then(|v| v.as_str())
             {
                 writeln!(out, "mg {s}").unwrap();
+            }
+            // Display-attribute state-setters — emitted ahead of the
+            // elements they apply to. Order is fixed to keep round-trip
+            // diffs deterministic.
+            for keyword in ["bevel", "c_interp", "d_interp", "lod"] {
+                let key = format!("obj:{keyword}");
+                if let Some(s) = prim.extras.get(&key).and_then(|v| v.as_str()) {
+                    writeln!(out, "{keyword} {s}").unwrap();
+                }
             }
 
             // usemtl: prefer extras["obj:usemtl"] (loss-tolerant

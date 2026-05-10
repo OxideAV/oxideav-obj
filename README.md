@@ -23,6 +23,12 @@ modern loaders actually load):
 - `mg <group_number> [res]` merging-group state-setting → preserved
   verbatim in `Primitive::extras["obj:merging_group"]`; a change
   mid-stream splits the primitive (mirrors `s` behaviour).
+- `bevel on/off`, `c_interp on/off`, `d_interp on/off`, and
+  `lod <level>` display attributes → captured per-primitive in
+  `Primitive::extras["obj:bevel"]` / `["obj:c_interp"]` /
+  `["obj:d_interp"]` / `["obj:lod"]`. Mid-stream changes split the
+  primitive so each one carries one consistent assignment per
+  attribute.
 - `o <name>` → one `Mesh` per object directive (or a single mesh if the
   file has no `o`).
 - `g name1 name2 …` → multiple group names per line, captured in
@@ -90,8 +96,7 @@ change), `Tf` / `sharpness` / displacement-map round-trip, path-based
 loader with `mtllib` resolution, and an opt-in negative-index encoder.
 
 Free-form curves/surfaces (`curv`, `surf`, `parm`, `trim`, `hole`,
-`scrv`, `sp`, `end`), the `vp` parameter-space vertex, the `bevel` /
-`c_interp` / `d_interp` / `lod` display attributes, and the `.mod`
+`scrv`, `sp`, `end`), the `vp` parameter-space vertex, and the `.mod`
 binary form remain unimplemented. Files using only those features
 decode to an empty scene; files that mix them with polygonal data
 decode the polygonal part and ignore the rest.
