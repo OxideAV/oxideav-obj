@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.1](https://github.com/OxideAV/oxideav-obj/compare/v0.0.0...v0.0.1) - 2026-05-10
+
+### Other
+
+- Round 6: per-vertex colour extension + v 4th weight preservation
+- round-5 status — Tf alt forms, typed refl, line strip/loop
+- Round 5: refl -type sphere / cube_* typed reflection-map sets
+- Round 5: promote single-l polylines to LineStrip / LineLoop topology
+- Round 5: MTL Tf spectral / Tf xyz alternative forms
+- Round 4: free-form geometry directives round-trip via Scene3D::extras
+- Round 3: encoder rejoins polyline segment chains into one l line
+- Round 3: MTL map_* option flags + d -halo dissolve
+- Round 3: bevel / c_interp / d_interp / lod display attributes
+- Round 3: p point elements + mg merging-group state-setting
+- Round 2: multi-name groups, smoothing-group split, MTL extras, path loader, negative-index encoder
+
 ### Added
 
 - `v x y z r g b` per-vertex colour extension (MeshLab / libigl /
