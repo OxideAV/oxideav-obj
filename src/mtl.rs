@@ -474,12 +474,137 @@ fn apply_directive(
             mat.extras
                 .insert(format!("mtl:{keyword}"), serde_json::Value::String(s));
         }
-        "map_Ka" | "map_Ks" | "map_Ns" | "map_d" | "disp" | "map_disp" | "decal" | "map_decal"
-        | "refl" | "map_refl" => {
+        "refl" | "map_refl" => {
+            // Reflection-map statements per spec §"Reflection Map" come
+            // in three discriminated forms via the `-type` flag:
+            //
+            //   refl -type sphere -options -args filename
+            //   refl -type cube_top|cube_bottom|cube_front|cube_back|cube_left|cube_right ... filename
+            //
+            // (plus the legacy bare-`refl filename` form which we
+            // preserve under `mtl:refl` as before).
+            //
+            // Cube faces span SIX separate `refl` lines that together
+            // describe one cubemap; bundle them into a single
+            // `mtl:refl:cube` object keyed by face name so consumers
+            // see one cubemap declaration rather than six unrelated
+            // textures. Sphere lands as `mtl:refl:sphere = filename`.
+            //
+            // Per-line option flags (`-blendu`, `-mm`, …) attached to
+            // a typed reflection-map line live next to the filename in
+            // a `{file, options: [...]}` object so the round-trip is
+            // bit-stable.
+            let toks: Vec<&str> = tokens.collect();
+            let mut iter = toks.iter().copied().peekable();
+            // Pull a `-type <kind>` flag out of the option stream when
+            // it is the first option; bare-refl with no `-type` falls
+            // through to the legacy single-string form.
+            let mut refl_kind: Option<&'static str> = None;
+            if iter.peek() == Some(&"-type") {
+                let _ = iter.next();
+                if let Some(kind) = iter.next() {
+                    refl_kind = match kind {
+                        "sphere" => Some("sphere"),
+                        "cube_top" => Some("cube_top"),
+                        "cube_bottom" => Some("cube_bottom"),
+                        "cube_front" => Some("cube_front"),
+                        "cube_back" => Some("cube_back"),
+                        "cube_left" => Some("cube_left"),
+                        "cube_right" => Some("cube_right"),
+                        // Spec also lists the legacy `cube_side` keyword
+                        // as an alias-shape; surface it verbatim.
+                        "cube_side" => Some("cube_side"),
+                        _ => None,
+                    };
+                    if refl_kind.is_none() {
+                        // Unknown -type kind — preserve verbatim via
+                        // the legacy single-string slot below.
+                    }
+                }
+            }
+            // Re-collect the remaining tokens into a SplitWhitespace-
+            // shaped helper so `map_options_and_filename` can work over
+            // them without regressing the existing API.
+            let remaining: Vec<&str> = iter.collect();
+            let joined = remaining.join(" ");
+            let mut split = joined.split_whitespace();
+            let (opts, filename) = map_options_and_filename(&mut split);
+
+            match refl_kind {
+                Some(face) if face != "sphere" && face != "cube_side" => {
+                    // Cube face — fold into the per-material cubemap
+                    // bundle. Each face is a `{file, options}` object;
+                    // missing options arrays are omitted.
+                    let mut entry = serde_json::Map::new();
+                    entry.insert(
+                        "file".to_string(),
+                        serde_json::Value::String(filename.clone()),
+                    );
+                    if !opts.is_empty() {
+                        entry.insert(
+                            "options".to_string(),
+                            serde_json::Value::Array(
+                                opts.iter()
+                                    .map(|s| serde_json::Value::String(s.clone()))
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    let cube_key = "mtl:refl:cube".to_string();
+                    let cube_obj = match mat.extras.remove(&cube_key) {
+                        Some(serde_json::Value::Object(map)) => map,
+                        _ => serde_json::Map::new(),
+                    };
+                    let mut cube_obj = cube_obj;
+                    cube_obj.insert(face.to_string(), serde_json::Value::Object(entry));
+                    mat.extras
+                        .insert(cube_key, serde_json::Value::Object(cube_obj));
+                }
+                Some("sphere") => {
+                    let mut entry = serde_json::Map::new();
+                    entry.insert(
+                        "file".to_string(),
+                        serde_json::Value::String(filename.clone()),
+                    );
+                    if !opts.is_empty() {
+                        entry.insert(
+                            "options".to_string(),
+                            serde_json::Value::Array(
+                                opts.iter()
+                                    .map(|s| serde_json::Value::String(s.clone()))
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    mat.extras.insert(
+                        "mtl:refl:sphere".to_string(),
+                        serde_json::Value::Object(entry),
+                    );
+                }
+                _ => {
+                    // Bare `refl filename` (legacy) or unknown -type
+                    // kind — preserve via the original single-string
+                    // slot used in r3.
+                    if !opts.is_empty() {
+                        mat.extras.insert(
+                            format!("mtl:{keyword}:options"),
+                            serde_json::Value::Array(
+                                opts.into_iter().map(serde_json::Value::String).collect(),
+                            ),
+                        );
+                    }
+                    mat.extras.insert(
+                        format!("mtl:{keyword}"),
+                        serde_json::Value::String(filename),
+                    );
+                }
+            }
+        }
+        "map_Ka" | "map_Ks" | "map_Ns" | "map_d" | "disp" | "map_disp" | "decal" | "map_decal" => {
             // Less-PBR-friendly maps preserved in extras for round-trip.
-            // Both the bare (`disp`, `decal`, `refl`) and `map_*`
-            // variants are accepted; the original spelling is kept as
-            // the extras key so the encoder re-emits the same form.
+            // Both the bare (`disp`, `decal`) and `map_*` variants are
+            // accepted; the original spelling is kept as the extras key
+            // so the encoder re-emits the same form.
             let s = parse_map_with_options(keyword, tokens, &mut mat.extras);
             mat.extras
                 .insert(format!("mtl:{keyword}"), serde_json::Value::String(s));
@@ -750,6 +875,52 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
             &mat.extras,
         );
 
+        // Typed reflection-map sets per spec §"Reflection Map":
+        // `refl -type sphere file` and the six `refl -type cube_*`
+        // faces. Each face emits as its own line; option flags
+        // captured per-face are spliced ahead of the filename.
+        if let Some(serde_json::Value::Object(o)) = mat.extras.get("mtl:refl:sphere") {
+            let file = o.get("file").and_then(|v| v.as_str()).unwrap_or("");
+            let opts: Vec<&str> = o
+                .get("options")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
+                .unwrap_or_default();
+            if opts.is_empty() {
+                writeln!(out, "refl -type sphere {file}").unwrap();
+            } else {
+                writeln!(out, "refl -type sphere {} {file}", opts.join(" ")).unwrap();
+            }
+        }
+        if let Some(serde_json::Value::Object(faces)) = mat.extras.get("mtl:refl:cube") {
+            // Fixed face order — keeps the round-trip diff stable
+            // regardless of HashMap insertion order.
+            for face in [
+                "cube_top",
+                "cube_bottom",
+                "cube_front",
+                "cube_back",
+                "cube_left",
+                "cube_right",
+                "cube_side",
+            ] {
+                let Some(serde_json::Value::Object(entry)) = faces.get(face) else {
+                    continue;
+                };
+                let file = entry.get("file").and_then(|v| v.as_str()).unwrap_or("");
+                let opts: Vec<&str> = entry
+                    .get("options")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
+                    .unwrap_or_default();
+                if opts.is_empty() {
+                    writeln!(out, "refl -type {face} {file}").unwrap();
+                } else {
+                    writeln!(out, "refl -type {face} {} {file}", opts.join(" ")).unwrap();
+                }
+            }
+        }
+
         // Pass-through extras — `mtl:*` keys we didn't consume above.
         for (k, v) in &mat.extras {
             if !k.starts_with("mtl:") {
@@ -769,7 +940,9 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
                 | "mtl:Tf:xyz"
                 | "mtl:sharpness"
                 | "mtl:displaced_pbr_map"
-                | "mtl:d_halo_factor" => continue,
+                | "mtl:d_halo_factor"
+                | "mtl:refl:sphere"
+                | "mtl:refl:cube" => continue,
                 _ => {}
             }
             // `mtl:<map>:options` chunks are spliced inline by

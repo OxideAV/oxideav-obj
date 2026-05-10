@@ -82,6 +82,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MTL `disp` ↔ `map_disp`, `decal` ↔ `map_decal`, and `refl` ↔
   `map_refl` keyword aliases land in extras with the original
   spelling preserved as the key.
+- MTL `refl -type sphere` and `refl -type cube_*` typed reflection-
+  map sets land as structured extras: `mtl:refl:sphere = {file,
+  options?}` and `mtl:refl:cube = {cube_top, cube_bottom, cube_front,
+  cube_back, cube_left, cube_right, cube_side}` (each face an
+  optional `{file, options?}` entry). Six separate `cube_*` lines
+  bundle into one cubemap rather than overwriting each other under
+  the legacy single-string slot. The encoder re-emits one line per
+  face / sphere with options spliced ahead of the filename, in a
+  fixed face order so the round-trip diff is deterministic. The bare
+  legacy `refl filename` form still lands in `mtl:refl` for
+  backwards compatibility.
 - `obj::parse_obj_from_path` convenience loader resolves `mtllib`
   references (single or multi-file per line) against the OBJ's parent
   directory; missing libraries surface a clean `Error::invalid` with
