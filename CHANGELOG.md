@@ -54,6 +54,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   equals segment N+1's start index, rather than emitting one
   `l v1 v2` per pair (lossless for the typical decode→encode round
   trip of polyline-heavy OBJ inputs).
+- A primitive with exactly one `l` element promotes to the more
+  specific `Topology::LineStrip` (or `Topology::LineLoop` when the
+  last vertex equals the first) instead of `Topology::Lines`. The
+  encoder is symmetric: `LineStrip` emits the natural index list,
+  `LineLoop` re-appends the first index so the round-trip parser
+  re-detects the closure. Multi-`l` primitives and 2-vertex
+  segments stay on `Topology::Lines` so the existing
+  contiguous-chain re-emit path still applies.
 - Multi-name `g` lines: `g name1 name2 …` captures every name as a
   distinct group entry in `Primitive::extras["obj:groups"]` and the
   encoder re-emits them on a single `g` line.

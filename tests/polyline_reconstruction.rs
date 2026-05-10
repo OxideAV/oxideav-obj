@@ -31,10 +31,14 @@ l 1 2 3 4
     let toks: Vec<&str> = l_lines[0].split_whitespace().collect();
     assert_eq!(toks, vec!["l", "1", "2", "3", "4"]);
 
-    // Re-decode and verify the segment count is unchanged.
+    // Re-decode and verify the topology promoted to `LineStrip`
+    // (round-5 behaviour) — a single `l` element with 4 distinct
+    // vertices is the prototypical strip case. Index buffer is the
+    // raw vertex sequence (no segment-pair decomposition).
     let scene2 = ObjDecoder::new().decode(&bytes).unwrap();
     let prim2 = &scene2.meshes[0].primitives[0];
-    assert_eq!(prim2.indices.as_ref().unwrap().len(), 6); // 3 segments * 2 verts
+    assert_eq!(prim2.topology, oxideav_mesh3d::Topology::LineStrip);
+    assert_eq!(prim2.indices.as_ref().unwrap().len(), 4);
 }
 
 #[test]

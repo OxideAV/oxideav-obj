@@ -694,6 +694,36 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
     Ok(scene)
 }
 
+/// Promote a single-`l`-element primitive to `LineStrip` / `LineLoop`
+/// when applicable; fall back to `Lines` for multi-element or 2-vertex
+/// segments. See [`build_primitive`] for the surrounding context.
+fn single_line_topology(elements: &[Element]) -> Topology {
+    if elements.len() != 1 {
+        return Topology::Lines;
+    }
+    let Element::Line(verts) = &elements[0] else {
+        return Topology::Lines;
+    };
+    if verts.len() < 2 {
+        return Topology::Lines;
+    }
+    // A 2-vertex `l` is a plain segment — keep it on `Lines` so the
+    // round-trip stays minimal (one `l v1 v2` line either way).
+    if verts.len() == 2 {
+        return Topology::Lines;
+    }
+    // Closed polyline: first / last vertex coincide on the position
+    // index. We don't need to compare uv/normal — `l` references only
+    // ever populate the position component for the loop-detection
+    // semantics specified by the spec §"Line elements".
+    let same_start_end = verts.first().map(|fv| fv.v) == verts.last().map(|fv| fv.v);
+    if same_start_end {
+        Topology::LineLoop
+    } else {
+        Topology::LineStrip
+    }
+}
+
 /// Build one [`Primitive`] from an accumulated [`PrimAccum`].
 ///
 /// Returns the primitive plus a per-element arity vector — one entry
@@ -710,10 +740,23 @@ fn build_primitive(
     // Decide topology + attribute presence by looking at the first
     // element. Mixed-element primitives (lines + faces under one
     // `usemtl`) aren't representable in mesh3d so we error cleanly.
+    //
+    // For a single `l` element we promote to the more specific
+    // `LineStrip` / `LineLoop` topology so consumers don't have to
+    // reconstruct the polyline shape from disjoint segment pairs:
+    //
+    //   * exactly one `l` element with N ≥ 2 vertices whose last
+    //     vertex equals its first → `LineLoop` (the redundant
+    //     closing vertex is dropped from the index buffer).
+    //   * exactly one `l` element with N ≥ 2 distinct end vertices →
+    //     `LineStrip`.
+    //   * multiple `l` elements (or a single 2-vertex `l` that is a
+    //     plain segment) fall back to `Lines` for the existing
+    //     contiguous-chain re-emit path on the encoder side.
     let first = prim_acc.elements.first();
     let topology = match first {
         Some(Element::Face(_)) => Topology::Triangles,
-        Some(Element::Line(_)) => Topology::Lines,
+        Some(Element::Line(_)) => single_line_topology(&prim_acc.elements),
         Some(Element::Point(_)) => Topology::Points,
         None => Topology::Triangles,
     };
@@ -722,6 +765,8 @@ fn build_primitive(
             (&topology, elt),
             (Topology::Triangles, Element::Face(_))
                 | (Topology::Lines, Element::Line(_))
+                | (Topology::LineStrip, Element::Line(_))
+                | (Topology::LineLoop, Element::Line(_))
                 | (Topology::Points, Element::Point(_))
         );
         if !ok {
@@ -810,10 +855,26 @@ fn build_primitive(
                     .iter()
                     .map(|&fv| intern(fv, &mut prim, &mut indexer))
                     .collect::<Result<Vec<_>>>()?;
-                // Decompose polyline into Lines (pairs).
-                for w in resolved.windows(2) {
-                    local_indices.push(w[0]);
-                    local_indices.push(w[1]);
+                match topology {
+                    Topology::LineStrip => {
+                        // Emit the polyline as a contiguous index list.
+                        local_indices.extend_from_slice(&resolved);
+                    }
+                    Topology::LineLoop => {
+                        // Drop the redundant closing vertex; consumers
+                        // treat the strip as closed at draw time.
+                        let n = resolved.len().saturating_sub(1);
+                        local_indices.extend_from_slice(&resolved[..n]);
+                    }
+                    _ => {
+                        // Plain `Lines` — decompose polyline into
+                        // disjoint segment pairs (encoder rejoins
+                        // contiguous chains on the way out).
+                        for w in resolved.windows(2) {
+                            local_indices.push(w[0]);
+                            local_indices.push(w[1]);
+                        }
+                    }
                 }
             }
             Element::Point(verts) => {
@@ -1364,6 +1425,35 @@ pub fn serialize_obj_with_options(
                         }
                     }
                     flush(&mut chain, &mut out);
+                }
+                Topology::LineStrip | Topology::LineLoop => {
+                    // Reconstruct the strip's index list from whichever
+                    // backing storage the primitive carries; bare
+                    // positions imply implicit `0..N` indices. For
+                    // `LineLoop` we re-append the first index so the
+                    // emitted `l` line spells out the closing edge —
+                    // the parser then detects start == end and round-
+                    // trips back to `LineLoop`.
+                    let mut strip_indices: Vec<u32> = match &prim.indices {
+                        Some(Indices::U16(v)) => v.iter().map(|&x| x as u32).collect(),
+                        Some(Indices::U32(v)) => v.clone(),
+                        None => (0..prim.positions.len() as u32).collect(),
+                    };
+                    if matches!(prim.topology, Topology::LineLoop)
+                        && let Some(&first) = strip_indices.first()
+                    {
+                        strip_indices.push(first);
+                    }
+                    if strip_indices.len() >= 2 {
+                        let total_v = positions.len() as u32;
+                        let parts: Vec<String> = strip_indices
+                            .iter()
+                            .map(|&local| {
+                                fmt_index(prim_globals[local as usize].0, total_v, negative)
+                            })
+                            .collect();
+                        writeln!(out, "l {}", parts.join(" ")).unwrap();
+                    }
                 }
                 Topology::Points => {
                     let pt_indices: Vec<u32> = match &prim.indices {
