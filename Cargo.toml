@@ -1,0 +1,31 @@
+[package]
+name = "oxideav-obj"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["Mark Karpeles <admin@echelle.co.jp>"]
+description = "Pure-Rust Wavefront OBJ + MTL 3D mesh codec — implements oxideav-mesh3d's Decoder/Encoder traits"
+repository = "https://github.com/OxideAV/oxideav-obj"
+homepage = "https://github.com/OxideAV/oxideav-obj"
+readme = "README.md"
+keywords = ["obj", "wavefront", "3d", "mesh", "oxideav"]
+categories = ["multimedia::encoding", "rendering::data-formats"]
+
+[features]
+default = ["registry"]
+# Wires up `oxideav-core` and exposes the `register()` helper that
+# plugs the OBJ + MTL decoders/encoders into a `Mesh3DRegistry`.
+# Drop with `default-features = false` for a free-standing build that
+# only exposes `ObjDecoder` / `ObjEncoder` directly.
+registry = ["dep:oxideav-core", "oxideav-mesh3d/registry"]
+
+[dependencies]
+# Optional under the `registry` feature so consumers can use the
+# parser/encoder without pulling the framework dependency tree.
+oxideav-core = { version = "0.1", optional = true }
+# Always-on: the typed model + Decoder/Encoder traits.
+oxideav-mesh3d = { version = "0.0", default-features = false }
+# `extras: HashMap<String, serde_json::Value>` round-trips loss-tolerant
+# side-channel data (smoothing groups, illum, original face arities…).
+serde_json = "1"

@@ -1,0 +1,622 @@
+//! Wavefront MTL (material library) ASCII parser + serialiser.
+//!
+//! The grammar mirrors OBJ's: line-oriented, whitespace-separated,
+//! `#` introduces a comment to end of line. Each `newmtl <name>`
+//! opens a fresh material; subsequent lines populate the material's
+//! parameters until the next `newmtl` or end of file.
+//!
+//! This crate maps the Phong-Blinn vocabulary onto the glTF
+//! metallic-roughness model in [`Material`], preserving the original
+//! field values in [`Material::extras`] so a re-serialise reproduces
+//! the input. The Wavefront-PBR extension (`Pr`, `Pm`, `Pc`, `Ps`,
+//! `map_Pr`, `map_Pm`) lands directly in the corresponding PBR slots.
+
+use oxideav_mesh3d::{AlphaMode, Error, ImageData, Material, Result, Sampler, Texture, TextureRef};
+
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
+
+/// Pending texture references from the parser. We can't allocate a
+/// `TextureRef` at parse time because that needs a `TextureId` (only
+/// known once textures land in the [`Scene3D`](oxideav_mesh3d::Scene3D)).
+/// The OBJ→Scene3D path bridges this in
+/// [`merge_materials_into_scene`].
+#[derive(Debug, Default, Clone)]
+struct PendingTextures {
+    base_color: Option<String>,
+    normal: Option<String>,
+    metallic_roughness: Option<String>,
+    emissive: Option<String>,
+}
+
+/// Parsed material plus its yet-to-be-resolved texture URIs.
+#[derive(Debug, Clone)]
+struct ParsedMaterial {
+    material: Material,
+    pending: PendingTextures,
+}
+
+/// Parse an MTL document.
+///
+/// Returns one [`Material`] per `newmtl` block. Texture references
+/// are resolved lazily by [`merge_materials_into_scene`] (used by the
+/// OBJ decoder) — direct callers get materials with `*_texture` slots
+/// wired to fresh textures stored in the same returned vector via
+/// the `extras["mtl:pending_textures"]` side-channel; consumers
+/// integrating with a real `Scene3D` should use [`parse_mtl_with_scene`]
+/// instead.
+pub fn parse_mtl(text: &str) -> Result<Vec<Material>> {
+    let parsed = parse_mtl_internal(text)?;
+    let mut out: Vec<Material> = Vec::with_capacity(parsed.len());
+    for pm in parsed {
+        let mut mat = pm.material;
+        // Stash pending texture URIs in extras so a downstream pass
+        // can hoist them into a Scene3D's texture pool. Direct callers
+        // who want the URIs without a Scene3D can pull them from here.
+        let mut pending_obj = serde_json::Map::new();
+        if let Some(p) = pm.pending.base_color {
+            pending_obj.insert("base_color".into(), serde_json::Value::String(p));
+        }
+        if let Some(p) = pm.pending.normal {
+            pending_obj.insert("normal".into(), serde_json::Value::String(p));
+        }
+        if let Some(p) = pm.pending.metallic_roughness {
+            pending_obj.insert("metallic_roughness".into(), serde_json::Value::String(p));
+        }
+        if let Some(p) = pm.pending.emissive {
+            pending_obj.insert("emissive".into(), serde_json::Value::String(p));
+        }
+        if !pending_obj.is_empty() {
+            mat.extras.insert(
+                "mtl:pending_textures".to_string(),
+                serde_json::Value::Object(pending_obj),
+            );
+        }
+        out.push(mat);
+    }
+    Ok(out)
+}
+
+/// Hoist pending texture URIs into the supplied scene as
+/// [`Texture`]s and bind the result on each material via
+/// [`TextureRef`]. Materials are also added to the scene; returns the
+/// `MaterialId` for each input material in declaration order.
+///
+/// Provided as a convenience for `obj.rs` and direct MTL-decoder
+/// callers; symmetrical with the OBJ→Scene3D pipeline so reload of an
+/// MTL standalone produces the same in-scene structure as a full OBJ
+/// decode would.
+pub fn merge_materials_into_scene(
+    scene: &mut oxideav_mesh3d::Scene3D,
+    materials: Vec<Material>,
+) -> Vec<oxideav_mesh3d::MaterialId> {
+    let mut ids = Vec::with_capacity(materials.len());
+    for mut mat in materials {
+        // Resolve any `mtl:pending_textures` field into real Textures.
+        let pending = mat.extras.remove("mtl:pending_textures");
+        if let Some(serde_json::Value::Object(obj)) = pending {
+            for (slot, val) in obj {
+                let serde_json::Value::String(uri) = val else {
+                    continue;
+                };
+                let tex = Texture {
+                    name: Some(uri.clone()),
+                    image: ImageData::External {
+                        uri: uri.clone(),
+                        mime: None,
+                    },
+                    sampler: Sampler::default_sampler(),
+                };
+                let tex_id = scene.add_texture(tex);
+                let tex_ref = TextureRef::new(tex_id);
+                match slot.as_str() {
+                    "base_color" => mat.base_color_texture = Some(tex_ref),
+                    "normal" => mat.normal_texture = Some(tex_ref),
+                    "metallic_roughness" => mat.metallic_roughness_texture = Some(tex_ref),
+                    "emissive" => mat.emissive_texture = Some(tex_ref),
+                    _ => {}
+                }
+            }
+        }
+        ids.push(scene.add_material(mat));
+    }
+    ids
+}
+
+/// One-shot parse + scene-hoist for direct MTL-decoder callers.
+pub fn parse_mtl_with_scene(text: &str) -> Result<oxideav_mesh3d::Scene3D> {
+    let mut scene = oxideav_mesh3d::Scene3D::new();
+    let materials = parse_mtl(text)?;
+    let _ = merge_materials_into_scene(&mut scene, materials);
+    Ok(scene)
+}
+
+fn parse_mtl_internal(text: &str) -> Result<Vec<ParsedMaterial>> {
+    let mut out: Vec<ParsedMaterial> = Vec::new();
+    let mut current: Option<ParsedMaterial> = None;
+
+    fn strip_comment(line: &str) -> &str {
+        match line.find('#') {
+            Some(idx) => &line[..idx],
+            None => line,
+        }
+    }
+
+    for raw_line in text.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        let line = strip_comment(line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        let Some(keyword) = tokens.next() else {
+            continue;
+        };
+
+        match keyword {
+            "newmtl" => {
+                if let Some(prev) = current.take() {
+                    out.push(prev);
+                }
+                let name: String = tokens.collect::<Vec<_>>().join(" ");
+                let mut mat = Material::new();
+                // Spec primer says fallback to metallic=0/roughness=0.5 when
+                // PBR fields aren't present.
+                mat.metallic = 0.0;
+                mat.roughness = 0.5;
+                mat.name = Some(name);
+                current = Some(ParsedMaterial {
+                    material: mat,
+                    pending: PendingTextures::default(),
+                });
+            }
+            other => {
+                let Some(pm) = current.as_mut() else {
+                    return Err(Error::invalid(format!(
+                        "MTL: {other:?} appears before any newmtl directive"
+                    )));
+                };
+                apply_directive(other, &mut tokens, pm)?;
+            }
+        }
+    }
+
+    if let Some(last) = current.take() {
+        out.push(last);
+    }
+    Ok(out)
+}
+
+fn parse_floats<'a, I: Iterator<Item = &'a str>>(tokens: I, keyword: &str) -> Result<Vec<f32>> {
+    tokens
+        .map(str::parse::<f32>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::invalid(format!("MTL {keyword}: bad float ({e})")))
+}
+
+fn apply_directive(
+    keyword: &str,
+    tokens: &mut std::str::SplitWhitespace<'_>,
+    pm: &mut ParsedMaterial,
+) -> Result<()> {
+    let mat = &mut pm.material;
+    match keyword {
+        "Ka" => {
+            let v = parse_floats(tokens.by_ref(), keyword)?;
+            if v.len() < 3 {
+                return Err(Error::invalid(format!(
+                    "Ka: needs 3 floats, got {}",
+                    v.len()
+                )));
+            }
+            mat.extras
+                .insert("mtl:Ka".to_string(), serde_json::json!([v[0], v[1], v[2]]));
+        }
+        "Kd" => {
+            let v = parse_floats(tokens.by_ref(), keyword)?;
+            if v.len() < 3 {
+                return Err(Error::invalid(format!(
+                    "Kd: needs 3 floats, got {}",
+                    v.len()
+                )));
+            }
+            // Preserve the alpha channel that may have been set by an
+            // earlier `d` line so the assignment ordering matches the
+            // file (`d` typically follows `Kd`, but defensive).
+            let alpha = mat.base_color[3];
+            mat.base_color = [v[0], v[1], v[2], alpha];
+        }
+        "Ks" => {
+            let v = parse_floats(tokens.by_ref(), keyword)?;
+            if v.len() < 3 {
+                return Err(Error::invalid(format!(
+                    "Ks: needs 3 floats, got {}",
+                    v.len()
+                )));
+            }
+            mat.extras
+                .insert("mtl:Ks".to_string(), serde_json::json!([v[0], v[1], v[2]]));
+        }
+        "Ke" => {
+            let v = parse_floats(tokens.by_ref(), keyword)?;
+            if v.len() < 3 {
+                return Err(Error::invalid(format!(
+                    "Ke: needs 3 floats, got {}",
+                    v.len()
+                )));
+            }
+            mat.emissive_factor = [v[0], v[1], v[2]];
+        }
+        "Tf" => {
+            // Transmission filter — preserved as-is in extras.
+            let v = parse_floats(tokens.by_ref(), keyword)?;
+            mat.extras
+                .insert("mtl:Tf".to_string(), serde_json::to_value(&v).unwrap());
+        }
+        "Ns" => {
+            let v: f32 = tokens
+                .next()
+                .ok_or_else(|| Error::invalid("Ns: missing value"))?
+                .parse()
+                .map_err(|e| Error::invalid(format!("Ns: bad float ({e})")))?;
+            mat.extras
+                .insert("mtl:Ns".to_string(), serde_json::json!(v));
+        }
+        "Ni" => {
+            let v: f32 = tokens
+                .next()
+                .ok_or_else(|| Error::invalid("Ni: missing value"))?
+                .parse()
+                .map_err(|e| Error::invalid(format!("Ni: bad float ({e})")))?;
+            mat.extras
+                .insert("mtl:Ni".to_string(), serde_json::json!(v));
+        }
+        "d" => {
+            let v: f32 = tokens
+                .next()
+                .ok_or_else(|| Error::invalid("d: missing value"))?
+                .parse()
+                .map_err(|e| Error::invalid(format!("d: bad float ({e})")))?;
+            mat.base_color[3] = v;
+            if v < 1.0 {
+                mat.alpha_mode = AlphaMode::Blend;
+            }
+        }
+        "Tr" => {
+            // Tr = 1 - d (Wavefront alternate dissolve form).
+            let v: f32 = tokens
+                .next()
+                .ok_or_else(|| Error::invalid("Tr: missing value"))?
+                .parse()
+                .map_err(|e| Error::invalid(format!("Tr: bad float ({e})")))?;
+            let d = 1.0 - v;
+            mat.base_color[3] = d;
+            if d < 1.0 {
+                mat.alpha_mode = AlphaMode::Blend;
+            }
+        }
+        "illum" => {
+            let v: i32 = tokens
+                .next()
+                .ok_or_else(|| Error::invalid("illum: missing value"))?
+                .parse()
+                .map_err(|e| Error::invalid(format!("illum: bad integer ({e})")))?;
+            mat.extras
+                .insert("mtl:illum".to_string(), serde_json::json!(v));
+        }
+        "Pr" => {
+            let v: f32 = tokens
+                .next()
+                .ok_or_else(|| Error::invalid("Pr: missing value"))?
+                .parse()
+                .map_err(|e| Error::invalid(format!("Pr: bad float ({e})")))?;
+            mat.roughness = v;
+        }
+        "Pm" => {
+            let v: f32 = tokens
+                .next()
+                .ok_or_else(|| Error::invalid("Pm: missing value"))?
+                .parse()
+                .map_err(|e| Error::invalid(format!("Pm: bad float ({e})")))?;
+            mat.metallic = v;
+        }
+        "Pc" => {
+            let v: f32 = tokens
+                .next()
+                .ok_or_else(|| Error::invalid("Pc: missing value"))?
+                .parse()
+                .map_err(|e| Error::invalid(format!("Pc: bad float ({e})")))?;
+            mat.extras
+                .insert("mtl:Pc".to_string(), serde_json::json!(v));
+        }
+        "Pcr" => {
+            let v: f32 = tokens
+                .next()
+                .ok_or_else(|| Error::invalid("Pcr: missing value"))?
+                .parse()
+                .map_err(|e| Error::invalid(format!("Pcr: bad float ({e})")))?;
+            mat.extras
+                .insert("mtl:Pcr".to_string(), serde_json::json!(v));
+        }
+        "Ps" => {
+            let v: f32 = tokens
+                .next()
+                .ok_or_else(|| Error::invalid("Ps: missing value"))?
+                .parse()
+                .map_err(|e| Error::invalid(format!("Ps: bad float ({e})")))?;
+            mat.extras
+                .insert("mtl:Ps".to_string(), serde_json::json!(v));
+        }
+        "aniso" | "anisor" => {
+            let v: f32 = tokens
+                .next()
+                .ok_or_else(|| Error::invalid(format!("{keyword}: missing value")))?
+                .parse()
+                .map_err(|e| Error::invalid(format!("{keyword}: bad float ({e})")))?;
+            mat.extras
+                .insert(format!("mtl:{keyword}"), serde_json::json!(v));
+        }
+        "map_Kd" => {
+            pm.pending.base_color = Some(map_filename(tokens));
+        }
+        "map_Bump" | "map_bump" | "bump" | "norm" => {
+            pm.pending.normal = Some(map_filename(tokens));
+        }
+        "map_Ke" => {
+            pm.pending.emissive = Some(map_filename(tokens));
+        }
+        "map_Pr" | "map_Pm" => {
+            // Either of the two PBR maps lands in metallic_roughness — the
+            // glTF channel-packing convention is B = metallic, G = roughness.
+            // We can't fuse two file references into one packed texture
+            // without decoding pixels, so the last-seen wins; the other
+            // is stashed in extras for round-trip.
+            let s = map_filename(tokens);
+            if let Some(prev) = pm.pending.metallic_roughness.replace(s.clone()) {
+                mat.extras.insert(
+                    "mtl:displaced_pbr_map".to_string(),
+                    serde_json::Value::String(prev),
+                );
+            }
+            mat.extras
+                .insert(format!("mtl:{keyword}"), serde_json::Value::String(s));
+        }
+        "map_Ka" | "map_Ks" | "map_Ns" | "map_d" | "disp" | "decal" | "refl" => {
+            // Less-PBR-friendly maps preserved in extras for round-trip.
+            let s = map_filename(tokens);
+            mat.extras
+                .insert(format!("mtl:{keyword}"), serde_json::Value::String(s));
+        }
+        // Unknown directives are silently skipped (lenient-loader convention).
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Concatenate the remaining tokens. `map_*` directives technically
+/// allow leading option tokens (`-blendu`, `-mm 0.0 1.0`, etc.); for
+/// round 1 we treat the whole tail as the filename and rely on extras
+/// preservation in callers that need it. Filenames with spaces are
+/// handled by the join.
+fn map_filename(tokens: &mut std::str::SplitWhitespace<'_>) -> String {
+    tokens.collect::<Vec<_>>().join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// Serialisation
+// ---------------------------------------------------------------------------
+
+/// Serialise a slice of materials to MTL format.
+///
+/// Texture references are emitted via the `External { uri, .. }`
+/// variant — the URI is written verbatim. Embedded / Source textures
+/// are skipped (no on-disk path to point at); a one-line comment
+/// identifies the gap so the file is round-trip-able under the same
+/// invariants as the decoder.
+pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec<u8>> {
+    use std::fmt::Write;
+    let mut out = String::new();
+    writeln!(out, "# MTL generated by oxideav-obj").unwrap();
+
+    for (i, mat) in materials.iter().enumerate() {
+        let name = mat.name.clone().unwrap_or_else(|| format!("material_{i}"));
+        writeln!(out, "newmtl {name}").unwrap();
+
+        if let Some(serde_json::Value::Array(v)) = mat.extras.get("mtl:Ka") {
+            if let [a, b, c] = v.as_slice() {
+                writeln!(
+                    out,
+                    "Ka {} {} {}",
+                    fmt_f(a.as_f64().unwrap_or(0.0) as f32),
+                    fmt_f(b.as_f64().unwrap_or(0.0) as f32),
+                    fmt_f(c.as_f64().unwrap_or(0.0) as f32)
+                )
+                .unwrap();
+            }
+        }
+        // Always emit Kd (it's the canonical glTF base color → MTL Phong diffuse).
+        writeln!(
+            out,
+            "Kd {} {} {}",
+            fmt_f(mat.base_color[0]),
+            fmt_f(mat.base_color[1]),
+            fmt_f(mat.base_color[2])
+        )
+        .unwrap();
+        if let Some(serde_json::Value::Array(v)) = mat.extras.get("mtl:Ks") {
+            if let [a, b, c] = v.as_slice() {
+                writeln!(
+                    out,
+                    "Ks {} {} {}",
+                    fmt_f(a.as_f64().unwrap_or(0.0) as f32),
+                    fmt_f(b.as_f64().unwrap_or(0.0) as f32),
+                    fmt_f(c.as_f64().unwrap_or(0.0) as f32)
+                )
+                .unwrap();
+            }
+        }
+        if mat.emissive_factor != [0.0, 0.0, 0.0] {
+            writeln!(
+                out,
+                "Ke {} {} {}",
+                fmt_f(mat.emissive_factor[0]),
+                fmt_f(mat.emissive_factor[1]),
+                fmt_f(mat.emissive_factor[2])
+            )
+            .unwrap();
+        }
+        if let Some(v) = mat.extras.get("mtl:Ns").and_then(|v| v.as_f64()) {
+            writeln!(out, "Ns {}", fmt_f(v as f32)).unwrap();
+        }
+        if let Some(v) = mat.extras.get("mtl:Ni").and_then(|v| v.as_f64()) {
+            writeln!(out, "Ni {}", fmt_f(v as f32)).unwrap();
+        }
+        if mat.base_color[3] < 1.0 || matches!(mat.alpha_mode, AlphaMode::Blend) {
+            writeln!(out, "d {}", fmt_f(mat.base_color[3])).unwrap();
+        }
+        if let Some(v) = mat.extras.get("mtl:illum").and_then(|v| v.as_i64()) {
+            writeln!(out, "illum {v}").unwrap();
+        }
+        // PBR fields — only emit when the user actually carries PBR values.
+        // The mesh3d default is metallic=1.0 / roughness=1.0; our parser
+        // resets those to 0 / 0.5 when constructing from MTL, so any
+        // non-default value is taken to indicate "PBR is in use".
+        let pbr_in_use = mat.metallic != 0.0
+            || (mat.roughness - 0.5).abs() > f32::EPSILON
+            || mat.metallic_roughness_texture.is_some()
+            || mat.extras.contains_key("mtl:Pc")
+            || mat.extras.contains_key("mtl:Ps");
+        if pbr_in_use {
+            writeln!(out, "Pr {}", fmt_f(mat.roughness)).unwrap();
+            writeln!(out, "Pm {}", fmt_f(mat.metallic)).unwrap();
+        }
+        if let Some(v) = mat.extras.get("mtl:Pc").and_then(|v| v.as_f64()) {
+            writeln!(out, "Pc {}", fmt_f(v as f32)).unwrap();
+        }
+        if let Some(v) = mat.extras.get("mtl:Ps").and_then(|v| v.as_f64()) {
+            writeln!(out, "Ps {}", fmt_f(v as f32)).unwrap();
+        }
+
+        // Texture references.
+        write_tex_ref(&mut out, "map_Kd", mat.base_color_texture, textures);
+        write_tex_ref(&mut out, "map_Bump", mat.normal_texture, textures);
+        write_tex_ref(&mut out, "map_Pr", mat.metallic_roughness_texture, textures);
+        write_tex_ref(&mut out, "map_Ke", mat.emissive_texture, textures);
+
+        // Pass-through extras — `mtl:*` keys we didn't consume above.
+        for (k, v) in &mat.extras {
+            if !k.starts_with("mtl:") {
+                continue;
+            }
+            // Skip the keys we already printed above.
+            match k.as_str() {
+                "mtl:Ka"
+                | "mtl:Ks"
+                | "mtl:Ns"
+                | "mtl:Ni"
+                | "mtl:illum"
+                | "mtl:Pc"
+                | "mtl:Ps"
+                | "mtl:displaced_pbr_map" => continue,
+                _ => {}
+            }
+            // Only emit string-valued passthrough keys (textures we didn't model);
+            // numeric ones we don't consume just stay as side-channel metadata.
+            if let Some(s) = v.as_str() {
+                let kw = k.strip_prefix("mtl:").unwrap_or(k.as_str());
+                writeln!(out, "{kw} {s}").unwrap();
+            }
+        }
+
+        out.push('\n');
+    }
+
+    Ok(out.into_bytes())
+}
+
+fn write_tex_ref(out: &mut String, keyword: &str, ref_: Option<TextureRef>, textures: &[Texture]) {
+    use std::fmt::Write;
+    let Some(r) = ref_ else { return };
+    let Some(tex) = textures.get(r.texture.0 as usize) else {
+        return;
+    };
+    if let ImageData::External { uri, .. } = &tex.image {
+        writeln!(out, "{keyword} {uri}").unwrap();
+    }
+}
+
+fn fmt_f(x: f32) -> String {
+    if x == 0.0 {
+        return "0".to_string();
+    }
+    let s = format!("{x:.6}");
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.').to_string();
+    if trimmed.is_empty() || trimmed == "-" {
+        "0".to_string()
+    } else {
+        trimmed
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_minimal_phong() {
+        let text = "newmtl Red\nKd 1.0 0.0 0.0\nKa 0.1 0.1 0.1\nNs 32\n";
+        let mats = parse_mtl(text).unwrap();
+        assert_eq!(mats.len(), 1);
+        let m = &mats[0];
+        assert_eq!(m.name.as_deref(), Some("Red"));
+        assert_eq!(m.base_color[0..3], [1.0, 0.0, 0.0]);
+        assert_eq!(
+            m.extras
+                .get("mtl:Ka")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(3)
+        );
+        assert_eq!(m.extras.get("mtl:Ns").and_then(|v| v.as_f64()), Some(32.0));
+    }
+
+    #[test]
+    fn dissolve_sets_alpha_blend() {
+        let mats = parse_mtl("newmtl Glass\nKd 0.5 0.5 0.5\nd 0.4\n").unwrap();
+        assert_eq!(mats[0].base_color[3], 0.4);
+        assert!(matches!(mats[0].alpha_mode, AlphaMode::Blend));
+    }
+
+    #[test]
+    fn tr_alternate_dissolve() {
+        let mats = parse_mtl("newmtl Glass\nKd 0.5 0.5 0.5\nTr 0.4\n").unwrap();
+        // Tr = 1 - d  ⇒  d = 0.6
+        assert!((mats[0].base_color[3] - 0.6).abs() < 1e-6);
+        assert!(matches!(mats[0].alpha_mode, AlphaMode::Blend));
+    }
+
+    #[test]
+    fn pbr_extension_lands_in_pbr_slots() {
+        let mats =
+            parse_mtl("newmtl Steel\nKd 0.7 0.7 0.7\nPr 0.25\nPm 0.95\nPc 0.5\nPs 0.1\n").unwrap();
+        let m = &mats[0];
+        assert!((m.roughness - 0.25).abs() < 1e-6);
+        assert!((m.metallic - 0.95).abs() < 1e-6);
+        let pc = m.extras.get("mtl:Pc").and_then(|v| v.as_f64()).unwrap();
+        assert!((pc - 0.5).abs() < 1e-6);
+        let ps = m.extras.get("mtl:Ps").and_then(|v| v.as_f64()).unwrap();
+        assert!((ps - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn map_kd_pending_uri_round_trips() {
+        let mats = parse_mtl("newmtl Tex\nKd 1 1 1\nmap_Kd diffuse.png\n").unwrap();
+        let pending = mats[0].extras.get("mtl:pending_textures").unwrap();
+        assert_eq!(pending["base_color"].as_str(), Some("diffuse.png"));
+    }
+}
