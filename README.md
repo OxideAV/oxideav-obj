@@ -42,6 +42,16 @@ modern loaders actually load):
 - `mtllib <file.mtl> [<file2.mtl> …]` and `usemtl <name>` — each
   `usemtl` switch starts a fresh `Primitive` so a multi-material OBJ
   becomes a `Mesh` with N primitives, each with its own `MaterialId`.
+- Free-form geometry (`vp` parameter-space vertices, `cstype`,
+  `deg`, `curv`, `curv2`, `surf`, `parm`, `trim`, `hole`, `scrv`,
+  `sp`, `end`, plus superseded `bzp` / `bsp` patches) — captured
+  verbatim into `Scene3D::extras["obj:vp"]` (1-based parallel vertex
+  pool) and `Scene3D::extras["obj:freeform_directives"]` (sequence
+  of `[keyword, arg1, arg2, …]` arrays). The encoder replays both
+  after the polygonal section so a decode → encode round-trip
+  preserves the directive order and arguments. No tessellation —
+  consumers that need to evaluate the curves walk the directive
+  sequence themselves.
 
 The companion **MTL** parser/serialiser handles:
 
@@ -102,12 +112,19 @@ Round 1: polygonal subset + MTL Phong + Wavefront-PBR extension.
 Round 2: multi-name `g` lines, smoothing-group state-setting (split-on-
 change), `Tf` / `sharpness` / displacement-map round-trip, path-based
 loader with `mtllib` resolution, and an opt-in negative-index encoder.
+Round 3: `p` point elements, `mg` merging groups, `bevel` / `c_interp`
+/ `d_interp` / `lod` display attributes, MTL `map_*` option flags
+(`-blendu`, `-clamp`, `-bm`, …) preserved through round-trip, MTL
+`d -halo factor`, encoder polyline rejoin.
+Round 4: free-form geometry (`vp` parameter-space vertex pool plus
+the verbatim `cstype` / `deg` / `curv` / `curv2` / `surf` / `parm` /
+`trim` / `hole` / `scrv` / `sp` / `end` / `bzp` / `bsp` directive
+sequence) — round-trips through `Scene3D::extras` without
+tessellation.
 
-Free-form curves/surfaces (`curv`, `surf`, `parm`, `trim`, `hole`,
-`scrv`, `sp`, `end`), the `vp` parameter-space vertex, and the `.mod`
-binary form remain unimplemented. Files using only those features
-decode to an empty scene; files that mix them with polygonal data
-decode the polygonal part and ignore the rest.
+The `.mod` binary form, MTL `Tf spectral file.rfl factor` / `Tf xyz
+x y z` variants, and the `refl -type cube_*` multi-file reflection-
+map sets remain unimplemented.
 
 ## License
 

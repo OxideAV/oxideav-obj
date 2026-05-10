@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Free-form geometry directives (`vp` parameter-space vertices,
+  `cstype`, `deg`, `curv`, `curv2`, `surf`, `parm`, `trim`, `hole`,
+  `scrv`, `sp`, `end`, plus the older superseded `bzp` / `bsp`
+  patches per spec §"Superseded statements") are captured into
+  `Scene3D::extras["obj:vp"]` (list of `[u, v, w]` 3-tuples in 1-based
+  numbering parallel to `v` / `vt` / `vn`) and
+  `Scene3D::extras["obj:freeform_directives"]` (sequence of
+  `[keyword, arg1, arg2, …]` arrays preserving directive order and
+  arguments verbatim). The encoder replays both after the polygonal
+  section so a decode → encode round-trip is bit-stable for the
+  free-form portion. No semantic interpretation — consumers that
+  need to evaluate the curves/surfaces walk the captured directive
+  sequence themselves; this crate guarantees lossless transit.
+  `vp` lines are emitted with only as many coordinates as carry
+  meaningful information (`vp u`, `vp u v`, or `vp u v w`).
 - `p v1 v2 v3 …` point elements decode to a `Topology::Points`
   primitive (multi-vertex `p` lines pack onto one element list);
   mixing point and face/line elements under one `usemtl` splits into

@@ -1,8 +1,15 @@
 //! Wavefront OBJ ASCII parser + serialiser.
 //!
-//! Strictly the polygonal subset (vertex / face / line / grouping /
-//! material directives). Free-form curves/surfaces and the `.mod`
-//! binary form are intentionally not handled.
+//! Polygonal subset (vertex / face / line / point / grouping / material
+//! directives) is fully decoded into the typed [`Scene3D`] model. The
+//! free-form curve/surface directives — `vp`, `cstype`, `deg`, `curv`,
+//! `curv2`, `surf`, `parm`, `trim`, `hole`, `scrv`, `sp`, `end`, plus
+//! the superseded `bzp` / `bsp` patches — are captured verbatim into
+//! `Scene3D::extras["obj:vp"]` and
+//! `Scene3D::extras["obj:freeform_directives"]` so a decode → encode
+//! round-trip preserves the directive sequence and arguments without
+//! semantic interpretation. The `.mod` binary form remains out of
+//! scope.
 //!
 //! The grammar is line-oriented; whitespace-separated; `#` introduces
 //! a comment to end of line. Continuation lines (trailing `\\`) are
@@ -97,6 +104,15 @@ struct ObjDoc {
     positions: Vec<[f32; 3]>,
     texcoords: Vec<[f32; 2]>,
     normals: Vec<[f32; 3]>,
+    /// Parameter-space vertices (`vp u v [w]`) from the free-form
+    /// geometry portion of the spec — 1-based numbering, parallel to
+    /// `positions` / `texcoords` / `normals`. Stored as a 3-tuple
+    /// where missing components default to `0.0` (this matches what
+    /// the spec calls out: `v` defaults to 0 for 1D points, `w`
+    /// defaults to 1.0 for rational trimming curves but we leave the
+    /// raw "what the file said" in extras and let the consumer
+    /// interpret).
+    vp: Vec<[f32; 3]>,
     /// Material library file names referenced by `mtllib`.
     mtllibs: Vec<String>,
     /// All material definitions resolved from `mtllib` references
@@ -105,6 +121,18 @@ struct ObjDoc {
     /// caller.
     resolved_materials: HashMap<String, oxideav_mesh3d::Material>,
     meshes: Vec<MeshAccum>,
+    /// Verbatim sequence of free-form-geometry directives (`cstype`,
+    /// `deg`, `curv`, `surf`, `parm`, `trim`, `hole`, `scrv`, `sp`,
+    /// `end`, `bzp`, plus the older `bsp`). Each entry is the keyword
+    /// followed by its whitespace-separated arguments. Round-trip
+    /// preservation: the encoder replays the sequence verbatim after
+    /// the polygonal section so consumers can carry free-form data
+    /// through us without semantic loss. Body statements (`parm`,
+    /// `trim`, `hole`, `scrv`, `sp`, `end`) are accepted in document
+    /// order; the spec mandates they appear between an element start
+    /// (`curv` / `surf`) and `end`, but we don't enforce that — a
+    /// lenient loader pattern matches what tools in the wild emit.
+    freeform_directives: Vec<Vec<String>>,
 }
 
 /// Glue line-continuation (`\\` + newline) before line splitting and
@@ -230,8 +258,48 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 doc.normals.push([coords[0], coords[1], coords[2]]);
             }
             "vp" => {
-                // Parameter-space vertex — silently skipped (free-form
-                // surface support is out of scope for round 1).
+                // Parameter-space vertex (`vp u v [w]`) — used as the
+                // control-point pool for free-form 2D trimming curves
+                // (`curv2`, referenced by `trim`/`hole`/`scrv`) and
+                // for special points (`sp`). Spec §"vp u v w".
+                //
+                // The number of meaningful coordinates depends on the
+                // usage (1D for 1D special points, 2D for trimming
+                // curves, 3D for rational trimming curves with a
+                // weight). We always store a 3-tuple, padding with
+                // `0.0` so the encoder can emit a faithful
+                // `vp <u> <v> <w>` line for the rational case and a
+                // shorter `vp <u> <v>` / `vp <u>` for the others.
+                let coords: Vec<f32> = tokens
+                    .map(str::parse)
+                    .collect::<std::result::Result<Vec<f32>, _>>()
+                    .map_err(|e| Error::invalid(format!("vp: bad float ({e})")))?;
+                if coords.is_empty() {
+                    return Err(Error::invalid("vp: expected ≥1 coord"));
+                }
+                let u = coords[0];
+                let v = coords.get(1).copied().unwrap_or(0.0);
+                let w = coords.get(2).copied().unwrap_or(0.0);
+                doc.vp.push([u, v, w]);
+            }
+            "cstype" | "deg" | "curv" | "curv2" | "surf" | "parm" | "trim" | "hole" | "scrv"
+            | "sp" | "end" | "bzp" | "bsp" => {
+                // Free-form geometry directives. Captured verbatim as
+                // a `(keyword, args)` sequence on the document so the
+                // encoder can replay them after the polygonal section.
+                // No semantic interpretation: the round-trip preserves
+                // the operator's exact token sequence.
+                //
+                // Spec §"Free-form curve/surface attributes" /
+                // §"Specifying free-form curves/surfaces" /
+                // §"Free-form curve/surface body statements" /
+                // §"Superseded statements (bzp / bsp)".
+                let mut entry: Vec<String> = Vec::new();
+                entry.push(keyword.to_string());
+                for tok in tokens {
+                    entry.push(tok.to_string());
+                }
+                doc.freeform_directives.push(entry);
             }
             "f" => {
                 let n_pos = doc.positions.len() as i64;
@@ -601,6 +669,25 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         scene.extras.insert(
             "obj:mtllibs".to_string(),
             serde_json::to_value(&doc.mtllibs).unwrap(),
+        );
+    }
+
+    // Free-form geometry side-channel: the parameter-space vertex pool
+    // (`vp`) and the verbatim sequence of `cstype` / `deg` / `curv` /
+    // `surf` / `parm` / `trim` / `hole` / `scrv` / `sp` / `end` / `bzp`
+    // / `bsp` directives. The encoder replays these after the
+    // polygonal section so consumers that don't care about free-form
+    // geometry simply ignore the keys, while consumers that do can
+    // walk the directive sequence themselves.
+    if !doc.vp.is_empty() {
+        scene
+            .extras
+            .insert("obj:vp".to_string(), serde_json::to_value(&doc.vp).unwrap());
+    }
+    if !doc.freeform_directives.is_empty() {
+        scene.extras.insert(
+            "obj:freeform_directives".to_string(),
+            serde_json::to_value(&doc.freeform_directives).unwrap(),
         );
     }
 
@@ -1027,6 +1114,42 @@ pub fn serialize_obj_with_options(
         )
         .unwrap();
     }
+    // Parameter-space vertices for the free-form geometry section. We
+    // emit these after `v` and before `vt` to mirror the typical layout
+    // produced by Wavefront-era authoring tools (the spec doesn't
+    // mandate an ordering, but co-locating `vp` with the other vertex
+    // pools keeps human diffs tidy).
+    if let Some(serde_json::Value::Array(vps)) = scene.extras.get("obj:vp") {
+        for entry in vps {
+            if let serde_json::Value::Array(coords) = entry {
+                let parts: Vec<f32> = coords
+                    .iter()
+                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                    .collect();
+                if parts.is_empty() {
+                    continue;
+                }
+                // Emit only as many coordinates as carry meaningful
+                // information. The decoder padded with `0.0`, so a
+                // trailing `0` is a strong signal "the operator
+                // didn't supply this component". 1D / 2D / 3D `vp`
+                // statements are all valid per spec §"vp u v w".
+                let trim = if parts.len() >= 3 && parts[2] != 0.0 {
+                    3
+                } else if parts.len() >= 2 && parts[1] != 0.0 {
+                    2
+                } else {
+                    1
+                };
+                let mut s = String::from("vp");
+                for coord in parts.iter().take(trim) {
+                    s.push(' ');
+                    s.push_str(&fmt_float(*coord));
+                }
+                writeln!(out, "{s}").unwrap();
+            }
+        }
+    }
     for t in &texcoords {
         writeln!(out, "vt {} {}", fmt_float(t[0]), fmt_float(t[1])).unwrap();
     }
@@ -1268,6 +1391,27 @@ pub fn serialize_obj_with_options(
                         "OBJ encoder: topology {other:?} not representable"
                     )));
                 }
+            }
+        }
+    }
+
+    // Free-form geometry section: replay the captured directive
+    // sequence verbatim. The decoder records every `cstype` / `deg` /
+    // `curv` / `surf` / `parm` / `trim` / `hole` / `scrv` / `sp` /
+    // `end` / `bzp` / `bsp` line as `[keyword, arg1, arg2, …]` so the
+    // encoder is purely textual — no semantic interpretation, which
+    // means the round-trip is bit-exact for the directive args even
+    // when the polygonal section sits between `vp` and the free-form
+    // body.
+    if let Some(serde_json::Value::Array(directives)) = scene.extras.get("obj:freeform_directives")
+    {
+        for entry in directives {
+            if let serde_json::Value::Array(toks) = entry {
+                let parts: Vec<&str> = toks.iter().filter_map(|v| v.as_str()).collect();
+                if parts.is_empty() {
+                    continue;
+                }
+                writeln!(out, "{}", parts.join(" ")).unwrap();
             }
         }
     }
