@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `v x y z r g b` per-vertex colour extension (MeshLab / libigl /
+  Meshroom / OpenCV de-facto). The decoder accepts `v` lines with 3, 4,
+  6, or 7 floats — `xyz`, `xyzw` (rational weight per spec
+  §"v x y z w"), `xyzrgb` (vertex-colour extension), or `xyzwrgb`
+  (both). Colours land on `Primitive::colors[0]` as
+  `[r, g, b, 1.0]`; rational weights land in
+  `Primitive::extras["obj:vertex_weight"]`. A per-vertex bitmap in
+  `Primitive::extras["obj:vertex_color_present"]` records *which*
+  source vertices originally carried RGB so the encoder can re-emit
+  the same 3-/4-/6-/7-token width on round-trip rather than
+  fabricating synthetic white for vertices that didn't spell out
+  colour. Mixed-colouring primitives round-trip with the partition
+  preserved (some `v` lines stay 3-token, others go to 6). The
+  loader rejects 5-float `v` lines as ambiguous (neither `xyzw` nor
+  `xyzrgb` per any extant convention).
 - Free-form geometry directives (`vp` parameter-space vertices,
   `cstype`, `deg`, `curv`, `curv2`, `surf`, `parm`, `trim`, `hole`,
   `scrv`, `sp`, `end`, plus the older superseded `bzp` / `bsp`

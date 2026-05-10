@@ -102,6 +102,22 @@ impl MeshAccum {
 #[derive(Debug, Default)]
 struct ObjDoc {
     positions: Vec<[f32; 3]>,
+    /// Per-position rational weight from the optional 4th `w` component
+    /// of `v x y z w`. `None` means "no weight given" (the spec default
+    /// is `1.0`); `Some(w)` is preserved verbatim so a round-trip emits
+    /// the original 4-token form rather than collapsing to 3 tokens.
+    /// Parallel to `positions` (1-based / 0-based index parity).
+    /// Spec §"v x y z w" — w defaults to 1.0 for non-rational geometry.
+    position_weights: Vec<Option<f32>>,
+    /// Per-position vertex colour from the widely-deployed
+    /// `v x y z r g b` extension (MeshLab, libigl, Meshroom, OpenCV).
+    /// `None` for vertices written in the standard 3-token form.
+    /// `Some([r, g, b, 1.0])` carries the linear-space RGB triplet
+    /// (alpha pinned to opaque since the extension only spells out
+    /// three colour channels). Parallel to `positions`.
+    /// Not in the original spec — flagged in `docs/3d/obj/README.md`
+    /// as the canonical "widely used but never standardised" extension.
+    position_colors: Vec<Option<[f32; 4]>>,
     texcoords: Vec<[f32; 2]>,
     normals: Vec<[f32; 3]>,
     /// Parameter-space vertices (`vp u v [w]`) from the free-form
@@ -222,14 +238,33 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                     .map(str::parse)
                     .collect::<std::result::Result<Vec<f32>, _>>()
                     .map_err(|e| Error::invalid(format!("v: bad float ({e})")))?;
-                if coords.len() < 3 {
-                    return Err(Error::invalid(format!(
-                        "v: expected ≥3 coords, got {}",
-                        coords.len()
-                    )));
-                }
-                // The optional 4th `w` is silently dropped (rare in practice).
+                // Spec §"v x y z w" defines 3 or 4 components (the 4th
+                // is the rational weight, default 1.0). The
+                // widely-deployed MeshLab / libigl / Meshroom extension
+                // adds a per-vertex RGB triplet making 6 (`x y z r g b`)
+                // or 7 (`x y z w r g b`) the supported widths in the
+                // wild. We accept all four shapes and surface the extra
+                // information through parallel `position_weights` /
+                // `position_colors` arrays so the encoder can re-emit
+                // the original token width on round-trip.
+                let (w, rgb) = match coords.len() {
+                    3 => (None, None),
+                    4 => (Some(coords[3]), None),
+                    6 => (None, Some([coords[3], coords[4], coords[5], 1.0])),
+                    7 => (
+                        Some(coords[3]),
+                        Some([coords[4], coords[5], coords[6], 1.0]),
+                    ),
+                    n => {
+                        return Err(Error::invalid(format!(
+                            "v: expected 3, 4, 6, or 7 floats (xyz, xyzw, xyzrgb, or \
+                             xyzwrgb per spec + MeshLab vertex-colour extension), got {n}"
+                        )));
+                    }
+                };
                 doc.positions.push([coords[0], coords[1], coords[2]]);
+                doc.position_weights.push(w);
+                doc.position_colors.push(rgb);
             }
             "vt" => {
                 let coords: Vec<f32> = tokens
@@ -638,6 +673,8 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
             let (mut primitive, arities) = build_primitive(
                 &prim_acc,
                 &doc.positions,
+                &doc.position_weights,
+                &doc.position_colors,
                 &doc.texcoords,
                 &doc.normals,
                 &material_ids,
@@ -733,6 +770,8 @@ fn single_line_topology(elements: &[Element]) -> Topology {
 fn build_primitive(
     prim_acc: &PrimAccum,
     positions: &[[f32; 3]],
+    position_weights: &[Option<f32>],
+    position_colors: &[Option<[f32; 4]>],
     texcoords: &[[f32; 2]],
     normals: &[[f32; 3]],
     material_ids: &HashMap<String, oxideav_mesh3d::MaterialId>,
@@ -786,6 +825,24 @@ fn build_primitive(
             verts.iter().any(|fv| fv.vn != 0)
         }
     });
+    // Per-vertex colour applies to a primitive whenever any of its
+    // referenced positions carries the `v x y z r g b` extension. We
+    // promote to a single-channel `colors[0]` set; vertices that
+    // don't carry RGB fall back to white (the obvious "no colour
+    // information" sentinel — preserves the standard glTF expectation
+    // that a colour buffer is fully populated when present). The
+    // round-trip-aware `obj:vertex_color_present` per-position
+    // bitmap below guards the encoder against re-emitting a
+    // synthetic white that the original file didn't spell out.
+    let has_color = prim_acc.elements.iter().any(|elt| match elt {
+        Element::Face(verts) | Element::Line(verts) | Element::Point(verts) => {
+            verts.iter().any(|fv| {
+                position_colors
+                    .get((fv.v - 1) as usize)
+                    .is_some_and(Option::is_some)
+            })
+        }
+    });
 
     let mut prim = Primitive::new(topology);
     if has_uv {
@@ -794,45 +851,75 @@ fn build_primitive(
     if has_normal {
         prim.normals = Some(Vec::new());
     }
+    if has_color {
+        prim.colors.push(Vec::new());
+    }
+    // Track per-interned-vertex "did this position carry RGB / a
+    // weight in the source file?" so the encoder doesn't fabricate
+    // colours / weights that the user never wrote. Both vectors are
+    // parallel to `prim.positions` after interning completes.
+    let mut color_present: Vec<bool> = Vec::new();
+    let mut weights_seen: Vec<Option<f32>> = Vec::new();
 
     // De-duplicate face-vertices into a single interleaved buffer.
     let mut indexer: HashMap<FaceVert, u32> = HashMap::new();
     let mut arities: Vec<u32> = Vec::new();
     let mut local_indices: Vec<u32> = Vec::new();
 
-    let intern =
-        |fv: FaceVert, prim: &mut Primitive, indexer: &mut HashMap<FaceVert, u32>| -> Result<u32> {
-            if let Some(&idx) = indexer.get(&fv) {
-                return Ok(idx);
-            }
-            let pos = positions.get((fv.v - 1) as usize).ok_or_else(|| {
-                Error::invalid(format!("face references missing position {}", fv.v))
-            })?;
-            prim.positions.push(*pos);
-            if has_uv {
-                let uv = if fv.vt == 0 {
-                    [0.0, 0.0]
-                } else {
-                    *texcoords.get((fv.vt - 1) as usize).ok_or_else(|| {
-                        Error::invalid(format!("face references missing texcoord {}", fv.vt))
-                    })?
-                };
-                prim.uvs[0].push(uv);
-            }
-            if has_normal {
-                let n = if fv.vn == 0 {
-                    [0.0, 0.0, 0.0]
-                } else {
-                    *normals.get((fv.vn - 1) as usize).ok_or_else(|| {
-                        Error::invalid(format!("face references missing normal {}", fv.vn))
-                    })?
-                };
-                prim.normals.as_mut().unwrap().push(n);
-            }
-            let new_idx = (prim.positions.len() - 1) as u32;
-            indexer.insert(fv, new_idx);
-            Ok(new_idx)
-        };
+    let intern = |fv: FaceVert,
+                  prim: &mut Primitive,
+                  indexer: &mut HashMap<FaceVert, u32>,
+                  color_present: &mut Vec<bool>,
+                  weights_seen: &mut Vec<Option<f32>>|
+     -> Result<u32> {
+        if let Some(&idx) = indexer.get(&fv) {
+            return Ok(idx);
+        }
+        let pos = positions
+            .get((fv.v - 1) as usize)
+            .ok_or_else(|| Error::invalid(format!("face references missing position {}", fv.v)))?;
+        prim.positions.push(*pos);
+        if has_uv {
+            let uv = if fv.vt == 0 {
+                [0.0, 0.0]
+            } else {
+                *texcoords.get((fv.vt - 1) as usize).ok_or_else(|| {
+                    Error::invalid(format!("face references missing texcoord {}", fv.vt))
+                })?
+            };
+            prim.uvs[0].push(uv);
+        }
+        if has_normal {
+            let n = if fv.vn == 0 {
+                [0.0, 0.0, 0.0]
+            } else {
+                *normals.get((fv.vn - 1) as usize).ok_or_else(|| {
+                    Error::invalid(format!("face references missing normal {}", fv.vn))
+                })?
+            };
+            prim.normals.as_mut().unwrap().push(n);
+        }
+        if has_color {
+            // Either the source file carried RGB for this vertex, or
+            // we synthesise opaque white so the colour buffer stays
+            // length-parallel with positions (mesh3d invariant).
+            let rgba = position_colors
+                .get((fv.v - 1) as usize)
+                .copied()
+                .flatten()
+                .unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            prim.colors[0].push(rgba);
+            color_present.push(
+                position_colors
+                    .get((fv.v - 1) as usize)
+                    .is_some_and(Option::is_some),
+            );
+        }
+        weights_seen.push(position_weights.get((fv.v - 1) as usize).copied().flatten());
+        let new_idx = (prim.positions.len() - 1) as u32;
+        indexer.insert(fv, new_idx);
+        Ok(new_idx)
+    };
 
     for elt in &prim_acc.elements {
         match elt {
@@ -841,7 +928,15 @@ fn build_primitive(
                 arities.push(arity);
                 let resolved: Vec<u32> = verts
                     .iter()
-                    .map(|&fv| intern(fv, &mut prim, &mut indexer))
+                    .map(|&fv| {
+                        intern(
+                            fv,
+                            &mut prim,
+                            &mut indexer,
+                            &mut color_present,
+                            &mut weights_seen,
+                        )
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 // Fan triangulate: (v0, v1, v2), (v0, v2, v3), …
                 for i in 1..(resolved.len() - 1) {
@@ -853,7 +948,15 @@ fn build_primitive(
             Element::Line(verts) => {
                 let resolved: Vec<u32> = verts
                     .iter()
-                    .map(|&fv| intern(fv, &mut prim, &mut indexer))
+                    .map(|&fv| {
+                        intern(
+                            fv,
+                            &mut prim,
+                            &mut indexer,
+                            &mut color_present,
+                            &mut weights_seen,
+                        )
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 match topology {
                     Topology::LineStrip => {
@@ -883,7 +986,13 @@ fn build_primitive(
                 // `Topology::Points`. Original arities aren't tracked
                 // since a re-emit can pack them on one line freely.
                 for &fv in verts {
-                    let idx = intern(fv, &mut prim, &mut indexer)?;
+                    let idx = intern(
+                        fv,
+                        &mut prim,
+                        &mut indexer,
+                        &mut color_present,
+                        &mut weights_seen,
+                    )?;
                     local_indices.push(idx);
                 }
             }
@@ -897,6 +1006,24 @@ fn build_primitive(
         prim.indices = Some(Indices::U16(
             local_indices.into_iter().map(|i| i as u16).collect(),
         ));
+    }
+
+    // Per-vertex extension state — surfaced through `Primitive::extras`
+    // so the encoder knows which `v` lines to expand to the 4-token
+    // `xyzw`, 6-token `xyzrgb`, or 7-token `xyzwrgb` form. We only stash
+    // the bitmaps when at least one vertex used the extension; the
+    // common no-extension case stays free of decode-time noise.
+    if has_color && color_present.iter().any(|&b| b) {
+        prim.extras.insert(
+            "obj:vertex_color_present".to_string(),
+            serde_json::to_value(&color_present).unwrap(),
+        );
+    }
+    if weights_seen.iter().any(Option::is_some) {
+        prim.extras.insert(
+            "obj:vertex_weight".to_string(),
+            serde_json::to_value(&weights_seen).unwrap(),
+        );
     }
 
     if let Some(name) = &prim_acc.material {
@@ -1092,23 +1219,60 @@ pub fn serialize_obj_with_options(
     // Deduplicated global vertex / texcoord / normal pools so emitted
     // index references match the canonical 1-based numbering.
     let mut positions: Vec<[f32; 3]> = Vec::new();
+    // Parallel to `positions` — `Some(rgb)` when the source flagged
+    // this vertex through the `obj:vertex_color_present` extras
+    // bitmap, `None` otherwise. We *don't* emit synthetic white for a
+    // `None` entry: the round-trip rule is "only re-emit RGB for
+    // vertices that originally had it". When at least one position
+    // carries colour the encoder also sets a flag so the entire
+    // colour set isn't dropped on a partial-colouring file (mixed
+    // colored / uncolored vertices in one primitive — re-emit
+    // standard `v x y z` for the uncolored).
+    let mut position_colors: Vec<Option<[f32; 4]>> = Vec::new();
+    // Parallel to `positions` — preserved `v` 4th `w` weight whenever
+    // the source carried it. `None` re-emits the standard 3-token form.
+    let mut position_weights: Vec<Option<f32>> = Vec::new();
     let mut texcoords: Vec<[f32; 2]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut pos_map: HashMap<KeyVec3, u32> = HashMap::new();
     let mut tex_map: HashMap<KeyVec2, u32> = HashMap::new();
     let mut nor_map: HashMap<KeyVec3, u32> = HashMap::new();
 
-    let intern_pos =
-        |p: [f32; 3], positions: &mut Vec<[f32; 3]>, map: &mut HashMap<KeyVec3, u32>| -> u32 {
-            let key = KeyVec3::from(p);
-            if let Some(&i) = map.get(&key) {
-                return i;
+    // Intern a position into the shared global pool, attaching the
+    // (optional) per-vertex colour + weight derived from the
+    // `obj:vertex_color_present` / `obj:vertex_weight` extras. When the
+    // same position appears across primitives, the *first* non-`None`
+    // colour / weight wins — silently ignoring later overrides keeps
+    // round-trip determinism without forcing a partition of duplicate
+    // positions on differing colour metadata (which would force the
+    // encoder to emit redundant `v` lines and bloat the output).
+    let intern_pos = |p: [f32; 3],
+                      colour: Option<[f32; 4]>,
+                      weight: Option<f32>,
+                      positions: &mut Vec<[f32; 3]>,
+                      colours: &mut Vec<Option<[f32; 4]>>,
+                      weights: &mut Vec<Option<f32>>,
+                      map: &mut HashMap<KeyVec3, u32>|
+     -> u32 {
+        let key = KeyVec3::from(p);
+        if let Some(&i) = map.get(&key) {
+            // First-write-wins on extension metadata.
+            let slot = (i - 1) as usize;
+            if colours[slot].is_none() {
+                colours[slot] = colour;
             }
-            positions.push(p);
-            let idx = positions.len() as u32;
-            map.insert(key, idx);
-            idx
-        };
+            if weights[slot].is_none() {
+                weights[slot] = weight;
+            }
+            return i;
+        }
+        positions.push(p);
+        colours.push(colour);
+        weights.push(weight);
+        let idx = positions.len() as u32;
+        map.insert(key, idx);
+        idx
+    };
     let intern_tex =
         |p: [f32; 2], texcoords: &mut Vec<[f32; 2]>, map: &mut HashMap<KeyVec2, u32>| -> u32 {
             let key = KeyVec2::from(p);
@@ -1141,9 +1305,40 @@ pub fn serialize_obj_with_options(
         for prim in &mesh.primitives {
             let has_uv = !prim.uvs.is_empty();
             let has_normal = prim.normals.is_some();
+            let has_color = !prim.colors.is_empty();
+            // Per-vertex bitmap saying "did the source spell out RGB on
+            // this vertex?". Missing extras / no-colors-set means every
+            // vertex stays in the standard 3-token form.
+            let color_present: Vec<bool> = prim
+                .extras
+                .get("obj:vertex_color_present")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| arr.iter().map(|v| v.as_bool().unwrap_or(false)).collect())
+                .unwrap_or_else(|| vec![has_color; prim.positions.len()]);
+            // Per-vertex weight overrides — preserved through extras.
+            let weight_overrides: Vec<Option<f32>> = prim
+                .extras
+                .get("obj:vertex_weight")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect())
+                .unwrap_or_default();
             let mut prim_globals: Vec<GlobalTriple> = Vec::with_capacity(prim.positions.len());
             for vi in 0..prim.positions.len() {
-                let v_idx = intern_pos(prim.positions[vi], &mut positions, &mut pos_map);
+                let colour = if has_color && color_present.get(vi).copied().unwrap_or(false) {
+                    Some(prim.colors[0][vi])
+                } else {
+                    None
+                };
+                let weight = weight_overrides.get(vi).copied().flatten();
+                let v_idx = intern_pos(
+                    prim.positions[vi],
+                    colour,
+                    weight,
+                    &mut positions,
+                    &mut position_colors,
+                    &mut position_weights,
+                    &mut pos_map,
+                );
                 let vt_idx = if has_uv {
                     intern_tex(prim.uvs[0][vi], &mut texcoords, &mut tex_map)
                 } else {
@@ -1165,15 +1360,34 @@ pub fn serialize_obj_with_options(
         global_indices.push(mesh_globals);
     }
 
-    for p in &positions {
-        writeln!(
-            out,
-            "v {} {} {}",
-            fmt_float(p[0]),
-            fmt_float(p[1]),
-            fmt_float(p[2])
-        )
-        .unwrap();
+    for (i, p) in positions.iter().enumerate() {
+        // Pick the most-compact `v` form that still carries the
+        // extension data: `xyz`, `xyzw` (rational weight), `xyzrgb`
+        // (MeshLab vertex colour), or `xyzwrgb` (both). Each
+        // extension is silently dropped if it would just spell out
+        // the spec default (`w == 1.0`, no colour).
+        let weight = position_weights[i];
+        let colour = position_colors[i];
+        let mut s = String::with_capacity(40);
+        s.push_str("v ");
+        s.push_str(&fmt_float(p[0]));
+        s.push(' ');
+        s.push_str(&fmt_float(p[1]));
+        s.push(' ');
+        s.push_str(&fmt_float(p[2]));
+        if let Some(w) = weight {
+            s.push(' ');
+            s.push_str(&fmt_float(w));
+        }
+        if let Some(rgb) = colour {
+            s.push(' ');
+            s.push_str(&fmt_float(rgb[0]));
+            s.push(' ');
+            s.push_str(&fmt_float(rgb[1]));
+            s.push(' ');
+            s.push_str(&fmt_float(rgb[2]));
+        }
+        writeln!(out, "{s}").unwrap();
     }
     // Parameter-space vertices for the free-form geometry section. We
     // emit these after `v` and before `vt` to mirror the typical layout

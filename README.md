@@ -10,7 +10,18 @@ manual. This crate implements the polygonal subset (the part that
 modern loaders actually load):
 
 - `v` / `vt` / `vn` vertex data — with the optional `w` 4th component on
-  positions and the optional `v` / `w` extra components on UVs.
+  positions (rational weight per spec §"v x y z w" — preserved verbatim
+  through `Primitive::extras["obj:vertex_weight"]`) and the optional
+  `v` / `w` extra components on UVs. The widely-deployed MeshLab /
+  libigl / Meshroom / OpenCV `v x y z r g b` per-vertex-colour
+  extension is accepted at parse time, surfaced through
+  `Primitive::colors[0]` (alpha pinned to 1.0 since the extension only
+  spells out three channels), and re-emitted at the original token
+  width — `xyz`, `xyzw`, `xyzrgb`, or `xyzwrgb` — using the
+  `Primitive::extras["obj:vertex_color_present"]` bitmap so partial-
+  colouring inputs preserve their per-vertex partition on round-trip
+  rather than fabricating synthetic white. 5-float `v` lines are
+  rejected as ambiguous.
 - `f` faces in all four index syntaxes (`v`, `v/vt`, `v//vn`,
   `v/vt/vn`), with 1-based indexing and the negative-index relative-from-end
   shorthand. Polygons (n-gons) are fan-triangulated on read; the original
@@ -142,6 +153,12 @@ forms, `refl -type sphere` / `refl -type cube_*` typed reflection-map
 sets bundled into `mtl:refl:sphere` / `mtl:refl:cube` extras, and
 single-`l` polylines promoted to `Topology::LineStrip` /
 `Topology::LineLoop` (with closure detection at decode time).
+Round 6: per-vertex colour extension (`v x y z r g b`, MeshLab /
+libigl / Meshroom de-facto) accepted on parse, populated on
+`Primitive::colors[0]`, and re-emitted at the source's original
+3-/4-/6-/7-token width via the `obj:vertex_color_present` bitmap.
+The `v` 4th `w` weight component is now preserved through
+`Primitive::extras["obj:vertex_weight"]` rather than silently dropped.
 
 The `.mod` binary form remains out of scope; tessellation evaluators
 that turn captured `cstype + deg + curv + parm` blocks into actual
