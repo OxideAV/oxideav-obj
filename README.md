@@ -47,7 +47,9 @@ The companion **MTL** parser/serialiser handles:
   (from `Kd`) + `emissive_factor` (from `Ke`); `Ka` / `Ks` and the
   `Ns` exponent are stashed in `Material::extras` for round-trip.
 - Transparency (`d` dissolve / `Tr = 1 - d`) → `AlphaMode::Blend`
-  + `base_color.a`.
+  + `base_color.a`. The `d -halo factor` orientation-dependent
+  variant is detected and re-emitted via
+  `Material::extras["mtl:d_halo_factor"]`.
 - Index of refraction (`Ni`) and illumination model (`illum`) → extras.
 - Transmission filter (`Tf r g b`, with `g`/`b` defaulting to `r`),
   reflection sharpness (`sharpness`), and displacement / decal /
@@ -56,7 +58,11 @@ The companion **MTL** parser/serialiser handles:
 - Texture references (`map_Kd` → `base_color_texture`,
   `map_Bump` → `normal_texture`, `map_d` etc.) emitted as
   `ImageData::External { uri, mime: None }` — the caller resolves
-  paths against the OBJ file's directory.
+  paths against the OBJ file's directory. Leading `-flag value`
+  option chunks (`-blendu`, `-bm`, `-mm`, `-clamp`, `-imfchan`, `-o`,
+  `-s`, `-t`, `-texres`) are parsed out of the filename and surfaced
+  via `Material::extras["mtl:<map_name>:options"]`; the encoder
+  splices them back inline.
 - Wavefront-PBR extension (`Pr` roughness, `Pm` metallic, `Pc`
   clearcoat, `Ps` sheen, `map_Pr` / `map_Pm`) → `Material::roughness`
   / `Material::metallic` / `metallic_roughness_texture`.

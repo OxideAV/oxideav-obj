@@ -24,6 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `["obj:d_interp"]` / `["obj:lod"]`. Mid-stream changes split the
   primitive so each one carries one consistent assignment per
   attribute.
+- MTL `map_*` directive option flags (`-blendu`, `-blendv`, `-cc`,
+  `-clamp`, `-bm`, `-boost`, `-mm`, `-o`, `-s`, `-t`, `-texres`,
+  `-imfchan`, `-type`) are stripped out of the filename at parse
+  time and preserved in `Material::extras["mtl:<map_name>:options"]`
+  as an array of `"<flag> <args>"` strings. The encoder splices the
+  saved options back ahead of the filename so a round-trip emits
+  `map_Kd -clamp on path.png` rather than dropping the flags.
+- MTL `d -halo factor` orientation-dependent dissolve is detected on
+  parse, surfaced via `Material::extras["mtl:d_halo_factor"]`, and
+  re-emitted as `d -halo <factor>` rather than the plain `d` form.
 - Multi-name `g` lines: `g name1 name2 …` captures every name as a
   distinct group entry in `Primitive::extras["obj:groups"]` and the
   encoder re-emits them on a single `g` line.

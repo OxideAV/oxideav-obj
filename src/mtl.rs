@@ -294,14 +294,31 @@ fn apply_directive(
                 .insert("mtl:Ni".to_string(), serde_json::json!(v));
         }
         "d" => {
-            let v: f32 = tokens
-                .next()
-                .ok_or_else(|| Error::invalid("d: missing value"))?
-                .parse()
-                .map_err(|e| Error::invalid(format!("d: bad float ({e})")))?;
+            // The first non-flag token is the dissolve value. The
+            // optional `-halo` flag (per spec §"d -halo factor")
+            // makes the dissolve orientation-dependent — surface it
+            // via extras so the round-trip emits the same form.
+            let mut halo = false;
+            let mut value: Option<f32> = None;
+            for tok in tokens.by_ref() {
+                if tok == "-halo" {
+                    halo = true;
+                    continue;
+                }
+                value = Some(
+                    tok.parse()
+                        .map_err(|e| Error::invalid(format!("d: bad float ({e})")))?,
+                );
+                break;
+            }
+            let v = value.ok_or_else(|| Error::invalid("d: missing value"))?;
             mat.base_color[3] = v;
             if v < 1.0 {
                 mat.alpha_mode = AlphaMode::Blend;
+            }
+            if halo {
+                mat.extras
+                    .insert("mtl:d_halo_factor".to_string(), serde_json::json!(v));
             }
         }
         "Tr" => {
@@ -379,13 +396,13 @@ fn apply_directive(
                 .insert(format!("mtl:{keyword}"), serde_json::json!(v));
         }
         "map_Kd" => {
-            pm.pending.base_color = Some(map_filename(tokens));
+            pm.pending.base_color = Some(parse_map_with_options(keyword, tokens, &mut mat.extras));
         }
         "map_Bump" | "map_bump" | "bump" | "norm" => {
-            pm.pending.normal = Some(map_filename(tokens));
+            pm.pending.normal = Some(parse_map_with_options(keyword, tokens, &mut mat.extras));
         }
         "map_Ke" => {
-            pm.pending.emissive = Some(map_filename(tokens));
+            pm.pending.emissive = Some(parse_map_with_options(keyword, tokens, &mut mat.extras));
         }
         "map_Pr" | "map_Pm" => {
             // Either of the two PBR maps lands in metallic_roughness — the
@@ -393,7 +410,7 @@ fn apply_directive(
             // We can't fuse two file references into one packed texture
             // without decoding pixels, so the last-seen wins; the other
             // is stashed in extras for round-trip.
-            let s = map_filename(tokens);
+            let s = parse_map_with_options(keyword, tokens, &mut mat.extras);
             if let Some(prev) = pm.pending.metallic_roughness.replace(s.clone()) {
                 mat.extras.insert(
                     "mtl:displaced_pbr_map".to_string(),
@@ -409,7 +426,7 @@ fn apply_directive(
             // Both the bare (`disp`, `decal`, `refl`) and `map_*`
             // variants are accepted; the original spelling is kept as
             // the extras key so the encoder re-emits the same form.
-            let s = map_filename(tokens);
+            let s = parse_map_with_options(keyword, tokens, &mut mat.extras);
             mat.extras
                 .insert(format!("mtl:{keyword}"), serde_json::Value::String(s));
         }
@@ -419,13 +436,89 @@ fn apply_directive(
     Ok(())
 }
 
-/// Concatenate the remaining tokens. `map_*` directives technically
-/// allow leading option tokens (`-blendu`, `-mm 0.0 1.0`, etc.); for
-/// round 1 we treat the whole tail as the filename and rely on extras
-/// preservation in callers that need it. Filenames with spaces are
-/// handled by the join.
-fn map_filename(tokens: &mut std::str::SplitWhitespace<'_>) -> String {
-    tokens.collect::<Vec<_>>().join(" ")
+/// Split a `map_*` token stream into `(options, filename)`.
+///
+/// `map_Kd -blendu off -clamp on -mm 0 1 path/to/diffuse.png`
+/// returns `(["-blendu off", "-clamp on", "-mm 0 1"], "path/to/diffuse.png")`.
+///
+/// Each leading `-flag` token consumes a known number of arguments
+/// per the MTL spec ("Options for texture map statements", Bourke
+/// mirror line 540 onwards). Once a token that is neither a flag nor
+/// a flag argument is encountered, the rest of the line is treated
+/// as the filename (joined with single spaces so paths with embedded
+/// whitespace round-trip).
+fn map_options_and_filename(tokens: &mut std::str::SplitWhitespace<'_>) -> (Vec<String>, String) {
+    let toks: Vec<&str> = tokens.collect();
+    let mut opts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        // Only `-letter…` is a flag; bare integers / negative numbers
+        // for paths starting with `-` would also start with `-`,
+        // but the second char is the discriminator (alphabetic ⇒ flag).
+        let is_flag = t.starts_with('-')
+            && t.len() > 1
+            && t.chars().nth(1).is_some_and(|c| c.is_ascii_alphabetic());
+        if !is_flag {
+            break;
+        }
+        let arg_count = flag_arg_count(t);
+        if arg_count == 0 {
+            // Unknown flag — preserve verbatim and hope the next token
+            // is the filename. Bumps the index by 1.
+            opts.push(t.to_string());
+            i += 1;
+            continue;
+        }
+        // Make sure we have enough remaining tokens; if not, the file
+        // name was truncated mid-flag and we surface the original
+        // tail verbatim so the user sees the malformed input.
+        let end = (i + 1 + arg_count).min(toks.len());
+        let chunk: Vec<&str> = toks[i..end].to_vec();
+        opts.push(chunk.join(" "));
+        i = end;
+    }
+    let filename = toks[i..].join(" ");
+    (opts, filename)
+}
+
+/// Number of arguments that follow a known `map_*` option flag, per
+/// the MTL spec. Unknown flags return 0 → the parser preserves the
+/// flag literally and treats the next token as the filename.
+fn flag_arg_count(flag: &str) -> usize {
+    match flag {
+        "-blendu" | "-blendv" | "-cc" | "-clamp" => 1, // on | off
+        "-bm" | "-boost" | "-texres" => 1,             // single float / int
+        "-imfchan" | "-type" => 1,                     // single char / keyword
+        "-mm" => 2,                                    // base gain
+        // `-o`, `-s`, `-t` are documented as `u [v] [w]` — variable
+        // arity. We greedily consume up to three numeric tokens after
+        // the flag in `consume_uvw`, but the static count is 3 so
+        // well-formed inputs round-trip cleanly. If a path follows
+        // earlier than expected (e.g. `-o 1 path.png`), the path
+        // accidentally absorbs the missing v / w; users who need that
+        // edge case can supply explicit zeros.
+        "-o" | "-s" | "-t" => 3,
+        _ => 0,
+    }
+}
+
+/// Parse a `map_*`-style keyword: split into (options, filename),
+/// stash the options in `extras["mtl:<keyword>:options"]`, and return
+/// the bare filename for caller-side TextureRef wiring.
+fn parse_map_with_options(
+    keyword: &str,
+    tokens: &mut std::str::SplitWhitespace<'_>,
+    extras: &mut std::collections::HashMap<String, serde_json::Value>,
+) -> String {
+    let (opts, filename) = map_options_and_filename(tokens);
+    if !opts.is_empty() {
+        extras.insert(
+            format!("mtl:{keyword}:options"),
+            serde_json::Value::Array(opts.into_iter().map(serde_json::Value::String).collect()),
+        );
+    }
+    filename
 }
 
 // ---------------------------------------------------------------------------
@@ -515,7 +608,13 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
             writeln!(out, "sharpness {}", fmt_f(v as f32)).unwrap();
         }
         if mat.base_color[3] < 1.0 || matches!(mat.alpha_mode, AlphaMode::Blend) {
-            writeln!(out, "d {}", fmt_f(mat.base_color[3])).unwrap();
+            // Emit `d -halo <factor>` when the parser captured a halo
+            // dissolve, otherwise the canonical `d <value>` form.
+            if mat.extras.contains_key("mtl:d_halo_factor") {
+                writeln!(out, "d -halo {}", fmt_f(mat.base_color[3])).unwrap();
+            } else {
+                writeln!(out, "d {}", fmt_f(mat.base_color[3])).unwrap();
+            }
         }
         if let Some(v) = mat.extras.get("mtl:illum").and_then(|v| v.as_i64()) {
             writeln!(out, "illum {v}").unwrap();
@@ -540,11 +639,37 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
             writeln!(out, "Ps {}", fmt_f(v as f32)).unwrap();
         }
 
-        // Texture references.
-        write_tex_ref(&mut out, "map_Kd", mat.base_color_texture, textures);
-        write_tex_ref(&mut out, "map_Bump", mat.normal_texture, textures);
-        write_tex_ref(&mut out, "map_Pr", mat.metallic_roughness_texture, textures);
-        write_tex_ref(&mut out, "map_Ke", mat.emissive_texture, textures);
+        // Texture references — splice any saved `-flag value` option
+        // chunks back ahead of the filename so the round-trip emits
+        // `map_Kd -clamp on path.png` instead of just `map_Kd path.png`.
+        write_tex_ref(
+            &mut out,
+            "map_Kd",
+            mat.base_color_texture,
+            textures,
+            &mat.extras,
+        );
+        write_tex_ref(
+            &mut out,
+            "map_Bump",
+            mat.normal_texture,
+            textures,
+            &mat.extras,
+        );
+        write_tex_ref(
+            &mut out,
+            "map_Pr",
+            mat.metallic_roughness_texture,
+            textures,
+            &mat.extras,
+        );
+        write_tex_ref(
+            &mut out,
+            "map_Ke",
+            mat.emissive_texture,
+            textures,
+            &mat.extras,
+        );
 
         // Pass-through extras — `mtl:*` keys we didn't consume above.
         for (k, v) in &mat.extras {
@@ -562,14 +687,30 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
                 | "mtl:Ps"
                 | "mtl:Tf"
                 | "mtl:sharpness"
-                | "mtl:displaced_pbr_map" => continue,
+                | "mtl:displaced_pbr_map"
+                | "mtl:d_halo_factor" => continue,
                 _ => {}
+            }
+            // `mtl:<map>:options` chunks are spliced inline by
+            // write_tex_ref / the bare-`disp`-etc pass-through; skip
+            // them here so they don't double-emit as a standalone line.
+            if k.ends_with(":options") {
+                continue;
             }
             // Only emit string-valued passthrough keys (textures we didn't model);
             // numeric ones we don't consume just stay as side-channel metadata.
             if let Some(s) = v.as_str() {
                 let kw = k.strip_prefix("mtl:").unwrap_or(k.as_str());
-                writeln!(out, "{kw} {s}").unwrap();
+                // Splice options ahead of the filename for keys that
+                // have an associated `:options` companion (disp /
+                // decal / refl / map_Ka / map_Ks / map_Ns / map_d).
+                let opts_key = format!("mtl:{kw}:options");
+                if let Some(serde_json::Value::Array(opts)) = mat.extras.get(&opts_key) {
+                    let parts: Vec<&str> = opts.iter().filter_map(|o| o.as_str()).collect();
+                    writeln!(out, "{kw} {} {s}", parts.join(" ")).unwrap();
+                } else {
+                    writeln!(out, "{kw} {s}").unwrap();
+                }
             }
         }
 
@@ -579,14 +720,46 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
     Ok(out.into_bytes())
 }
 
-fn write_tex_ref(out: &mut String, keyword: &str, ref_: Option<TextureRef>, textures: &[Texture]) {
+fn write_tex_ref(
+    out: &mut String,
+    keyword: &str,
+    ref_: Option<TextureRef>,
+    textures: &[Texture],
+    extras: &std::collections::HashMap<String, serde_json::Value>,
+) {
     use std::fmt::Write;
     let Some(r) = ref_ else { return };
     let Some(tex) = textures.get(r.texture.0 as usize) else {
         return;
     };
     if let ImageData::External { uri, .. } = &tex.image {
-        writeln!(out, "{keyword} {uri}").unwrap();
+        // Splice any saved option flags ahead of the filename. The
+        // options key uses the canonical map keyword (e.g. `map_Bump`)
+        // even when the user originally wrote `bump` / `map_bump` /
+        // `norm` — those alias keywords store options under whatever
+        // spelling the user used, so try both.
+        let opts_key = format!("mtl:{keyword}:options");
+        let alt_keys: &[&str] = match keyword {
+            "map_Bump" => &[
+                "mtl:map_bump:options",
+                "mtl:bump:options",
+                "mtl:norm:options",
+            ],
+            _ => &[],
+        };
+        let opts = extras
+            .get(&opts_key)
+            .or_else(|| alt_keys.iter().find_map(|k| extras.get(*k)));
+        if let Some(serde_json::Value::Array(arr)) = opts {
+            let parts: Vec<&str> = arr.iter().filter_map(|o| o.as_str()).collect();
+            if parts.is_empty() {
+                writeln!(out, "{keyword} {uri}").unwrap();
+            } else {
+                writeln!(out, "{keyword} {} {uri}", parts.join(" ")).unwrap();
+            }
+        } else {
+            writeln!(out, "{keyword} {uri}").unwrap();
+        }
     }
 }
 
