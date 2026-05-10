@@ -249,21 +249,75 @@ fn apply_directive(
             mat.emissive_factor = [v[0], v[1], v[2]];
         }
         "Tf" => {
-            // Transmission filter — preserved as an `[r,g,b]` array in
-            // extras (we don't model it as a first-class field; PBR
-            // transmission is its own KHR extension on the glTF side).
-            // Per MTL spec §"Tf r g b", g and b default to r when
-            // omitted; we eagerly normalise to a 3-tuple so the
-            // round-trip emits a canonical line.
-            let v = parse_floats(tokens.by_ref(), keyword)?;
-            if v.is_empty() {
-                return Err(Error::invalid("Tf: needs at least 1 float"));
+            // Transmission filter. Spec §"Tf r g b" lists three mutually
+            // exclusive forms:
+            //
+            //   Tf r g b               — RGB triple (g/b default to r)
+            //   Tf spectral file.rfl factor    — spectral .rfl curve
+            //   Tf xyz x y z           — CIEXYZ tristimulus (y/z default to x)
+            //
+            // The RGB form lands in `extras["mtl:Tf"]` as an
+            // `[r,g,b]` array (the round-1 behaviour); the alt forms
+            // land under sibling keys so a re-emit reproduces the
+            // operator's chosen spelling. PBR transmission is its
+            // own KHR extension on the glTF side, so we don't model
+            // any of the variants as a first-class `Material` field.
+            //
+            // The first token discriminates: `spectral` / `xyz` /
+            // anything-else (treated as a numeric `r`).
+            let toks: Vec<&str> = tokens.collect();
+            if toks.is_empty() {
+                return Err(Error::invalid("Tf: needs at least 1 argument"));
             }
-            let r = v[0];
-            let g = v.get(1).copied().unwrap_or(r);
-            let b = v.get(2).copied().unwrap_or(r);
-            mat.extras
-                .insert("mtl:Tf".to_string(), serde_json::json!([r, g, b]));
+            match toks[0] {
+                "spectral" => {
+                    if toks.len() < 2 {
+                        return Err(Error::invalid("Tf spectral: missing file.rfl"));
+                    }
+                    let file = toks[1].to_string();
+                    let factor: f32 = if let Some(f) = toks.get(2) {
+                        f.parse()
+                            .map_err(|e| Error::invalid(format!("Tf spectral: bad factor ({e})")))?
+                    } else {
+                        1.0
+                    };
+                    mat.extras.insert(
+                        "mtl:Tf:spectral".to_string(),
+                        serde_json::json!({ "file": file, "factor": factor }),
+                    );
+                }
+                "xyz" => {
+                    let v: Vec<f32> = toks[1..]
+                        .iter()
+                        .map(|s| s.parse::<f32>())
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(|e| Error::invalid(format!("Tf xyz: bad float ({e})")))?;
+                    if v.is_empty() {
+                        return Err(Error::invalid("Tf xyz: needs at least 1 float"));
+                    }
+                    let x = v[0];
+                    let y = v.get(1).copied().unwrap_or(x);
+                    let z = v.get(2).copied().unwrap_or(x);
+                    mat.extras
+                        .insert("mtl:Tf:xyz".to_string(), serde_json::json!([x, y, z]));
+                }
+                _ => {
+                    // Plain RGB form. Per MTL spec §"Tf r g b", g and
+                    // b default to r when omitted; we eagerly
+                    // normalise to a 3-tuple so the round-trip emits
+                    // a canonical line.
+                    let v: Vec<f32> = toks
+                        .iter()
+                        .map(|s| s.parse::<f32>())
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(|e| Error::invalid(format!("Tf: bad float ({e})")))?;
+                    let r = v[0];
+                    let g = v.get(1).copied().unwrap_or(r);
+                    let b = v.get(2).copied().unwrap_or(r);
+                    mat.extras
+                        .insert("mtl:Tf".to_string(), serde_json::json!([r, g, b]));
+                }
+            }
         }
         "sharpness" => {
             // Reflection-map sharpness; spec range 0..1000, default 60.
@@ -590,12 +644,37 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
         if let Some(v) = mat.extras.get("mtl:Ni").and_then(|v| v.as_f64()) {
             writeln!(out, "Ni {}", fmt_f(v as f32)).unwrap();
         }
-        // Tf transmission filter (RGB triple).
+        // Tf transmission filter — one of three mutually exclusive
+        // forms per spec §"Tf". Only the first present extras key is
+        // emitted (per the spec's mutual-exclusion clause).
         if let Some(serde_json::Value::Array(v)) = mat.extras.get("mtl:Tf") {
             if let [a, b, c] = v.as_slice() {
                 writeln!(
                     out,
                     "Tf {} {} {}",
+                    fmt_f(a.as_f64().unwrap_or(0.0) as f32),
+                    fmt_f(b.as_f64().unwrap_or(0.0) as f32),
+                    fmt_f(c.as_f64().unwrap_or(0.0) as f32)
+                )
+                .unwrap();
+            }
+        } else if let Some(serde_json::Value::Object(o)) = mat.extras.get("mtl:Tf:spectral") {
+            // `Tf spectral file.rfl factor` — `factor` defaults to 1.0
+            // and is omitted from the emit when it equals the default,
+            // so the round-trip matches the most common operator-written
+            // form.
+            let file = o.get("file").and_then(|v| v.as_str()).unwrap_or("");
+            let factor = o.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            if (factor - 1.0).abs() < f32::EPSILON {
+                writeln!(out, "Tf spectral {file}").unwrap();
+            } else {
+                writeln!(out, "Tf spectral {file} {}", fmt_f(factor)).unwrap();
+            }
+        } else if let Some(serde_json::Value::Array(v)) = mat.extras.get("mtl:Tf:xyz") {
+            if let [a, b, c] = v.as_slice() {
+                writeln!(
+                    out,
+                    "Tf xyz {} {} {}",
                     fmt_f(a.as_f64().unwrap_or(0.0) as f32),
                     fmt_f(b.as_f64().unwrap_or(0.0) as f32),
                     fmt_f(c.as_f64().unwrap_or(0.0) as f32)
@@ -686,6 +765,8 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
                 | "mtl:Pc"
                 | "mtl:Ps"
                 | "mtl:Tf"
+                | "mtl:Tf:spectral"
+                | "mtl:Tf:xyz"
                 | "mtl:sharpness"
                 | "mtl:displaced_pbr_map"
                 | "mtl:d_halo_factor" => continue,

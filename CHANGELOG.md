@@ -64,6 +64,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MTL `Tf r g b` (transmission filter, with `g` / `b` defaulting to
   `r`) and `sharpness <value>` directives parse into
   `Material::extras` and re-emit on serialisation.
+- MTL `Tf` alternative-form support — `Tf spectral file.rfl factor`
+  lands as `Material::extras["mtl:Tf:spectral"] = {file, factor}` and
+  `Tf xyz x y z` lands as `Material::extras["mtl:Tf:xyz"] = [x, y, z]`
+  (with `y` / `z` defaulting to `x` per spec). The three forms are
+  mutually exclusive on emit; the factor `1.0` default is omitted from
+  the spectral re-emit so it matches the most common operator-written
+  spelling.
 - MTL `disp` ↔ `map_disp`, `decal` ↔ `map_decal`, and `refl` ↔
   `map_refl` keyword aliases land in extras with the original
   spelling preserved as the key.
