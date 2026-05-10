@@ -16,9 +16,15 @@ modern loaders actually load):
   shorthand. Polygons (n-gons) are fan-triangulated on read; the original
   per-face arity is stashed in `Mesh::extras["obj:original_face_arities"]`
   so the encoder can re-emit n-gons rather than triangles.
-- `l` line elements → `Topology::Lines`. The encoder rejoins
-  contiguous segment pairs back into one polyline `l v1 v2 v3 …`
-  rather than emitting one `l v1 v2` per pair.
+- `l` line elements → `Topology::LineStrip` for a single `l` element
+  with three or more distinct vertices, `Topology::LineLoop` when
+  the polyline closes (last vertex equals the first; redundant
+  closing index dropped), or `Topology::Lines` for multi-`l`
+  primitives and 2-vertex segments. The encoder picks the matching
+  emit shape: `LineStrip` writes the natural index list,
+  `LineLoop` re-appends the first index to spell out the closing
+  edge, and `Lines` rejoins contiguous segment pairs into one
+  polyline rather than emitting one `l v1 v2` per pair.
 - `p` point elements → `Topology::Points`. Multi-vertex `p v1 v2 v3 …`
   lines pack onto one element list; mixing point and face/line elements
   under one `usemtl` splits into one primitive per topology.
@@ -63,10 +69,20 @@ The companion **MTL** parser/serialiser handles:
   variant is detected and re-emitted via
   `Material::extras["mtl:d_halo_factor"]`.
 - Index of refraction (`Ni`) and illumination model (`illum`) → extras.
-- Transmission filter (`Tf r g b`, with `g`/`b` defaulting to `r`),
-  reflection sharpness (`sharpness`), and displacement / decal /
+- Transmission filter — three mutually-exclusive forms per spec:
+  `Tf r g b` (with `g`/`b` defaulting to `r`),
+  `Tf spectral file.rfl factor` → `Material::extras["mtl:Tf:spectral"]`,
+  and `Tf xyz x y z` → `Material::extras["mtl:Tf:xyz"]`.
+- Reflection sharpness (`sharpness`) and displacement / decal /
   reflection maps (`disp` ↔ `map_disp`, `decal` ↔ `map_decal`,
   `refl` ↔ `map_refl`) round-trip via extras.
+- Typed reflection maps — `refl -type sphere file` and the six-face
+  `refl -type cube_top|cube_bottom|cube_front|cube_back|cube_left|cube_right`
+  cubemap. Sphere lands as `Material::extras["mtl:refl:sphere"]`;
+  the six face lines bundle into `Material::extras["mtl:refl:cube"]`
+  (one entry per face) so they don't collapse onto each other under
+  last-write-wins; the encoder re-emits one `refl -type <kind> ... file`
+  line per face / sphere in deterministic order.
 - Texture references (`map_Kd` → `base_color_texture`,
   `map_Bump` → `normal_texture`, `map_d` etc.) emitted as
   `ImageData::External { uri, mime: None }` — the caller resolves
@@ -121,10 +137,15 @@ the verbatim `cstype` / `deg` / `curv` / `curv2` / `surf` / `parm` /
 `trim` / `hole` / `scrv` / `sp` / `end` / `bzp` / `bsp` directive
 sequence) — round-trips through `Scene3D::extras` without
 tessellation.
+Round 5: MTL `Tf spectral` / `Tf xyz` alternative transmission-filter
+forms, `refl -type sphere` / `refl -type cube_*` typed reflection-map
+sets bundled into `mtl:refl:sphere` / `mtl:refl:cube` extras, and
+single-`l` polylines promoted to `Topology::LineStrip` /
+`Topology::LineLoop` (with closure detection at decode time).
 
-The `.mod` binary form, MTL `Tf spectral file.rfl factor` / `Tf xyz
-x y z` variants, and the `refl -type cube_*` multi-file reflection-
-map sets remain unimplemented.
+The `.mod` binary form remains out of scope; tessellation evaluators
+that turn captured `cstype + deg + curv + parm` blocks into actual
+mesh primitives are the obvious next round of work.
 
 ## License
 
