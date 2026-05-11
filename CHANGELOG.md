@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ObjDecoder::with_curve_tessellation(samples: u32)` evaluates every
+  `cstype bezier` (and `cstype rat bezier`) `curv` directive via de
+  Casteljau's algorithm at `samples + 1` uniformly-spaced parameter
+  values, producing real `Topology::LineStrip` primitives on a synthetic
+  mesh named `"obj:curves"`. Rational form uses the per-vertex 4th `w`
+  weight (`v x y z w`) and projects the homogeneous blend back to 3D.
+  Each tessellated primitive carries `obj:tessellated_curve = true`,
+  `obj:curve_kind` (`"bezier"` / `"rat_bezier"`), `obj:curve_degree`,
+  `obj:curve_u_range`, and `obj:curve_samples` in `extras` so consumers
+  can filter / inspect derived geometry. `samples == 0` (the default)
+  preserves the round 1-6 behaviour: directives ride as
+  `Scene3D::extras["obj:freeform_directives"]` only, no synthetic mesh.
+  The encoder skips synthetic curve primitives so re-encoding produces
+  the original `cstype` / `curv` / `end` section unchanged. B-spline /
+  cardinal / Taylor / basis-matrix / NURBS bases are out of scope —
+  only the `bezier` family is tessellated this round.
+- Source position pool round-trip: when an OBJ's free-form section
+  (`curv` / `curv2` / `surf` / `bzp` / `bsp`) references positions by
+  absolute index, those positions now ride on
+  `Scene3D::extras["obj:positions"]` (and parallel
+  `obj:position_weights` / `obj:position_colors` arrays for the
+  extension widths) so the encoder re-emits the full `v` block in
+  source order. Previously, positions only referenced by free-form
+  directives were silently dropped on re-encode, which made absolute
+  curve-control-point indices drift after a decode → encode → decode
+  cycle. The fix is invisible to polygon-only OBJs; the extras are
+  populated only when free-form directives that reference indices are
+  present.
+
 ## [0.0.1](https://github.com/OxideAV/oxideav-obj/compare/v0.0.0...v0.0.1) - 2026-05-10
 
 ### Other

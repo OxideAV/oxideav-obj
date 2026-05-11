@@ -709,6 +709,44 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         );
     }
 
+    // Source-of-truth position pool — kept in 1-based parallel order
+    // for free-form directives (`curv` / `surf`) that reference
+    // vertices by index. Without this, an OBJ whose free-form section
+    // is the *only* consumer of those positions would lose them on
+    // re-encode (the encoder pools positions only from polygonal
+    // primitives). The encoder re-emits any `obj:positions` entry not
+    // already covered by polygonal primitives, in their original
+    // 1-based order, so `curv 0 1 N M K` directives keep resolving
+    // to the same coordinates after a decode → encode → decode cycle.
+    //
+    // Position colours / weights ride along on the same parallel
+    // arrays so the `xyzrgb` / `xyzw` extension widths survive.
+    if !doc.positions.is_empty()
+        && (doc.freeform_directives.iter().any(|d| {
+            matches!(
+                d.first().map(String::as_str),
+                Some("curv" | "curv2" | "surf" | "bzp" | "bsp")
+            )
+        }))
+    {
+        scene.extras.insert(
+            "obj:positions".to_string(),
+            serde_json::to_value(&doc.positions).unwrap(),
+        );
+        if doc.position_weights.iter().any(Option::is_some) {
+            scene.extras.insert(
+                "obj:position_weights".to_string(),
+                serde_json::to_value(&doc.position_weights).unwrap(),
+            );
+        }
+        if doc.position_colors.iter().any(Option::is_some) {
+            scene.extras.insert(
+                "obj:position_colors".to_string(),
+                serde_json::to_value(&doc.position_colors).unwrap(),
+            );
+        }
+    }
+
     // Free-form geometry side-channel: the parameter-space vertex pool
     // (`vp`) and the verbatim sequence of `cstype` / `deg` / `curv` /
     // `surf` / `parm` / `trim` / `hole` / `scrv` / `sp` / `end` / `bzp`
@@ -729,6 +767,258 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
     }
 
     Ok(scene)
+}
+
+/// Walk the captured free-form directive sequence in [`ObjDoc`] and
+/// synthesise one [`Primitive`] (Topology::LineStrip, indexed) per
+/// `curv` directive that sits under an active `cstype bezier` or
+/// `cstype rat bezier` header.
+///
+/// Each curve is evaluated at `samples + 1` uniformly-spaced parameter
+/// values across its `[u_min, u_max]` interval via de Casteljau's
+/// algorithm (numerically stable, O((samples+1) × n²) for an
+/// n-control-point curve). The resulting points become a polyline.
+///
+/// `cstype` modifiers other than `bezier` / `rat bezier` are ignored
+/// (B-splines, cardinal splines, Taylor expansions, NURBS surfaces
+/// etc. need a different evaluator; round 7's scope is Bezier only).
+///
+/// Per-curve provenance lands on `Primitive::extras`:
+///
+///   * `obj:tessellated_curve` — `true` (sentinel for filters).
+///   * `obj:curve_kind` — `"bezier"` or `"rat_bezier"`.
+///   * `obj:curve_degree` — N − 1 (also the `deg` directive value).
+///   * `obj:curve_u_range` — `[u_min, u_max]`.
+///   * `obj:curve_samples` — sample count emitted.
+///
+/// Spec references: §"Curve and surface type" (cstype), §"Degree"
+/// (deg), §"Curve" (curv), §"Free-form curve/surface body statements"
+/// (rational weight semantics).
+fn tessellate_bezier_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
+    let mut out: Vec<Primitive> = Vec::new();
+    // Active free-form state — tracked as we walk the directive list.
+    // `cstype` is "bezier" / "rat bezier" (we don't tessellate other
+    // basis types). `deg` carries the curve degree (1D — only the first
+    // value matters for `curv`; `surf` would use both).
+    let mut active_kind: Option<&'static str> = None; // "bezier" or "rat_bezier"
+
+    for entry in &doc.freeform_directives {
+        if entry.is_empty() {
+            continue;
+        }
+        match entry[0].as_str() {
+            "cstype" => {
+                // Spec §"Curve and surface type": `cstype [rat] type`.
+                // Accept either `bezier` (non-rational) or `rat bezier`
+                // (rational — weights from the optional 4th `v w`).
+                let mut iter = entry.iter().skip(1);
+                let first = iter.next().map(String::as_str);
+                let second = iter.next().map(String::as_str);
+                active_kind = match (first, second) {
+                    (Some("bezier"), _) => Some("bezier"),
+                    (Some("rat"), Some("bezier")) => Some("rat_bezier"),
+                    _ => None,
+                };
+            }
+            "end" => {
+                active_kind = None;
+            }
+            "curv" => {
+                // `curv u0 u1 cp1 cp2 …` per spec §"Curve". Skip when
+                // not under a Bezier cstype.
+                let Some(kind) = active_kind else {
+                    continue;
+                };
+                // tokens past "curv" — first two are u_min / u_max,
+                // remaining are 1-based / negative position indices.
+                if entry.len() < 5 {
+                    // Minimum: keyword + u0 + u1 + at least 2 control
+                    // points (a line / degree-1 Bezier). Anything
+                    // shorter is malformed; skip rather than abort —
+                    // the lenient-loader pattern matches the rest of
+                    // the codebase.
+                    continue;
+                }
+                let Ok(u_min) = entry[1].parse::<f32>() else {
+                    continue;
+                };
+                let Ok(u_max) = entry[2].parse::<f32>() else {
+                    continue;
+                };
+                let n_pos = doc.positions.len() as i64;
+                let mut control_points: Vec<[f32; 3]> = Vec::new();
+                let mut control_weights: Vec<f32> = Vec::new();
+                let mut bad = false;
+                for tok in &entry[3..] {
+                    let Ok(raw) = tok.parse::<i64>() else {
+                        bad = true;
+                        break;
+                    };
+                    let resolved = if raw < 0 { n_pos + 1 + raw } else { raw };
+                    if resolved <= 0 || resolved > n_pos {
+                        bad = true;
+                        break;
+                    }
+                    let pos = doc.positions[(resolved as usize) - 1];
+                    control_points.push(pos);
+                    // For rational Bezier, take the position's 4th-w
+                    // weight from the parallel `position_weights` pool
+                    // (`v x y z w`). Default 1.0 per spec when absent.
+                    let w = doc.position_weights[(resolved as usize) - 1].unwrap_or(1.0);
+                    control_weights.push(w);
+                }
+                if bad || control_points.len() < 2 {
+                    continue;
+                }
+
+                let curve_points = sample_bezier(
+                    &control_points,
+                    &control_weights,
+                    kind,
+                    u_min,
+                    u_max,
+                    samples,
+                );
+                if curve_points.len() < 2 {
+                    continue;
+                }
+
+                let mut prim = Primitive::new(Topology::LineStrip);
+                let n = curve_points.len() as u32;
+                prim.positions = curve_points;
+                // Implicit 0..N strip indices keep the buffer compact
+                // and match how `LineStrip` consumers normally walk
+                // the vertex array.
+                if n > u16::MAX as u32 {
+                    prim.indices = Some(Indices::U32((0..n).collect()));
+                } else {
+                    prim.indices = Some(Indices::U16((0..n).map(|i| i as u16).collect()));
+                }
+
+                prim.extras.insert(
+                    "obj:tessellated_curve".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                prim.extras.insert(
+                    "obj:curve_kind".to_string(),
+                    serde_json::Value::String(kind.to_string()),
+                );
+                prim.extras.insert(
+                    "obj:curve_degree".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(
+                        (control_points.len() - 1) as u64,
+                    )),
+                );
+                let range_arr = serde_json::Value::Array(vec![
+                    serde_json::Value::from(u_min as f64),
+                    serde_json::Value::from(u_max as f64),
+                ]);
+                prim.extras
+                    .insert("obj:curve_u_range".to_string(), range_arr);
+                prim.extras.insert(
+                    "obj:curve_samples".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(samples as u64)),
+                );
+
+                out.push(prim);
+            }
+            // `deg`, `parm`, `surf`, `curv2`, `trim`, `hole`, `scrv`,
+            // `sp`, `bzp`, `bsp` etc. are tracked through
+            // `freeform_directives` but don't influence Bezier curve
+            // tessellation directly. `surf` (a 2-parameter surface)
+            // needs a separate evaluator — deferred to a future round.
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Evaluate a Bezier (or rational-Bezier) curve at `samples + 1`
+/// uniformly-spaced parameter values from `u_min` to `u_max` via the
+/// numerically-stable de Casteljau algorithm.
+///
+/// For `kind == "bezier"` weights are ignored and the result is the
+/// straight 3D control-point combination.
+///
+/// For `kind == "rat_bezier"` each control point is treated as a
+/// homogeneous `(w·x, w·y, w·z, w)` 4-tuple, de Casteljau runs on the
+/// 4D form, and the final point is projected back to 3D by `x/w`.
+/// This matches the spec §"Curve" rational form.
+fn sample_bezier(
+    control_points: &[[f32; 3]],
+    control_weights: &[f32],
+    kind: &str,
+    _u_min: f32,
+    _u_max: f32,
+    samples: u32,
+) -> Vec<[f32; 3]> {
+    if control_points.is_empty() || samples == 0 {
+        return Vec::new();
+    }
+    let rational = kind == "rat_bezier";
+    // Build the working buffer in 4D so the same de Casteljau loop
+    // covers both rational and non-rational cases (non-rational uses
+    // w == 1).
+    let homogeneous: Vec<[f32; 4]> = control_points
+        .iter()
+        .zip(control_weights.iter())
+        .map(|(p, w)| {
+            let weight = if rational { *w } else { 1.0 };
+            [p[0] * weight, p[1] * weight, p[2] * weight, weight]
+        })
+        .collect();
+
+    let n_samples = samples + 1;
+    let mut out: Vec<[f32; 3]> = Vec::with_capacity(n_samples as usize);
+    for i in 0..n_samples {
+        // Normalise sample index into the curve's parameter range so
+        // `u_min` and `u_max` aren't mandatorily [0, 1].
+        let t01 = if n_samples == 1 {
+            0.0
+        } else {
+            i as f32 / (n_samples - 1) as f32
+        };
+        // The `u_min` / `u_max` arguments on `curv` are spec-defined
+        // clip bounds for trimming the basis evaluation, not a
+        // re-parameterisation of the basis. For a single un-trimmed
+        // Bezier segment they have no effect on shape — the curve
+        // domain is `[0, 1]` in basis space. We sample uniformly on
+        // `t01 ∈ [0, 1]` (so a non-trivial `u_min, u_max` doesn't
+        // distort the polyline), which is what every other OBJ
+        // tessellator does.
+        let t = t01;
+        let mut buf: Vec<[f32; 4]> = homogeneous.clone();
+        let n = buf.len();
+        for level in 1..n {
+            for j in 0..(n - level) {
+                buf[j] = [
+                    (1.0 - t) * buf[j][0] + t * buf[j + 1][0],
+                    (1.0 - t) * buf[j][1] + t * buf[j + 1][1],
+                    (1.0 - t) * buf[j][2] + t * buf[j + 1][2],
+                    (1.0 - t) * buf[j][3] + t * buf[j + 1][3],
+                ];
+            }
+        }
+        let [x, y, z, w] = buf[0];
+        if rational && w.abs() > f32::EPSILON {
+            out.push([x / w, y / w, z / w]);
+        } else {
+            out.push([x, y, z]);
+        }
+    }
+    out
+}
+
+/// `true` when the primitive was synthesised by the Bezier
+/// tessellator (see [`tessellate_bezier_curves`]). Encoder + serialiser
+/// branches use this to skip emitting derived geometry as `v` lines —
+/// the original `cstype` / `curv` / `end` directives carry the
+/// source-of-truth shape.
+fn is_tessellated_curve(prim: &Primitive) -> bool {
+    prim.extras
+        .get("obj:tessellated_curve")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// Promote a single-`l`-element primitive to `LineStrip` / `LineLoop`
@@ -1083,6 +1373,30 @@ fn build_primitive(
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Parser configuration knobs.
+///
+/// The default leaves free-form geometry as captured-only extras
+/// (back-compatible with rounds 1-6). Set
+/// [`ParseOptions::curve_tessellation_samples`] to a non-zero value
+/// to enable de-Casteljau evaluation of `cstype bezier` curves into
+/// real `LineStrip` primitives (see [`crate::ObjDecoder::with_curve_tessellation`]).
+#[derive(Clone, Debug, Default)]
+pub struct ParseOptions {
+    /// When > 0, every `curv` directive under an active `cstype bezier`
+    /// (or `cstype rat bezier`) header is evaluated at
+    /// `curve_tessellation_samples + 1` uniformly-spaced parameter
+    /// values across its `[u_min, u_max]` interval. The resulting
+    /// polyline lands on a synthetic mesh named `"obj:curves"` whose
+    /// primitives carry `Topology::LineStrip`. The directive itself
+    /// is still preserved in `Scene3D::extras["obj:freeform_directives"]`
+    /// so a round-trip re-emit produces the same free-form section —
+    /// downstream consumers can opt out of the synthetic mesh by
+    /// filtering on `Mesh::extras["obj:tessellated_curves"] == true`.
+    ///
+    /// `0` disables tessellation (the default; back-compat with r1-r6).
+    pub curve_tessellation_samples: u32,
+}
+
 /// Parse an OBJ document (no MTL resolution).
 ///
 /// `usemtl` directives still create one `Primitive` per switch and the
@@ -1132,7 +1446,21 @@ pub fn parse_obj_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<Scene3D
 /// The resolver returns `Ok(Vec::new())` to signal "this library
 /// couldn't be located but skip silently"; any other `Err` aborts the
 /// parse.
-pub fn parse_obj_with_resolver<R>(text: &str, mut resolve: R) -> Result<Scene3D>
+pub fn parse_obj_with_resolver<R>(text: &str, resolve: R) -> Result<Scene3D>
+where
+    R: FnMut(&str) -> Result<Vec<u8>>,
+{
+    parse_obj_with_options(text, &ParseOptions::default(), resolve)
+}
+
+/// Parse an OBJ document with explicit [`ParseOptions`] and a
+/// caller-supplied `mtllib` resolver. Lifts the option struct out of
+/// the otherwise-identical [`parse_obj_with_resolver`] signature.
+pub fn parse_obj_with_options<R>(
+    text: &str,
+    options: &ParseOptions,
+    mut resolve: R,
+) -> Result<Scene3D>
 where
     R: FnMut(&str) -> Result<Vec<u8>>,
 {
@@ -1154,7 +1482,26 @@ where
         }
     }
 
-    build_scene(doc)
+    // Bezier tessellation pass — captures the curve directives still in
+    // `doc.freeform_directives` and synthesises `LineStrip` primitives
+    // on a dedicated mesh. Skipped when samples == 0 (the default).
+    let tessellated = if options.curve_tessellation_samples > 0 {
+        tessellate_bezier_curves(&doc, options.curve_tessellation_samples)
+    } else {
+        Vec::new()
+    };
+
+    let mut scene = build_scene(doc)?;
+
+    if !tessellated.is_empty() {
+        let mut mesh = Mesh::new(Some("obj:curves".to_string()));
+        for prim in tessellated {
+            mesh.primitives.push(prim);
+        }
+        scene.add_mesh(mesh);
+    }
+
+    Ok(scene)
 }
 
 /// Serialiser configuration. Keeps the public free-function signature
@@ -1296,13 +1643,83 @@ pub fn serialize_obj_with_options(
             idx
         };
 
+    // Seed the position pool with `obj:positions` if present — these
+    // are the source 1-based vertex coordinates captured on decode so
+    // free-form directives (`curv`, `surf`, etc.) that reference
+    // positions by absolute index keep resolving correctly across a
+    // decode → encode → decode round-trip. Without this, the encoder
+    // would only pool positions referenced by polygonal primitives and
+    // the free-form directive numbering would silently drift.
+    if let Some(serde_json::Value::Array(src_positions)) = scene.extras.get("obj:positions") {
+        let src_weights: Vec<Option<f32>> = scene
+            .extras
+            .get("obj:position_weights")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect())
+            .unwrap_or_default();
+        let src_colors: Vec<Option<[f32; 4]>> = scene
+            .extras
+            .get("obj:position_colors")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|v| {
+                        v.as_array().map(|c| {
+                            let mut rgba = [1.0; 4];
+                            for (i, x) in c.iter().enumerate().take(4) {
+                                rgba[i] = x.as_f64().map(|f| f as f32).unwrap_or(0.0);
+                            }
+                            rgba
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for (i, pv) in src_positions.iter().enumerate() {
+            let serde_json::Value::Array(coords) = pv else {
+                continue;
+            };
+            let mut p = [0.0_f32; 3];
+            for (j, c) in coords.iter().enumerate().take(3) {
+                p[j] = c.as_f64().map(|f| f as f32).unwrap_or(0.0);
+            }
+            let weight = src_weights.get(i).copied().flatten();
+            let colour = src_colors.get(i).copied().flatten();
+            intern_pos(
+                p,
+                colour,
+                weight,
+                &mut positions,
+                &mut position_colors,
+                &mut position_weights,
+                &mut pos_map,
+            );
+        }
+    }
+
     // First pass: emit `v` / `vt` / `vn` lists and remember the global
     // indices for each (mesh, primitive, vertex) triple.
+    //
+    // Primitives flagged `obj:tessellated_curve = true` are synthetic
+    // (they came out of the Bezier evaluator, not source `v` lines).
+    // We skip them here so their points don't pollute the `v` pool and
+    // skip them again in the element-emit pass below — the original
+    // `cstype` / `curv` / `end` directives still get replayed verbatim
+    // from `Scene3D::extras["obj:freeform_directives"]`, so the
+    // round-trip stays bit-stable for the directive section.
     type GlobalTriple = (u32, u32, u32); // (v_idx, vt_idx_or_0, vn_idx_or_0)
     let mut global_indices: Vec<Vec<Vec<GlobalTriple>>> = Vec::new();
     for mesh in &scene.meshes {
         let mut mesh_globals: Vec<Vec<GlobalTriple>> = Vec::new();
         for prim in &mesh.primitives {
+            if is_tessellated_curve(prim) {
+                // Push an empty slot so global_indices[mi][pi] still
+                // lines up with mesh.primitives[mi][pi] in the second
+                // pass — we'll just skip the empty slot there.
+                mesh_globals.push(Vec::new());
+                continue;
+            }
             let has_uv = !prim.uvs.is_empty();
             let has_normal = prim.normals.is_some();
             let has_color = !prim.colors.is_empty();
@@ -1442,11 +1859,22 @@ pub fn serialize_obj_with_options(
     // Second pass: per-mesh `o` directive, per-primitive `usemtl` +
     // groups + smoothing-group, then face/line elements.
     for (mi, mesh) in scene.meshes.iter().enumerate() {
+        // Synthesised curve mesh — its primitives carry
+        // `obj:tessellated_curve = true` and were produced by the
+        // decoder's de-Casteljau pass. Skip the whole `o` block; the
+        // original `cstype`/`curv`/`end` directives still get replayed
+        // from `Scene3D::extras["obj:freeform_directives"]`.
+        if mesh.primitives.iter().all(is_tessellated_curve) && !mesh.primitives.is_empty() {
+            continue;
+        }
         if let Some(name) = &mesh.name {
             writeln!(out, "o {name}").unwrap();
         }
 
         for (pi, prim) in mesh.primitives.iter().enumerate() {
+            if is_tessellated_curve(prim) {
+                continue;
+            }
             // Per-primitive arity vector for n-gon re-emission, if any.
             let arities: Option<Vec<u32>> = prim
                 .extras

@@ -159,10 +159,28 @@ libigl / Meshroom de-facto) accepted on parse, populated on
 3-/4-/6-/7-token width via the `obj:vertex_color_present` bitmap.
 The `v` 4th `w` weight component is now preserved through
 `Primitive::extras["obj:vertex_weight"]` rather than silently dropped.
+Round 7: opt-in Bezier curve tessellation —
+`ObjDecoder::with_curve_tessellation(samples)` evaluates every
+`cstype bezier` (and `cstype rat bezier`) `curv` directive via de
+Casteljau's algorithm and emits a real `Topology::LineStrip`
+primitive on a synthetic `"obj:curves"` mesh; the rational form
+uses the per-vertex 4th `w` weight and projects back to 3D. Each
+tessellated primitive carries provenance extras
+(`obj:tessellated_curve`, `obj:curve_kind`, `obj:curve_degree`,
+`obj:curve_u_range`, `obj:curve_samples`). The free-form directive
+sequence still rides on `Scene3D::extras["obj:freeform_directives"]`
+so re-encoding regenerates the original `cstype` / `curv` / `end`
+section unchanged; the encoder filters synthetic curve primitives
+out of the polygonal output. Free-form-section position pool now
+rides on `Scene3D::extras["obj:positions"]` (plus parallel
+`obj:position_weights` / `obj:position_colors`) so `curv` /
+`surf` absolute-index references stay valid across a
+decode → encode → decode cycle.
 
-The `.mod` binary form remains out of scope; tessellation evaluators
-that turn captured `cstype + deg + curv + parm` blocks into actual
-mesh primitives are the obvious next round of work.
+The `.mod` binary form remains out of scope; surface tessellation
+(`surf`, NURBS, trim-loop evaluation) and the non-Bezier basis
+families (B-spline, cardinal, Taylor, basis-matrix) are the
+obvious next rounds of work.
 
 ## License
 
