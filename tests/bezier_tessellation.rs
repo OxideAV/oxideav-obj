@@ -278,10 +278,50 @@ end
 }
 
 #[test]
-fn b_spline_and_other_cstype_basis_kinds_are_left_alone() {
-    // Only `cstype bezier` / `cstype rat bezier` get tessellated.
-    // Spline / cardinal / Taylor / basis-matrix / NURBS forms stay as
-    // captured directives so a future evaluator can pick them up.
+fn cardinal_and_other_unsupported_cstype_basis_kinds_are_left_alone() {
+    // Only the basis families with an evaluator land on the synthetic
+    // mesh. Bezier (round 7) + B-spline (round 8) are supported;
+    // Cardinal / Taylor / basis-matrix stay as captured directives so a
+    // future evaluator can pick them up. The example below uses
+    // Cardinal because it's the simplest non-evaluated basis (spec
+    // §"Cardinal": cubic, fixed degree 3).
+    let text = "\
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 2.0 0.0 0.0
+v 3.0 0.0 0.0
+v 4.0 0.0 0.0
+cstype cardinal
+deg 3
+curv 0.0 1.0 1 2 3 4 5
+end
+";
+    let scene = ObjDecoder::new()
+        .with_curve_tessellation(8)
+        .decode(text.as_bytes())
+        .unwrap();
+    // No synthetic curve mesh — Cardinal isn't an evaluator we ship.
+    assert!(
+        scene.meshes.is_empty(),
+        "Cardinal curves must not produce a tessellated mesh"
+    );
+    // Directives still captured for round-trip.
+    let dirs = scene
+        .extras
+        .get("obj:freeform_directives")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert!(!dirs.is_empty());
+}
+
+#[test]
+fn b_spline_without_parm_u_knot_vector_is_left_alone() {
+    // Spec §"B-spline" condition 6 requires
+    //   knots.len() == control_points.len() + degree + 1
+    // If the OBJ is missing a `parm u …` body statement we can't
+    // evaluate; the directive stays in `freeform_directives` and the
+    // synthetic mesh is empty.
     let text = "\
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -295,12 +335,10 @@ end
         .with_curve_tessellation(8)
         .decode(text.as_bytes())
         .unwrap();
-    // No synthetic curve mesh — B-spline isn't a Bezier variant.
     assert!(
         scene.meshes.is_empty(),
-        "B-spline curves must not produce a tessellated mesh"
+        "B-spline without parm u must not produce a tessellated mesh"
     );
-    // Directives still captured for round-trip.
     let dirs = scene
         .extras
         .get("obj:freeform_directives")
