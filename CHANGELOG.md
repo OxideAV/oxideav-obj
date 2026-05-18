@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- B-spline / NURBS curve tessellation under
+  `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
+  evaluates `cstype bspline` and `cstype rat bspline` `curv` directives
+  via the Cox-deBoor recursive basis-function formula (spec §"B-spline"),
+  clipped against the `[x_n, x_{K+1}]` evaluation window of the knot
+  vector supplied by the most-recent `parm u …` body statement. The
+  resulting polyline lands on the existing `"obj:curves"` synthetic
+  mesh with the same `obj:tessellated_curve = true` /
+  `obj:curve_kind` (`"bspline"` / `"rat_bspline"`) /
+  `obj:curve_degree` / `obj:curve_u_range` / `obj:curve_samples`
+  provenance extras. Rational form (NURBS) uses the per-vertex 4th `w`
+  weight and projects the weighted blend back to 3D, matching the
+  spec's `Σ N_{i,n} · w_i · d_i / Σ N_{i,n} · w_i` formulation.
+  Knot-vector length is validated against the spec condition
+  `len == K + degree + 2` and incomplete curves are skipped silently
+  (the directive itself remains captured for round-trip). The
+  tessellator now does two-pass per-block traversal so the `curv`
+  header (which precedes the `parm u` body statement per spec
+  §"Specifying free-form curves/surfaces") still resolves its knot
+  vector. Cardinal / Taylor / basis-matrix bases and `surf`
+  2-parameter surfaces remain captured-only.
 - `ObjDecoder::with_curve_tessellation(samples: u32)` evaluates every
   `cstype bezier` (and `cstype rat bezier`) `curv` directive via de
   Casteljau's algorithm at `samples + 1` uniformly-spaced parameter
@@ -22,9 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserves the round 1-6 behaviour: directives ride as
   `Scene3D::extras["obj:freeform_directives"]` only, no synthetic mesh.
   The encoder skips synthetic curve primitives so re-encoding produces
-  the original `cstype` / `curv` / `end` section unchanged. B-spline /
-  cardinal / Taylor / basis-matrix / NURBS bases are out of scope —
-  only the `bezier` family is tessellated this round.
+  the original `cstype` / `curv` / `end` section unchanged.
 - Source position pool round-trip: when an OBJ's free-form section
   (`curv` / `curv2` / `surf` / `bzp` / `bsp`) references positions by
   absolute index, those positions now ride on

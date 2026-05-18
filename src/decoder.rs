@@ -3,7 +3,8 @@
 //! These are thin wrappers around [`crate::obj::parse_obj`] /
 //! [`crate::mtl::parse_mtl_with_scene`] that conform to the
 //! `oxideav-mesh3d` decoder trait. The OBJ decoder carries one
-//! optional knob — Bezier curve tessellation, opt-in via
+//! optional knob — free-form curve tessellation (Bezier + B-spline,
+//! rational and non-rational), opt-in via
 //! [`ObjDecoder::with_curve_tessellation`]; the wrapper exists so
 //! registry-based lookup gets a uniform `Box<dyn Mesh3DDecoder>`
 //! factory.
@@ -25,8 +26,8 @@ use crate::{mtl, obj};
 /// already available.
 #[derive(Debug, Default)]
 pub struct ObjDecoder {
-    /// Bezier curve tessellation sample count (default 0 — disabled).
-    /// See [`Self::with_curve_tessellation`].
+    /// Free-form curve tessellation sample count (default 0 —
+    /// disabled). See [`Self::with_curve_tessellation`].
     curve_tessellation_samples: u32,
 }
 
@@ -36,12 +37,18 @@ impl ObjDecoder {
         Self::default()
     }
 
-    /// Enable de Casteljau tessellation of `cstype bezier` /
-    /// `cstype rat bezier` free-form curves. `samples` is the number
-    /// of *intervals* — the resulting `LineStrip` carries
-    /// `samples + 1` vertices (so `samples == 32` produces a 33-point
-    /// polyline per curve, smooth enough for diagnostic display
-    /// without overwhelming the buffer).
+    /// Enable tessellation of `cstype` free-form curves:
+    ///
+    ///   * `cstype bezier` / `cstype rat bezier` — de Casteljau
+    ///     evaluation on the `[0, 1]` basis domain.
+    ///   * `cstype bspline` / `cstype rat bspline` — Cox-deBoor
+    ///     recursive basis on the knot vector supplied by the most-
+    ///     recent `parm u …` directive.
+    ///
+    /// `samples` is the number of *intervals* — the resulting
+    /// `LineStrip` carries `samples + 1` vertices (so `samples == 32`
+    /// produces a 33-point polyline per curve, smooth enough for
+    /// diagnostic display without overwhelming the buffer).
     ///
     /// The synthesised primitives land on a synthetic mesh named
     /// `"obj:curves"`; each primitive carries
@@ -49,11 +56,12 @@ impl ObjDecoder {
     /// consumers that don't want the curve geometry can filter it
     /// out. The free-form directive sequence remains preserved in
     /// `Scene3D::extras["obj:freeform_directives"]` so re-encoding
-    /// regenerates the original `cstype` / `deg` / `curv` / `end`
-    /// section.
+    /// regenerates the original `cstype` / `deg` / `curv` / `parm` /
+    /// `end` section.
     ///
     /// `samples == 0` (the default) disables tessellation, matching
-    /// the round 1-6 behaviour.
+    /// the round 1-6 behaviour. Cardinal / Taylor / basis-matrix
+    /// bases and `surf` 2D surfaces remain captured-only.
     pub fn with_curve_tessellation(mut self, samples: u32) -> Self {
         self.curve_tessellation_samples = samples;
         self

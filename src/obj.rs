@@ -771,36 +771,60 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
 
 /// Walk the captured free-form directive sequence in [`ObjDoc`] and
 /// synthesise one [`Primitive`] (Topology::LineStrip, indexed) per
-/// `curv` directive that sits under an active `cstype bezier` or
-/// `cstype rat bezier` header.
+/// `curv` directive that sits under a supported `cstype` header.
+///
+/// Supported `cstype` values:
+///
+///   * `bezier` / `rat bezier` — round 7, de Casteljau evaluation on the
+///     `[0, 1]` basis domain.
+///   * `bspline` / `rat bspline` — round 8, Cox-deBoor recursive basis
+///     functions evaluated on `[t_min, t_max]` derived from the curve's
+///     `u_min` / `u_max` clipped against the active knot vector parsed
+///     from the most-recent `parm u` body statement.
 ///
 /// Each curve is evaluated at `samples + 1` uniformly-spaced parameter
-/// values across its `[u_min, u_max]` interval via de Casteljau's
-/// algorithm (numerically stable, O((samples+1) × n²) for an
-/// n-control-point curve). The resulting points become a polyline.
+/// values across its evaluation interval. The resulting points become a
+/// polyline.
 ///
-/// `cstype` modifiers other than `bezier` / `rat bezier` are ignored
-/// (B-splines, cardinal splines, Taylor expansions, NURBS surfaces
-/// etc. need a different evaluator; round 7's scope is Bezier only).
+/// `cstype` modifiers other than the listed kinds are ignored (cardinal
+/// splines, Taylor expansions, basis-matrix curves, NURBS surfaces etc.
+/// need a different evaluator). `surf` (2-parameter surfaces) is also
+/// deferred — only 1D `curv` is handled here.
 ///
 /// Per-curve provenance lands on `Primitive::extras`:
 ///
 ///   * `obj:tessellated_curve` — `true` (sentinel for filters).
-///   * `obj:curve_kind` — `"bezier"` or `"rat_bezier"`.
-///   * `obj:curve_degree` — N − 1 (also the `deg` directive value).
-///   * `obj:curve_u_range` — `[u_min, u_max]`.
+///   * `obj:curve_kind` — `"bezier"` / `"rat_bezier"` / `"bspline"` /
+///     `"rat_bspline"`.
+///   * `obj:curve_degree` — basis polynomial degree.
+///   * `obj:curve_u_range` — `[u_min, u_max]` from the `curv` directive.
 ///   * `obj:curve_samples` — sample count emitted.
 ///
 /// Spec references: §"Curve and surface type" (cstype), §"Degree"
-/// (deg), §"Curve" (curv), §"Free-form curve/surface body statements"
-/// (rational weight semantics).
-fn tessellate_bezier_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
+/// (deg), §"Curve" (curv), §"Parameter values and knot vectors"
+/// (parm), §"B-spline" (Cox-deBoor recursion), §"Free-form curve/surface
+/// body statements" (rational weight semantics).
+fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
+    // Spec §"Specifying free-form curves/surfaces": the curve / surface
+    // header (`curv` / `surf`) lists control points, and the *body*
+    // statements (`parm`, `trim`, `hole`, `scrv`, `sp`) follow before
+    // the block-terminating `end`. That means a `curv` directive is
+    // syntactically ahead of the `parm u …` knot vector it depends on
+    // — we can't tessellate B-splines on a single linear walk.
+    //
+    // Strategy: scan into per-block records (`cstype` opens, `end`
+    // closes), accumulate the relevant directives, then evaluate every
+    // pending `curv` once the body is fully visible. The Bezier path
+    // doesn't need the body but uses the same scaffolding for
+    // simplicity.
     let mut out: Vec<Primitive> = Vec::new();
-    // Active free-form state — tracked as we walk the directive list.
-    // `cstype` is "bezier" / "rat bezier" (we don't tessellate other
-    // basis types). `deg` carries the curve degree (1D — only the first
-    // value matters for `curv`; `surf` would use both).
-    let mut active_kind: Option<&'static str> = None; // "bezier" or "rat_bezier"
+
+    // Pending state inside the current `cstype` … `end` block.
+    let mut active_kind: Option<&'static str> = None;
+    let mut active_degree: Option<u32> = None;
+    let mut parm_u: Vec<f32> = Vec::new();
+    // `curv` directives queued for this block — evaluated on `end`.
+    let mut pending_curves: Vec<&Vec<String>> = Vec::new();
 
     for entry in &doc.freeform_directives {
         if entry.is_empty() {
@@ -808,129 +832,241 @@ fn tessellate_bezier_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
         }
         match entry[0].as_str() {
             "cstype" => {
+                // Flush the previous block (rare — OBJ usually ends
+                // each block with `end`, but be defensive).
+                flush_block(
+                    &mut out,
+                    doc,
+                    active_kind,
+                    active_degree,
+                    &parm_u,
+                    &pending_curves,
+                    samples,
+                );
+                pending_curves.clear();
+                parm_u.clear();
+                active_degree = None;
+
                 // Spec §"Curve and surface type": `cstype [rat] type`.
-                // Accept either `bezier` (non-rational) or `rat bezier`
-                // (rational — weights from the optional 4th `v w`).
                 let mut iter = entry.iter().skip(1);
                 let first = iter.next().map(String::as_str);
                 let second = iter.next().map(String::as_str);
                 active_kind = match (first, second) {
                     (Some("bezier"), _) => Some("bezier"),
                     (Some("rat"), Some("bezier")) => Some("rat_bezier"),
+                    (Some("bspline"), _) => Some("bspline"),
+                    (Some("rat"), Some("bspline")) => Some("rat_bspline"),
                     _ => None,
                 };
             }
-            "end" => {
-                active_kind = None;
+            "deg" => {
+                // Spec §"Degree": `deg degu [degv]`. We only consume
+                // `degu` for 1D `curv` tessellation; `degv` is captured
+                // in the directive sequence but unused here.
+                if let Some(d) = entry.get(1).and_then(|t| t.parse::<u32>().ok()) {
+                    active_degree = Some(d);
+                }
+            }
+            // Spec §"Parameter values and knot vectors":
+            // `parm u p1 p2 p3 …` (or `parm v …`). For 1D curves we
+            // only need the `u` knot vector / parameter vector.
+            "parm" if entry.get(1).map(String::as_str) == Some("u") => {
+                parm_u = entry[2..]
+                    .iter()
+                    .filter_map(|t| t.parse::<f32>().ok())
+                    .collect();
             }
             "curv" => {
-                // `curv u0 u1 cp1 cp2 …` per spec §"Curve". Skip when
-                // not under a Bezier cstype.
-                let Some(kind) = active_kind else {
-                    continue;
-                };
-                // tokens past "curv" — first two are u_min / u_max,
-                // remaining are 1-based / negative position indices.
-                if entry.len() < 5 {
-                    // Minimum: keyword + u0 + u1 + at least 2 control
-                    // points (a line / degree-1 Bezier). Anything
-                    // shorter is malformed; skip rather than abort —
-                    // the lenient-loader pattern matches the rest of
-                    // the codebase.
-                    continue;
-                }
-                let Ok(u_min) = entry[1].parse::<f32>() else {
-                    continue;
-                };
-                let Ok(u_max) = entry[2].parse::<f32>() else {
-                    continue;
-                };
-                let n_pos = doc.positions.len() as i64;
-                let mut control_points: Vec<[f32; 3]> = Vec::new();
-                let mut control_weights: Vec<f32> = Vec::new();
-                let mut bad = false;
-                for tok in &entry[3..] {
-                    let Ok(raw) = tok.parse::<i64>() else {
-                        bad = true;
-                        break;
-                    };
-                    let resolved = if raw < 0 { n_pos + 1 + raw } else { raw };
-                    if resolved <= 0 || resolved > n_pos {
-                        bad = true;
-                        break;
-                    }
-                    let pos = doc.positions[(resolved as usize) - 1];
-                    control_points.push(pos);
-                    // For rational Bezier, take the position's 4th-w
-                    // weight from the parallel `position_weights` pool
-                    // (`v x y z w`). Default 1.0 per spec when absent.
-                    let w = doc.position_weights[(resolved as usize) - 1].unwrap_or(1.0);
-                    control_weights.push(w);
-                }
-                if bad || control_points.len() < 2 {
-                    continue;
-                }
-
-                let curve_points = sample_bezier(
-                    &control_points,
-                    &control_weights,
-                    kind,
-                    u_min,
-                    u_max,
+                // Defer evaluation until `end` — the body statement
+                // `parm u …` that supplies the B-spline knot vector
+                // hasn't been seen yet at this point.
+                pending_curves.push(entry);
+            }
+            "end" => {
+                flush_block(
+                    &mut out,
+                    doc,
+                    active_kind,
+                    active_degree,
+                    &parm_u,
+                    &pending_curves,
                     samples,
                 );
-                if curve_points.len() < 2 {
-                    continue;
-                }
-
-                let mut prim = Primitive::new(Topology::LineStrip);
-                let n = curve_points.len() as u32;
-                prim.positions = curve_points;
-                // Implicit 0..N strip indices keep the buffer compact
-                // and match how `LineStrip` consumers normally walk
-                // the vertex array.
-                if n > u16::MAX as u32 {
-                    prim.indices = Some(Indices::U32((0..n).collect()));
-                } else {
-                    prim.indices = Some(Indices::U16((0..n).map(|i| i as u16).collect()));
-                }
-
-                prim.extras.insert(
-                    "obj:tessellated_curve".to_string(),
-                    serde_json::Value::Bool(true),
-                );
-                prim.extras.insert(
-                    "obj:curve_kind".to_string(),
-                    serde_json::Value::String(kind.to_string()),
-                );
-                prim.extras.insert(
-                    "obj:curve_degree".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(
-                        (control_points.len() - 1) as u64,
-                    )),
-                );
-                let range_arr = serde_json::Value::Array(vec![
-                    serde_json::Value::from(u_min as f64),
-                    serde_json::Value::from(u_max as f64),
-                ]);
-                prim.extras
-                    .insert("obj:curve_u_range".to_string(), range_arr);
-                prim.extras.insert(
-                    "obj:curve_samples".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(samples as u64)),
-                );
-
-                out.push(prim);
+                pending_curves.clear();
+                parm_u.clear();
+                active_kind = None;
+                active_degree = None;
             }
-            // `deg`, `parm`, `surf`, `curv2`, `trim`, `hole`, `scrv`,
-            // `sp`, `bzp`, `bsp` etc. are tracked through
-            // `freeform_directives` but don't influence Bezier curve
-            // tessellation directly. `surf` (a 2-parameter surface)
-            // needs a separate evaluator — deferred to a future round.
+            // `surf`, `curv2`, `trim`, `hole`, `scrv`, `sp`, `bzp`,
+            // `bsp` etc. are tracked through `freeform_directives` but
+            // don't influence 1D-curve tessellation directly. `surf`
+            // (a 2-parameter surface) needs a separate evaluator —
+            // deferred to a future round.
             _ => {}
         }
     }
+    // Tail flush — a malformed OBJ might omit the closing `end`. Spec
+    // §"Free-form curve/surface body statements" requires it, but the
+    // rest of the loader is lenient so we are too.
+    flush_block(
+        &mut out,
+        doc,
+        active_kind,
+        active_degree,
+        &parm_u,
+        &pending_curves,
+        samples,
+    );
     out
+}
+
+/// Evaluate every `curv` entry queued for the current `cstype … end`
+/// block, appending tessellated primitives to `out`. A block whose
+/// state is incomplete (missing `cstype`, missing knot vector for
+/// B-spline, malformed control-point indices, …) is silently dropped —
+/// the directive sequence already rides on `Scene3D::extras` for
+/// downstream consumers.
+#[allow(clippy::too_many_arguments)]
+fn flush_block(
+    out: &mut Vec<Primitive>,
+    doc: &ObjDoc,
+    active_kind: Option<&'static str>,
+    active_degree: Option<u32>,
+    parm_u: &[f32],
+    pending_curves: &[&Vec<String>],
+    samples: u32,
+) {
+    let Some(kind) = active_kind else {
+        return;
+    };
+    for entry in pending_curves {
+        // tokens past "curv" — first two are u_min / u_max,
+        // remaining are 1-based / negative position indices.
+        if entry.len() < 5 {
+            // Minimum: keyword + u0 + u1 + at least 2 control points
+            // (a line / degree-1 curve). Anything shorter is malformed;
+            // skip rather than abort — the lenient-loader pattern
+            // matches the rest of the codebase.
+            continue;
+        }
+        let Ok(u_min) = entry[1].parse::<f32>() else {
+            continue;
+        };
+        let Ok(u_max) = entry[2].parse::<f32>() else {
+            continue;
+        };
+        let n_pos = doc.positions.len() as i64;
+        let mut control_points: Vec<[f32; 3]> = Vec::new();
+        let mut control_weights: Vec<f32> = Vec::new();
+        let mut bad = false;
+        for tok in &entry[3..] {
+            let Ok(raw) = tok.parse::<i64>() else {
+                bad = true;
+                break;
+            };
+            let resolved = if raw < 0 { n_pos + 1 + raw } else { raw };
+            if resolved <= 0 || resolved > n_pos {
+                bad = true;
+                break;
+            }
+            let pos = doc.positions[(resolved as usize) - 1];
+            control_points.push(pos);
+            // For rational forms, take the position's 4th-w weight from
+            // the parallel `position_weights` pool (`v x y z w`).
+            // Default 1.0 per spec when absent.
+            let w = doc.position_weights[(resolved as usize) - 1].unwrap_or(1.0);
+            control_weights.push(w);
+        }
+        if bad || control_points.len() < 2 {
+            continue;
+        }
+
+        let curve_points = match kind {
+            "bezier" | "rat_bezier" => sample_bezier(
+                &control_points,
+                &control_weights,
+                kind,
+                u_min,
+                u_max,
+                samples,
+            ),
+            "bspline" | "rat_bspline" => {
+                // B-spline needs a knot vector and a degree. Spec
+                // §"B-spline" condition 6: K = q - n - 1 ⇒ knot count
+                // must equal control-point count + degree + 1. Skip
+                // silently when missing — the source OBJ is incomplete
+                // in spec terms but we don't want to abort the whole
+                // decode.
+                let Some(degree) = active_degree else {
+                    continue;
+                };
+                if parm_u.len() != control_points.len() + degree as usize + 1 {
+                    continue;
+                }
+                sample_bspline(
+                    &control_points,
+                    &control_weights,
+                    kind,
+                    degree,
+                    parm_u,
+                    u_min,
+                    u_max,
+                    samples,
+                )
+            }
+            _ => continue,
+        };
+        if curve_points.len() < 2 {
+            continue;
+        }
+
+        let mut prim = Primitive::new(Topology::LineStrip);
+        let n = curve_points.len() as u32;
+        prim.positions = curve_points;
+        // Implicit 0..N strip indices keep the buffer compact and
+        // match how `LineStrip` consumers normally walk the vertex
+        // array.
+        if n > u16::MAX as u32 {
+            prim.indices = Some(Indices::U32((0..n).collect()));
+        } else {
+            prim.indices = Some(Indices::U16((0..n).map(|i| i as u16).collect()));
+        }
+
+        prim.extras.insert(
+            "obj:tessellated_curve".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        prim.extras.insert(
+            "obj:curve_kind".to_string(),
+            serde_json::Value::String(kind.to_string()),
+        );
+        // Reported degree: for Bezier the basis degree always equals
+        // N − 1 (control-point count − 1). For B-spline the basis
+        // degree is the `deg` value (independent of the control-point
+        // count). We report whichever is semantically correct for the
+        // basis.
+        let reported_degree = match kind {
+            "bezier" | "rat_bezier" => (control_points.len() - 1) as u64,
+            "bspline" | "rat_bspline" => active_degree.unwrap_or(0) as u64,
+            _ => 0,
+        };
+        prim.extras.insert(
+            "obj:curve_degree".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(reported_degree)),
+        );
+        let range_arr = serde_json::Value::Array(vec![
+            serde_json::Value::from(u_min as f64),
+            serde_json::Value::from(u_max as f64),
+        ]);
+        prim.extras
+            .insert("obj:curve_u_range".to_string(), range_arr);
+        prim.extras.insert(
+            "obj:curve_samples".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(samples as u64)),
+        );
+
+        out.push(prim);
+    }
 }
 
 /// Evaluate a Bezier (or rational-Bezier) curve at `samples + 1`
@@ -1009,11 +1145,186 @@ fn sample_bezier(
     out
 }
 
-/// `true` when the primitive was synthesised by the Bezier
-/// tessellator (see [`tessellate_bezier_curves`]). Encoder + serialiser
-/// branches use this to skip emitting derived geometry as `v` lines —
-/// the original `cstype` / `curv` / `end` directives carry the
-/// source-of-truth shape.
+/// Evaluate a B-spline (or rational B-spline / NURBS) curve at
+/// `samples + 1` uniformly-spaced parameter values from `t_min` to
+/// `t_max`, where the interval is clipped against the spec-required
+/// `[x_n, x_{K+1}]` evaluation range of the knot vector (spec §"B-spline"
+/// condition 5: `x_n ≤ t_min < t_max ≤ x_{K+1}`).
+///
+/// Mathematics — Cox-deBoor recursion (spec §"B-spline"):
+///
+///   N_{i,0}(t) = 1 if x_i ≤ t < x_{i+1} else 0
+///   N_{i,k}(t) = (t - x_i) / (x_{i+k} - x_i)         · N_{i,k-1}(t)
+///              + (x_{i+k+1} - t) / (x_{i+k+1} - x_{i+1}) · N_{i+1,k-1}(t)
+///
+/// by convention `0/0 = 0`. The curve at parameter t is
+///
+///   C(t) = Σ_{i=0..K} N_{i,n}(t) · d_i
+///
+/// For the rational form, the weighted homogeneous sum is computed and
+/// projected back to 3D via `x/w`:
+///
+///   C(t) = Σ N_{i,n}(t) · w_i · d_i / Σ N_{i,n}(t) · w_i
+///
+/// `kind` selects `"bspline"` (weights ignored, w = 1) or
+/// `"rat_bspline"` (per-vertex `w` from `v x y z w`).
+#[allow(clippy::too_many_arguments)]
+fn sample_bspline(
+    control_points: &[[f32; 3]],
+    control_weights: &[f32],
+    kind: &str,
+    degree: u32,
+    knots: &[f32],
+    u_min: f32,
+    u_max: f32,
+    samples: u32,
+) -> Vec<[f32; 3]> {
+    if control_points.is_empty() || samples == 0 {
+        return Vec::new();
+    }
+    let n = degree as usize;
+    let k_plus_1 = control_points.len(); // = K + 1 control points.
+    // Spec §"B-spline" condition 6: K = q - n - 1 ⇒ knots.len() must
+    // equal control_points.len() + degree + 1. The caller already
+    // checks this; double-check defensively.
+    if knots.len() != k_plus_1 + n + 1 {
+        return Vec::new();
+    }
+    // Spec condition 5: evaluation parameter t must satisfy
+    //   x_n ≤ t_min < t_max ≤ x_{K+1}
+    // Clip the caller-supplied u_min / u_max against that window so the
+    // basis functions evaluate to defined values (any t outside the
+    // window gives N = 0 across the support and a degenerate sample).
+    let t_lo_bound = knots[n];
+    let t_hi_bound = knots[k_plus_1]; // x_{K+1} index = K+1 = k_plus_1.
+    let t_min = u_min.max(t_lo_bound);
+    let t_max = u_max.min(t_hi_bound);
+    if t_min > t_max {
+        return Vec::new();
+    }
+
+    let rational = kind == "rat_bspline";
+    let n_samples = samples + 1;
+    let mut out: Vec<[f32; 3]> = Vec::with_capacity(n_samples as usize);
+
+    for i in 0..n_samples {
+        let t01 = if n_samples == 1 {
+            0.0
+        } else {
+            i as f32 / (n_samples - 1) as f32
+        };
+        let mut t = t_min + t01 * (t_max - t_min);
+        // Numerical guard — when t == t_hi_bound, the half-open interval
+        // convention `x_i ≤ t < x_{i+1}` makes N_{i,0} zero everywhere.
+        // Nudge the last sample fractionally below the upper bound so
+        // it lies inside the last non-empty knot span (a standard NURBS-
+        // evaluator pattern; the resulting blend converges to the curve
+        // endpoint as the bias shrinks).
+        if t >= t_hi_bound {
+            t = t_hi_bound - (t_hi_bound - t_lo_bound).abs() * 1e-7 - f32::EPSILON;
+            if t < t_lo_bound {
+                t = t_lo_bound;
+            }
+        }
+        let basis = bspline_basis(t, knots, n);
+        // Σ N_{i,n}(t) · w_i · d_i  (3D positions blended).
+        // For non-rational, w_i = 1 ⇒ standard polynomial blend.
+        let mut acc = [0.0f32; 3];
+        let mut wsum = 0.0f32;
+        for j in 0..k_plus_1 {
+            let bj = basis[j];
+            if bj == 0.0 {
+                continue;
+            }
+            let w = if rational { control_weights[j] } else { 1.0 };
+            let bw = bj * w;
+            wsum += bw;
+            acc[0] += bw * control_points[j][0];
+            acc[1] += bw * control_points[j][1];
+            acc[2] += bw * control_points[j][2];
+        }
+        if rational && wsum.abs() > f32::EPSILON {
+            out.push([acc[0] / wsum, acc[1] / wsum, acc[2] / wsum]);
+        } else if !rational && wsum.abs() > f32::EPSILON {
+            // Non-rational basis functions sum to 1 inside the valid
+            // window by partition-of-unity (spec note: "basis functions
+            // sum to 1.0, such as Bezier, Cardinal, and NURB"); no
+            // division needed in theory, but we still emit `acc` as-is.
+            out.push(acc);
+        } else {
+            // Sample fell outside the support of every basis function —
+            // emit the running accumulator (which is zero) so the
+            // polyline length still matches `samples + 1`. In practice
+            // the clip + nudge above prevents this branch except for
+            // pathological knot vectors.
+            out.push(acc);
+        }
+    }
+    out
+}
+
+/// Cox-deBoor recursive basis-function evaluation at parameter `t`
+/// against the given knot vector. Returns one weight per control point
+/// (control-point count = knots.len() − degree − 1).
+///
+/// Uses the iterative bottom-up formulation: build degree-0 step
+/// functions, then accumulate higher-degree polynomials in place. This
+/// is `O(k_plus_1 · (degree + 1))` work per evaluation, which suffices
+/// for the modest curve sizes typical of OBJ files. The standard
+/// `0/0 = 0` convention is applied via explicit denominator guards
+/// (spec §"B-spline" inline note).
+fn bspline_basis(t: f32, knots: &[f32], degree: usize) -> Vec<f32> {
+    let m = knots.len();
+    if m <= degree + 1 {
+        return Vec::new();
+    }
+    let k_plus_1 = m - degree - 1;
+    // Allocate one row of `m - 1` degree-0 weights (one per knot span);
+    // we'll fold this down to k_plus_1 weights at the end.
+    let mut basis: Vec<f32> = Vec::with_capacity(m - 1);
+    for i in 0..(m - 1) {
+        // Degree-0: indicator function on the half-open knot span. Use
+        // the closed-on-the-right convention for the final span so that
+        // a t exactly at the upper bound still falls inside the last
+        // non-empty interval (NURBS-evaluator convention).
+        let inside = if i + 1 == m - 1 {
+            knots[i] <= t && t <= knots[i + 1]
+        } else {
+            knots[i] <= t && t < knots[i + 1]
+        };
+        basis.push(if inside { 1.0 } else { 0.0 });
+    }
+    // Recursive degree promotion.
+    for k in 1..=degree {
+        // After this loop iteration we want length (m - 1 - k); we
+        // overwrite in place, indexing j and j+1.
+        let new_len = m - 1 - k;
+        for j in 0..new_len {
+            let denom_left = knots[j + k] - knots[j];
+            let denom_right = knots[j + k + 1] - knots[j + 1];
+            let left = if denom_left.abs() < f32::EPSILON {
+                0.0
+            } else {
+                (t - knots[j]) / denom_left * basis[j]
+            };
+            let right = if denom_right.abs() < f32::EPSILON {
+                0.0
+            } else {
+                (knots[j + k + 1] - t) / denom_right * basis[j + 1]
+            };
+            basis[j] = left + right;
+        }
+        basis.truncate(new_len);
+    }
+    debug_assert_eq!(basis.len(), k_plus_1);
+    basis
+}
+
+/// `true` when the primitive was synthesised by the curve tessellator
+/// (see [`tessellate_curves`]). Encoder + serialiser branches use this
+/// to skip emitting derived geometry as `v` lines — the original
+/// `cstype` / `curv` / `end` directives carry the source-of-truth
+/// shape.
 fn is_tessellated_curve(prim: &Primitive) -> bool {
     prim.extras
         .get("obj:tessellated_curve")
@@ -1378,20 +1689,26 @@ fn build_primitive(
 /// The default leaves free-form geometry as captured-only extras
 /// (back-compatible with rounds 1-6). Set
 /// [`ParseOptions::curve_tessellation_samples`] to a non-zero value
-/// to enable de-Casteljau evaluation of `cstype bezier` curves into
-/// real `LineStrip` primitives (see [`crate::ObjDecoder::with_curve_tessellation`]).
+/// to enable evaluation of `cstype bezier` / `cstype bspline`
+/// (rational + non-rational) curves into real `LineStrip` primitives
+/// (see [`crate::ObjDecoder::with_curve_tessellation`]).
 #[derive(Clone, Debug, Default)]
 pub struct ParseOptions {
     /// When > 0, every `curv` directive under an active `cstype bezier`
-    /// (or `cstype rat bezier`) header is evaluated at
-    /// `curve_tessellation_samples + 1` uniformly-spaced parameter
-    /// values across its `[u_min, u_max]` interval. The resulting
-    /// polyline lands on a synthetic mesh named `"obj:curves"` whose
-    /// primitives carry `Topology::LineStrip`. The directive itself
-    /// is still preserved in `Scene3D::extras["obj:freeform_directives"]`
-    /// so a round-trip re-emit produces the same free-form section —
-    /// downstream consumers can opt out of the synthetic mesh by
-    /// filtering on `Mesh::extras["obj:tessellated_curves"] == true`.
+    /// / `cstype rat bezier` / `cstype bspline` / `cstype rat bspline`
+    /// header is evaluated at `curve_tessellation_samples + 1`
+    /// uniformly-spaced parameter values. The resulting polyline lands
+    /// on a synthetic mesh named `"obj:curves"` whose primitives carry
+    /// `Topology::LineStrip`. The directive itself is still preserved
+    /// in `Scene3D::extras["obj:freeform_directives"]` so a round-trip
+    /// re-emit produces the same free-form section — downstream
+    /// consumers can opt out of the synthetic mesh by filtering on
+    /// `Primitive::extras["obj:tessellated_curve"] == true`.
+    ///
+    /// B-spline curves additionally require a valid `parm u` knot
+    /// vector (length must equal control-point count + degree + 1 per
+    /// spec §"B-spline" condition 6); curves with an incomplete knot
+    /// vector are skipped silently.
     ///
     /// `0` disables tessellation (the default; back-compat with r1-r6).
     pub curve_tessellation_samples: u32,
@@ -1482,11 +1799,13 @@ where
         }
     }
 
-    // Bezier tessellation pass — captures the curve directives still in
+    // Curve tessellation pass — captures the curve directives still in
     // `doc.freeform_directives` and synthesises `LineStrip` primitives
     // on a dedicated mesh. Skipped when samples == 0 (the default).
+    // Supports `cstype bezier` / `rat bezier` (round 7) and
+    // `cstype bspline` / `rat bspline` (round 8).
     let tessellated = if options.curve_tessellation_samples > 0 {
-        tessellate_bezier_curves(&doc, options.curve_tessellation_samples)
+        tessellate_curves(&doc, options.curve_tessellation_samples)
     } else {
         Vec::new()
     };

@@ -176,11 +176,24 @@ rides on `Scene3D::extras["obj:positions"]` (plus parallel
 `obj:position_weights` / `obj:position_colors`) so `curv` /
 `surf` absolute-index references stay valid across a
 decode → encode → decode cycle.
+Round 8: B-spline / NURBS curve tessellation — the same
+`with_curve_tessellation(samples)` knob now also evaluates
+`cstype bspline` and `cstype rat bspline` `curv` directives via the
+Cox-deBoor recursive basis-function formula (spec §"B-spline"),
+clipped against the `[x_n, x_{K+1}]` evaluation window of the knot
+vector supplied by the most-recent `parm u …` body statement.
+Rational form uses the per-vertex 4th `w` weight (NURBS form) and
+projects the weighted blend back to 3D. The tessellator now does
+two-pass per-`cstype/end` block traversal so the `curv` header
+(which comes before the `parm u …` body statement per spec) can
+still resolve its knot vector. Knot-vector length is validated
+against the spec condition `len == K + degree + 2` and curves with
+incomplete data are skipped silently (the directive remains
+captured for round-trip).
 
-The `.mod` binary form remains out of scope; surface tessellation
-(`surf`, NURBS, trim-loop evaluation) and the non-Bezier basis
-families (B-spline, cardinal, Taylor, basis-matrix) are the
-obvious next rounds of work.
+The `.mod` binary form remains out of scope; `surf` 2-parameter
+surface tessellation, trim/hole loop evaluation, and the cardinal /
+Taylor / basis-matrix bases are the remaining gaps.
 
 ## License
 
