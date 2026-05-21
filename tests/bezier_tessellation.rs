@@ -278,20 +278,29 @@ end
 }
 
 #[test]
-fn cardinal_and_other_unsupported_cstype_basis_kinds_are_left_alone() {
+fn unsupported_cstype_basis_kinds_are_left_alone() {
     // Only the basis families with an evaluator land on the synthetic
-    // mesh. Bezier (round 7) + B-spline (round 8) are supported;
-    // Cardinal / Taylor / basis-matrix stay as captured directives so a
-    // future evaluator can pick them up. The example below uses
-    // Cardinal because it's the simplest non-evaluated basis (spec
-    // §"Cardinal": cubic, fixed degree 3).
+    // mesh. Bezier (round 7) + B-spline (round 8) + Cardinal /
+    // Taylor (round 9) are supported; basis-matrix (`bmatrix`)
+    // stays as a captured directive sequence so a future evaluator
+    // can pick it up — it additionally needs the `bmat u` / `bmat v`
+    // body statements + a `step` size that we don't currently parse
+    // off `freeform_directives`. The example below uses `bmatrix`
+    // because it's the simplest still-unevaluated basis kind.
+    // Note: a full `bmatrix` curve would also carry `bmat u …` and
+    // `step …` body statements per spec §"Basis matrix"; we omit them
+    // here because the parser doesn't track them yet (they're absent
+    // from the §"Free-form curve/surface body statements" whitelist).
+    // For the purposes of this test only the `cstype bmatrix` keyword
+    // matters — the tessellator must not synthesise a mesh for an
+    // unrecognised basis kind.
     let text = "\
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
 v 2.0 0.0 0.0
 v 3.0 0.0 0.0
 v 4.0 0.0 0.0
-cstype cardinal
+cstype bmatrix
 deg 3
 curv 0.0 1.0 1 2 3 4 5
 end
@@ -300,10 +309,14 @@ end
         .with_curve_tessellation(8)
         .decode(text.as_bytes())
         .unwrap();
-    // No synthetic curve mesh — Cardinal isn't an evaluator we ship.
+    // No synthetic curve mesh — basis-matrix isn't an evaluator we
+    // ship yet.
     assert!(
-        scene.meshes.is_empty(),
-        "Cardinal curves must not produce a tessellated mesh"
+        scene
+            .meshes
+            .iter()
+            .all(|m| m.name.as_deref() != Some("obj:curves")),
+        "bmatrix curves must not produce a tessellated mesh"
     );
     // Directives still captured for round-trip.
     let dirs = scene

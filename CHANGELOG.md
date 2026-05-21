@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Cardinal (Catmull-Rom) + Taylor polynomial curve tessellation under
+  `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
+  evaluates `cstype cardinal` `curv` directives via the spec §"Cardinal"
+  conversion to Bezier control points
+  (`b0 = c1`, `b1 = c1 + (c2 − c0) / 6`, `b2 = c2 − (c3 − c1) / 6`,
+  `b3 = c2`, then cubic Bezier blend) on a sliding 4-point window across
+  the control polygon, producing C¹-continuous polylines that
+  interpolate every interior control point exactly. Cardinal is cubic
+  only per spec; non-cubic `deg` is silently rejected (the directive
+  itself remains captured for round-trip).
+  `cstype taylor` `curv` directives evaluate via Horner's-rule
+  polynomial evaluation `P(t) = Σ_{i=0..n} c_i · t^i` per spec §"Taylor"
+  (control points are the polynomial coefficients) with sampling across
+  the `[u_min, u_max]` range supplied on the `curv` line. Both `rat
+  cardinal` and `rat taylor` qualifiers are accepted but route to the
+  same evaluator (the spec note says the unit-weight default is
+  reasonable for Cardinal because its basis functions sum to 1, and
+  explicitly that the rational form "does not make sense for Taylor").
+  The resulting polylines land on the existing `"obj:curves"` synthetic
+  mesh with `obj:tessellated_curve = true` / `obj:curve_kind`
+  (`"cardinal"` / `"taylor"`) / `obj:curve_degree` (3 for Cardinal,
+  the `deg` value for Taylor) / `obj:curve_u_range` / `obj:curve_samples`
+  provenance extras. The encoder filters synthetic primitives out of
+  the polygonal section so a re-encode replays the original
+  `cstype cardinal` / `cstype taylor` blocks unchanged.
 - B-spline / NURBS curve tessellation under
   `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
   evaluates `cstype bspline` and `cstype rat bspline` `curv` directives

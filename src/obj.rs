@@ -781,29 +781,39 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
 ///     functions evaluated on `[t_min, t_max]` derived from the curve's
 ///     `u_min` / `u_max` clipped against the active knot vector parsed
 ///     from the most-recent `parm u` body statement.
+///   * `cardinal` — round 9, cubic Catmull-Rom evaluation via the spec's
+///     conversion to Bezier control points (`b1 = c1 + (c2 - c0) / 6`,
+///     `b2 = c2 - (c3 - c1) / 6`, `b0 = c1`, `b3 = c2`). Sliding-window
+///     piecewise: each segment i uses `c[i..i+4]`. Cardinal is cubic only
+///     per spec §"Cardinal" — non-cubic `deg` is rejected.
+///   * `taylor` — round 9, direct polynomial evaluation
+///     `P(t) = Σ_{i=0..n} c_i · t^i` where each control point IS a
+///     coefficient vector (spec §"Taylor": "control points are the
+///     polynomial coefficients"). Sample range `[u_min, u_max]`.
 ///
 /// Each curve is evaluated at `samples + 1` uniformly-spaced parameter
 /// values across its evaluation interval. The resulting points become a
 /// polyline.
 ///
-/// `cstype` modifiers other than the listed kinds are ignored (cardinal
-/// splines, Taylor expansions, basis-matrix curves, NURBS surfaces etc.
-/// need a different evaluator). `surf` (2-parameter surfaces) is also
-/// deferred — only 1D `curv` is handled here.
+/// `cstype` modifiers other than the listed kinds are ignored
+/// (basis-matrix curves need the `bmat` body statement which isn't tracked
+/// yet, and NURBS surfaces / `surf` 2-parameter tessellation are also
+/// deferred — only 1D `curv` is handled here).
 ///
 /// Per-curve provenance lands on `Primitive::extras`:
 ///
 ///   * `obj:tessellated_curve` — `true` (sentinel for filters).
 ///   * `obj:curve_kind` — `"bezier"` / `"rat_bezier"` / `"bspline"` /
-///     `"rat_bspline"`.
+///     `"rat_bspline"` / `"cardinal"` / `"taylor"`.
 ///   * `obj:curve_degree` — basis polynomial degree.
 ///   * `obj:curve_u_range` — `[u_min, u_max]` from the `curv` directive.
 ///   * `obj:curve_samples` — sample count emitted.
 ///
 /// Spec references: §"Curve and surface type" (cstype), §"Degree"
 /// (deg), §"Curve" (curv), §"Parameter values and knot vectors"
-/// (parm), §"B-spline" (Cox-deBoor recursion), §"Free-form curve/surface
-/// body statements" (rational weight semantics).
+/// (parm), §"B-spline" (Cox-deBoor recursion), §"Cardinal" (Catmull-Rom
+/// conversion to Bezier), §"Taylor" (polynomial-coefficient basis),
+/// §"Free-form curve/surface body statements" (rational weight semantics).
 fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
     // Spec §"Specifying free-form curves/surfaces": the curve / surface
     // header (`curv` / `surf`) lists control points, and the *body*
@@ -856,6 +866,21 @@ fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     (Some("rat"), Some("bezier")) => Some("rat_bezier"),
                     (Some("bspline"), _) => Some("bspline"),
                     (Some("rat"), Some("bspline")) => Some("rat_bspline"),
+                    // Spec §"Cardinal": cubic Catmull-Rom. The `rat`
+                    // qualifier is permitted but the spec note says the
+                    // unit-weight default is reasonable for Cardinal
+                    // because its basis functions sum to 1; we don't
+                    // currently differentiate rat_cardinal from cardinal
+                    // because the per-vertex weight is rarely populated
+                    // in real Cardinal data.
+                    (Some("cardinal"), _) => Some("cardinal"),
+                    (Some("rat"), Some("cardinal")) => Some("cardinal"),
+                    // Spec §"Taylor": polynomial-coefficient basis. The
+                    // spec note explicitly warns that the rational form
+                    // "does not make sense for Taylor" so we accept the
+                    // `rat` qualifier but route to the same evaluator.
+                    (Some("taylor"), _) => Some("taylor"),
+                    (Some("rat"), Some("taylor")) => Some("taylor"),
                     _ => None,
                 };
             }
@@ -1014,6 +1039,40 @@ fn flush_block(
                     samples,
                 )
             }
+            "cardinal" => {
+                // Spec §"Cardinal": "Cardinal splines are only defined
+                // for the cubic case." Reject non-cubic `deg`. The
+                // `parm` count requirement (K - n + 2 values, ⇒ K - 2
+                // segments) is informational here — we slide a window
+                // of 4 control points and emit segments directly
+                // without needing the global parameter vector for the
+                // basis evaluation itself, since the Catmull-Rom
+                // tangent definition is purely local (segment i uses
+                // c[i..i+4]).
+                if active_degree.is_some_and(|d| d != 3) {
+                    continue;
+                }
+                // Need at least 4 control points for one segment.
+                if control_points.len() < 4 {
+                    continue;
+                }
+                sample_cardinal(&control_points, samples)
+            }
+            "taylor" => {
+                // Spec §"Taylor": basis function is t^i; control points
+                // are the polynomial coefficients. `deg n` ⇒ n + 1
+                // coefficient vectors expected. Reject when the count
+                // doesn't match (lenient: also accept missing `deg` and
+                // infer n = K).
+                let degree = match active_degree {
+                    Some(d) => d as usize,
+                    None => control_points.len().saturating_sub(1),
+                };
+                if control_points.len() != degree + 1 {
+                    continue;
+                }
+                sample_taylor(&control_points, u_min, u_max, samples)
+            }
             _ => continue,
         };
         if curve_points.len() < 2 {
@@ -1048,6 +1107,13 @@ fn flush_block(
         let reported_degree = match kind {
             "bezier" | "rat_bezier" => (control_points.len() - 1) as u64,
             "bspline" | "rat_bspline" => active_degree.unwrap_or(0) as u64,
+            // Spec §"Cardinal": "Cardinal splines are only defined for
+            // the cubic case." Always 3.
+            "cardinal" => 3,
+            // Spec §"Taylor": degree n ⇒ K + 1 = n + 1 coefficients.
+            "taylor" => active_degree
+                .map(u64::from)
+                .unwrap_or_else(|| (control_points.len() - 1) as u64),
             _ => 0,
         };
         prim.extras.insert(
@@ -1318,6 +1384,151 @@ fn bspline_basis(t: f32, knots: &[f32], degree: usize) -> Vec<f32> {
     }
     debug_assert_eq!(basis.len(), k_plus_1);
     basis
+}
+
+/// Evaluate a cubic Cardinal (Catmull-Rom) curve at `samples + 1`
+/// uniformly-spaced parameter values from `t = 0` (start of first
+/// segment) to `t = K - 2` (end of last segment) where `K = control_points.len()`.
+///
+/// Spec §"Cardinal": Cardinal splines are cubic only and interpolate all
+/// but the first and last control points. The conversion to Bezier
+/// control points for one segment over `c0, c1, c2, c3` is:
+///
+///   b0 = c1
+///   b1 = c1 + (c2 - c0) / 6
+///   b2 = c2 - (c3 - c1) / 6
+///   b3 = c2
+///
+/// The full curve is the concatenation of `K - 3` such Bezier segments
+/// produced by sliding a 4-point window across the control polygon —
+/// segment `i` consumes `c[i..i+4]` and traces from the interpolated
+/// midpoint `c[i+1]` to `c[i+2]`. This yields a C¹-continuous piecewise
+/// curve that passes through every interior control point exactly.
+///
+/// The result is emitted as one polyline carrying `samples + 1` total
+/// vertices distributed across all segments in proportion to their share
+/// of the parameter range. To keep the implementation simple and the
+/// polyline density uniform along the curve, we evaluate `samples` total
+/// intervals (`samples + 1` points) globally, mapping each global sample
+/// to a segment index plus a local `t ∈ [0, 1]` within that segment.
+///
+/// Weights / rationality: the spec note says the unit-weight default is
+/// reasonable for Cardinal because its basis functions sum to 1, so we
+/// don't differentiate `rat cardinal` from `cardinal` — the per-vertex
+/// 4th `w` weight is read from `position_weights` but treated as 1 in
+/// the Bezier-conversion form (where it would otherwise alter the shape
+/// in a way the spec doesn't explicitly define).
+fn sample_cardinal(control_points: &[[f32; 3]], samples: u32) -> Vec<[f32; 3]> {
+    if control_points.len() < 4 || samples == 0 {
+        return Vec::new();
+    }
+    let n_segments = control_points.len() - 3;
+    let n_samples = samples + 1;
+    let mut out: Vec<[f32; 3]> = Vec::with_capacity(n_samples as usize);
+
+    for i in 0..n_samples {
+        // Global `s ∈ [0, n_segments]`; integer part picks the segment,
+        // fractional part is the local `t ∈ [0, 1]`. Pin the last sample
+        // to the very end of the last segment so the polyline closes
+        // exactly on `c[K-2]`.
+        let s = if i == n_samples - 1 {
+            n_segments as f32
+        } else {
+            i as f32 * n_segments as f32 / (n_samples - 1) as f32
+        };
+        let mut seg = s.floor() as usize;
+        let mut t = s - seg as f32;
+        if seg >= n_segments {
+            seg = n_segments - 1;
+            t = 1.0;
+        }
+        // 4 Cardinal control points for this segment.
+        let c0 = control_points[seg];
+        let c1 = control_points[seg + 1];
+        let c2 = control_points[seg + 2];
+        let c3 = control_points[seg + 3];
+        // Spec §"Cardinal" Bezier conversion (component-wise per axis):
+        //   b0 = c1
+        //   b1 = c1 + (c2 - c0) / 6
+        //   b2 = c2 - (c3 - c1) / 6
+        //   b3 = c2
+        let mut b: [[f32; 3]; 4] = [[0.0; 3]; 4];
+        for a in 0..3 {
+            b[0][a] = c1[a];
+            b[1][a] = c1[a] + (c2[a] - c0[a]) / 6.0;
+            b[2][a] = c2[a] - (c3[a] - c1[a]) / 6.0;
+            b[3][a] = c2[a];
+        }
+        // Cubic Bezier evaluation (Bernstein form, expanded for n = 3
+        // since the spec only defines Cardinal for the cubic case):
+        //   B(t) = (1-t)^3 b0 + 3(1-t)^2 t b1 + 3(1-t) t^2 b2 + t^3 b3
+        let u = 1.0 - t;
+        let w0 = u * u * u;
+        let w1 = 3.0 * u * u * t;
+        let w2 = 3.0 * u * t * t;
+        let w3 = t * t * t;
+        let p = [
+            w0 * b[0][0] + w1 * b[1][0] + w2 * b[2][0] + w3 * b[3][0],
+            w0 * b[0][1] + w1 * b[1][1] + w2 * b[2][1] + w3 * b[3][1],
+            w0 * b[0][2] + w1 * b[1][2] + w2 * b[2][2] + w3 * b[3][2],
+        ];
+        out.push(p);
+    }
+    out
+}
+
+/// Evaluate a Taylor polynomial curve at `samples + 1` uniformly-spaced
+/// parameter values from `u_min` to `u_max`.
+///
+/// Spec §"Taylor": "The basis function is simply t^i" with the note
+/// that the control points are the polynomial coefficients (and have no
+/// geometric significance). So for `K + 1` control points c_0..c_K
+/// supplied via `curv`, the curve is:
+///
+///   P(t) = c_0 + c_1 · t + c_2 · t^2 + … + c_K · t^K
+///
+/// applied component-wise per axis. This is Horner's-rule territory —
+/// we use the straightforward bottom-up evaluation:
+///
+///   P(t) = ((c_K · t + c_{K-1}) · t + c_{K-2}) · t + … + c_0
+///
+/// which is numerically well-behaved for the modest degrees typical of
+/// real Taylor curves (the spec example is degree 4).
+///
+/// The `u_min` / `u_max` arguments on the `curv` directive are the
+/// global parameter clip bounds; Taylor curves evaluate against `t`
+/// directly (not a normalised `[0, 1]` re-parameterisation) so we
+/// sample at `t_i = u_min + i / samples · (u_max - u_min)`.
+fn sample_taylor(
+    control_points: &[[f32; 3]],
+    u_min: f32,
+    u_max: f32,
+    samples: u32,
+) -> Vec<[f32; 3]> {
+    if control_points.is_empty() || samples == 0 {
+        return Vec::new();
+    }
+    let n_samples = samples + 1;
+    let mut out: Vec<[f32; 3]> = Vec::with_capacity(n_samples as usize);
+    let k = control_points.len();
+    for i in 0..n_samples {
+        let frac = if n_samples == 1 {
+            0.0
+        } else {
+            i as f32 / (n_samples - 1) as f32
+        };
+        let t = u_min + frac * (u_max - u_min);
+        // Horner's rule on the coefficient vector. Walk from the
+        // highest-order coefficient down to c_0.
+        let mut acc = control_points[k - 1];
+        for j in (0..(k - 1)).rev() {
+            acc[0] = acc[0] * t + control_points[j][0];
+            acc[1] = acc[1] * t + control_points[j][1];
+            acc[2] = acc[2] * t + control_points[j][2];
+        }
+        out.push(acc);
+    }
+    out
 }
 
 /// `true` when the primitive was synthesised by the curve tessellator

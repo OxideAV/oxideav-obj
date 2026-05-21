@@ -190,10 +190,27 @@ still resolve its knot vector. Knot-vector length is validated
 against the spec condition `len == K + degree + 2` and curves with
 incomplete data are skipped silently (the directive remains
 captured for round-trip).
+Round 9: Cardinal (Catmull-Rom) + Taylor polynomial curve
+tessellation — `with_curve_tessellation(samples)` now also evaluates
+`cstype cardinal` `curv` directives via the spec §"Cardinal"
+conversion to Bezier control points (`b0 = c1`,
+`b1 = c1 + (c2 − c0) / 6`, `b2 = c2 − (c3 − c1) / 6`, `b3 = c2`,
+then cubic Bezier blend) on a sliding 4-point window, and `cstype
+taylor` `curv` directives via Horner's-rule polynomial evaluation
+`P(t) = Σ_{i=0..n} c_i · t^i` per spec §"Taylor". Cardinal is cubic
+only (non-cubic `deg` is rejected, matching the spec's "only
+defined for the cubic case" requirement); Taylor honours the
+`[u_min, u_max]` parameter clip directly on the `curv` line.
+Synthetic primitives carry the same `obj:tessellated_curve` /
+`obj:curve_kind` (`"cardinal"` / `"taylor"`) / `obj:curve_degree` /
+`obj:curve_u_range` / `obj:curve_samples` provenance and the
+encoder filters them out so the source `cstype` / `curv` / `end`
+block replays unchanged.
 
 The `.mod` binary form remains out of scope; `surf` 2-parameter
-surface tessellation, trim/hole loop evaluation, and the cardinal /
-Taylor / basis-matrix bases are the remaining gaps.
+surface tessellation, trim/hole loop evaluation, and the
+basis-matrix basis (which additionally needs the `bmat` / `step`
+body statements that aren't tracked yet) are the remaining gaps.
 
 ## License
 
