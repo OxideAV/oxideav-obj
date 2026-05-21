@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Basis-matrix curve tessellation under
+  `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
+  evaluates `cstype bmatrix` `curv` directives per spec §"Basis matrix"
+  using the user-supplied `(n + 1) × (n + 1)` basis from `bmat u` and the
+  segment stride from `step <stepu>` (spec §"bmat u/v matrix" and
+  §"step stepu stepv"). Each polynomial segment `i` consumes the
+  control-point window `c_{i·step + 1} .. c_{i·step + n + 1}` (1-based)
+  and evaluates `P(t) = Σ_i Σ_j B[i][j] · t^j · p_{base + i}` per axis,
+  where `B[i][j]` is the row-major basis-matrix element with column
+  index `j` varying fastest (spec §"bmat u/v matrix": "matrix lists the
+  contents of the basis matrix with column subscript j varying the
+  fastest"). The `rat bmatrix` qualifier is accepted but does not apply
+  per-vertex weights (the spec note says the unit-weight default "may
+  or may not make sense for a representation given in basis-matrix form",
+  so the user's basis is the authoritative source). Synthetic primitives
+  carry the same `obj:tessellated_curve = true` / `obj:curve_kind` (`"bmatrix"`) /
+  `obj:curve_degree` (from `deg`) / `obj:curve_u_range` / `obj:curve_samples`
+  provenance extras. Malformed blocks (missing `bmat u`, missing `step`,
+  wrong-size matrix, fewer than `n + 1` control points) are silently
+  dropped — the directive sequence still rides on
+  `Scene3D::extras["obj:freeform_directives"]` for round-trip.
+- `bmat` and `step` free-form directive tracking — the parser now
+  captures these keywords into the `obj:freeform_directives` extra
+  alongside the existing `cstype` / `deg` / `curv` / `parm` / `surf` /
+  `trim` / `hole` / `scrv` / `sp` / `end` / `bzp` / `bsp` directives,
+  so a `cstype bmatrix` block round-trips through a decode → encode →
+  decode cycle bit-exactly. The encoder replays the captured directive
+  sequence verbatim with no semantic interpretation.
 - Cardinal (Catmull-Rom) + Taylor polynomial curve tessellation under
   `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
   evaluates `cstype cardinal` `curv` directives via the spec §"Cardinal"

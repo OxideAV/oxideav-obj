@@ -318,7 +318,7 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 doc.vp.push([u, v, w]);
             }
             "cstype" | "deg" | "curv" | "curv2" | "surf" | "parm" | "trim" | "hole" | "scrv"
-            | "sp" | "end" | "bzp" | "bsp" => {
+            | "sp" | "end" | "bzp" | "bsp" | "bmat" | "step" => {
                 // Free-form geometry directives. Captured verbatim as
                 // a `(keyword, args)` sequence on the document so the
                 // encoder can replay them after the polygonal section.
@@ -328,7 +328,8 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 // Spec §"Free-form curve/surface attributes" /
                 // §"Specifying free-form curves/surfaces" /
                 // §"Free-form curve/surface body statements" /
-                // §"Superseded statements (bzp / bsp)".
+                // §"Superseded statements (bzp / bsp)" /
+                // §"bmat u/v matrix" + §"step stepu stepv".
                 let mut entry: Vec<String> = Vec::new();
                 entry.push(keyword.to_string());
                 for tok in tokens {
@@ -774,6 +775,13 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
 /// `curv` directive that sits under a supported `cstype` header.
 ///
 /// Supported `cstype` values:
+///   * `bmatrix` — round 10, evaluated via the user-supplied basis
+///     matrix from `bmat u` and the step size from `step` (spec §"Basis
+///     matrix"). Each polynomial segment is constructed by walking the
+///     control-point list at the step size and computing
+///     `P(t) = Σ_i Σ_j B[i][j] · t^j · p_i` per axis (`bmat u`
+///     stores `B` in row-major order with column index `j` varying
+///     fastest, per spec §"bmat u/v matrix").
 ///
 ///   * `bezier` / `rat bezier` — round 7, de Casteljau evaluation on the
 ///     `[0, 1]` basis domain.
@@ -796,15 +804,14 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
 /// polyline.
 ///
 /// `cstype` modifiers other than the listed kinds are ignored
-/// (basis-matrix curves need the `bmat` body statement which isn't tracked
-/// yet, and NURBS surfaces / `surf` 2-parameter tessellation are also
-/// deferred — only 1D `curv` is handled here).
+/// (NURBS surfaces / `surf` 2-parameter tessellation are deferred —
+/// only 1D `curv` is handled here).
 ///
 /// Per-curve provenance lands on `Primitive::extras`:
 ///
 ///   * `obj:tessellated_curve` — `true` (sentinel for filters).
 ///   * `obj:curve_kind` — `"bezier"` / `"rat_bezier"` / `"bspline"` /
-///     `"rat_bspline"` / `"cardinal"` / `"taylor"`.
+///     `"rat_bspline"` / `"cardinal"` / `"taylor"` / `"bmatrix"`.
 ///   * `obj:curve_degree` — basis polynomial degree.
 ///   * `obj:curve_u_range` — `[u_min, u_max]` from the `curv` directive.
 ///   * `obj:curve_samples` — sample count emitted.
@@ -813,6 +820,8 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
 /// (deg), §"Curve" (curv), §"Parameter values and knot vectors"
 /// (parm), §"B-spline" (Cox-deBoor recursion), §"Cardinal" (Catmull-Rom
 /// conversion to Bezier), §"Taylor" (polynomial-coefficient basis),
+/// §"Basis matrix" (general arbitrary-degree user-defined basis,
+/// `bmat u/v` + `step` body statements),
 /// §"Free-form curve/surface body statements" (rational weight semantics).
 fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
     // Spec §"Specifying free-form curves/surfaces": the curve / surface
@@ -833,6 +842,12 @@ fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
     let mut active_kind: Option<&'static str> = None;
     let mut active_degree: Option<u32> = None;
     let mut parm_u: Vec<f32> = Vec::new();
+    // Basis-matrix block state (spec §"Basis matrix"): `bmat u <matrix>`
+    // supplies the (n+1)×(n+1) basis stored row-major (column j varies
+    // fastest per spec); `step <stepu>` supplies the integer stride
+    // between successive segment windows of control points.
+    let mut bmat_u: Vec<f32> = Vec::new();
+    let mut step_u: Option<u32> = None;
     // `curv` directives queued for this block — evaluated on `end`.
     let mut pending_curves: Vec<&Vec<String>> = Vec::new();
 
@@ -850,11 +865,15 @@ fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     active_kind,
                     active_degree,
                     &parm_u,
+                    &bmat_u,
+                    step_u,
                     &pending_curves,
                     samples,
                 );
                 pending_curves.clear();
                 parm_u.clear();
+                bmat_u.clear();
+                step_u = None;
                 active_degree = None;
 
                 // Spec §"Curve and surface type": `cstype [rat] type`.
@@ -881,6 +900,16 @@ fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     // `rat` qualifier but route to the same evaluator.
                     (Some("taylor"), _) => Some("taylor"),
                     (Some("rat"), Some("taylor")) => Some("taylor"),
+                    // Spec §"Basis matrix": `cstype bmatrix` — the
+                    // user supplies the basis via `bmat u <matrix>` and
+                    // the segment stride via `step <stepu>`. The spec
+                    // note on rational forms says the unit-weight
+                    // default "may or may not make sense for a
+                    // representation given in basis-matrix form", so
+                    // we accept `rat bmatrix` but don't apply weights
+                    // (the user's basis is the source of truth).
+                    (Some("bmatrix"), _) => Some("bmatrix"),
+                    (Some("rat"), Some("bmatrix")) => Some("bmatrix"),
                     _ => None,
                 };
             }
@@ -901,6 +930,24 @@ fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     .filter_map(|t| t.parse::<f32>().ok())
                     .collect();
             }
+            // Spec §"bmat u/v matrix": `bmat u m_00 m_01 … m_nn` (row-
+            // major with column index `j` varying fastest). Only the
+            // u-direction matrix is consumed by 1D `curv` evaluation;
+            // `bmat v` is captured in the directive sequence but only
+            // matters for surface tessellation (deferred).
+            "bmat" if entry.get(1).map(String::as_str) == Some("u") => {
+                bmat_u = entry[2..]
+                    .iter()
+                    .filter_map(|t| t.parse::<f32>().ok())
+                    .collect();
+            }
+            // Spec §"step stepu stepv": `step stepu [stepv]`. `stepu`
+            // is the integer stride between successive segment windows
+            // of control points (`stepv` is required only for
+            // surfaces).
+            "step" => {
+                step_u = entry.get(1).and_then(|t| t.parse::<u32>().ok());
+            }
             "curv" => {
                 // Defer evaluation until `end` — the body statement
                 // `parm u …` that supplies the B-spline knot vector
@@ -914,11 +961,15 @@ fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     active_kind,
                     active_degree,
                     &parm_u,
+                    &bmat_u,
+                    step_u,
                     &pending_curves,
                     samples,
                 );
                 pending_curves.clear();
                 parm_u.clear();
+                bmat_u.clear();
+                step_u = None;
                 active_kind = None;
                 active_degree = None;
             }
@@ -939,6 +990,8 @@ fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
         active_kind,
         active_degree,
         &parm_u,
+        &bmat_u,
+        step_u,
         &pending_curves,
         samples,
     );
@@ -958,6 +1011,8 @@ fn flush_block(
     active_kind: Option<&'static str>,
     active_degree: Option<u32>,
     parm_u: &[f32],
+    bmat_u: &[f32],
+    step_u: Option<u32>,
     pending_curves: &[&Vec<String>],
     samples: u32,
 ) {
@@ -1073,6 +1128,32 @@ fn flush_block(
                 }
                 sample_taylor(&control_points, u_min, u_max, samples)
             }
+            "bmatrix" => {
+                // Spec §"Basis matrix": needs `deg n` + `bmat u <(n+1)²
+                // floats>` + `step <stepu>` body statements. Without any
+                // of those, the block is malformed in spec terms — skip
+                // silently (lenient-loader pattern). The basis matrix is
+                // (n + 1) × (n + 1) per spec §"Consistency conditions":
+                // "the size of the basis matrix is (n + 1) x (n + 1)".
+                let Some(degree) = active_degree else {
+                    continue;
+                };
+                let Some(step) = step_u else {
+                    continue;
+                };
+                let n_plus_1 = degree as usize + 1;
+                if bmat_u.len() != n_plus_1 * n_plus_1 {
+                    continue;
+                }
+                if step == 0 {
+                    continue;
+                }
+                // Need at least n + 1 control points for one segment.
+                if control_points.len() < n_plus_1 {
+                    continue;
+                }
+                sample_bmatrix(&control_points, bmat_u, degree, step, samples)
+            }
             _ => continue,
         };
         if curve_points.len() < 2 {
@@ -1114,6 +1195,9 @@ fn flush_block(
             "taylor" => active_degree
                 .map(u64::from)
                 .unwrap_or_else(|| (control_points.len() - 1) as u64),
+            // Spec §"Basis matrix": degree comes from `deg n`; the
+            // basis matrix is (n + 1) × (n + 1).
+            "bmatrix" => active_degree.map(u64::from).unwrap_or(0),
             _ => 0,
         };
         prim.extras.insert(
@@ -1527,6 +1611,103 @@ fn sample_taylor(
             acc[2] = acc[2] * t + control_points[j][2];
         }
         out.push(acc);
+    }
+    out
+}
+
+/// Evaluate a basis-matrix curve at `samples + 1` total points.
+///
+/// Spec §"Basis matrix": general arbitrary-degree curves whose basis is
+/// expressed through a user-supplied `(n + 1) × (n + 1)` matrix `B`
+/// (passed via `bmat u`) and segment stride `s` (passed via `step`).
+/// Each polynomial segment `i` consumes the control-point window
+/// `c[i·s .. i·s + n]` (0-based) and evaluates per spec §"Basis matrix":
+///
+/// ```text
+///   P(t) = Σ_{i=0..n} Σ_{j=0..n} B[i][j] · t^j · p_i
+/// ```
+///
+/// where `B[i][j]` is the row-major element of `bmat u` with column
+/// index `j` varying fastest (per spec §"bmat u/v matrix": "matrix
+/// lists the contents of the basis matrix with column subscript j
+/// varying the fastest"). For the spec's cubic-Bezier-as-bmatrix
+/// example, this produces the standard Bernstein basis.
+///
+/// Number of segments per spec §"step": with `K` control points,
+/// degree `n`, and step `s`, segment `i` uses indices
+/// `c_{i·s + 1} .. c_{i·s + n + 1}` (1-based) ⇒ the segment count is
+/// `floor((K - n - 1) / s) + 1` when `K ≥ n + 1`. Samples are
+/// distributed proportionally across all segments so the polyline
+/// density is uniform along the global parameter.
+///
+/// Rationality: the spec note in §"Free-form curve/surface body
+/// statements" explicitly says the unit-weight default "may or may
+/// not make sense for a representation given in basis-matrix form",
+/// so we don't apply per-vertex weights here — the user's `bmat u`
+/// is the authoritative basis.
+fn sample_bmatrix(
+    control_points: &[[f32; 3]],
+    bmat_u: &[f32],
+    degree: u32,
+    step: u32,
+    samples: u32,
+) -> Vec<[f32; 3]> {
+    let n_plus_1 = degree as usize + 1;
+    if control_points.len() < n_plus_1
+        || bmat_u.len() != n_plus_1 * n_plus_1
+        || step == 0
+        || samples == 0
+    {
+        return Vec::new();
+    }
+    // Spec §"step stepu stepv": segment `i` uses control points
+    // `c_{i·s + 1} .. c_{i·s + n + 1}` (1-based). Solve for the largest
+    // i with `i·s + n + 1 ≤ K` ⇒ `i ≤ (K - n - 1) / s`.
+    let s = step as usize;
+    let n_segments = (control_points.len() - n_plus_1) / s + 1;
+    let n_samples = samples + 1;
+    let mut out: Vec<[f32; 3]> = Vec::with_capacity(n_samples as usize);
+
+    for i in 0..n_samples {
+        // Global `g ∈ [0, n_segments]` with integer part = segment and
+        // fractional part = local `t ∈ [0, 1]` within that segment. Pin
+        // the last sample exactly to the end of the final segment so
+        // the polyline closes on the spec-defined endpoint.
+        let g = if i == n_samples - 1 {
+            n_segments as f32
+        } else {
+            i as f32 * n_segments as f32 / (n_samples - 1) as f32
+        };
+        let mut seg = g.floor() as usize;
+        let mut t = g - seg as f32;
+        if seg >= n_segments {
+            seg = n_segments - 1;
+            t = 1.0;
+        }
+        let base = seg * s;
+
+        // Compute t^0 .. t^n once.
+        let mut t_pow: Vec<f32> = Vec::with_capacity(n_plus_1);
+        let mut p = 1.0_f32;
+        for _ in 0..n_plus_1 {
+            t_pow.push(p);
+            p *= t;
+        }
+
+        // P(t) = Σ_i p_i · (Σ_j B[i][j] · t^j) summed component-wise.
+        let mut accum = [0.0_f32; 3];
+        for ii in 0..n_plus_1 {
+            // Row `ii` of B, dotted against `[t^0, t^1, …, t^n]`.
+            let mut coef = 0.0_f32;
+            for jj in 0..n_plus_1 {
+                coef += bmat_u[ii * n_plus_1 + jj] * t_pow[jj];
+            }
+            let cp = control_points[base + ii];
+            accum[0] += coef * cp[0];
+            accum[1] += coef * cp[1];
+            accum[2] += coef * cp[2];
+        }
+        out.push(accum);
     }
     out
 }

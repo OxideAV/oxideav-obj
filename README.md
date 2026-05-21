@@ -206,11 +206,25 @@ Synthetic primitives carry the same `obj:tessellated_curve` /
 `obj:curve_u_range` / `obj:curve_samples` provenance and the
 encoder filters them out so the source `cstype` / `curv` / `end`
 block replays unchanged.
+Round 10: basis-matrix curve tessellation — `with_curve_tessellation(samples)`
+now also evaluates `cstype bmatrix` `curv` directives per spec
+§"Basis matrix" using the user-supplied `(n + 1) × (n + 1)` basis
+from `bmat u` (row-major, column index `j` varying fastest per
+spec §"bmat u/v matrix") and the segment stride from
+`step <stepu>` (spec §"step stepu stepv"). Each segment evaluates
+`P(t) = Σ_i Σ_j B[i][j] · t^j · p_{base + i}` over the
+control-point window `c_{base+1} .. c_{base+n+1}` (1-based, `base = i·stepu`).
+The `bmat` and `step` keywords are now tracked alongside the other
+free-form directives, so they round-trip verbatim through
+`Scene3D::extras["obj:freeform_directives"]` and the encoder
+replays the original `cstype bmatrix` block unchanged. Cubic
+Bezier expressed as `cstype bmatrix` matches the closed-form
+Bernstein evaluation; the Hermite spec example interpolates its
+endpoints.
 
 The `.mod` binary form remains out of scope; `surf` 2-parameter
-surface tessellation, trim/hole loop evaluation, and the
-basis-matrix basis (which additionally needs the `bmat` / `step`
-body statements that aren't tracked yet) are the remaining gaps.
+surface tessellation and trim/hole loop evaluation are the
+remaining gaps.
 
 ## License
 
