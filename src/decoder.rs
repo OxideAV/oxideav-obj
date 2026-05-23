@@ -37,31 +37,37 @@ impl ObjDecoder {
         Self::default()
     }
 
-    /// Enable tessellation of `cstype` free-form curves:
+    /// Enable tessellation of `cstype` free-form curves *and* `surf`
+    /// surfaces:
     ///
     ///   * `cstype bezier` / `cstype rat bezier` — de Casteljau
-    ///     evaluation on the `[0, 1]` basis domain.
+    ///     evaluation on the `[0, 1]` basis domain (1D `curv` curves
+    ///     *and* 2D `surf` surfaces via tensor-product de Casteljau).
     ///   * `cstype bspline` / `cstype rat bspline` — Cox-deBoor
     ///     recursive basis on the knot vector supplied by the most-
-    ///     recent `parm u …` directive.
+    ///     recent `parm u …` directive (1D `curv` only).
+    ///   * `cstype cardinal` / `cstype taylor` / `cstype bmatrix` — 1D
+    ///     `curv` only.
     ///
-    /// `samples` is the number of *intervals* — the resulting
-    /// `LineStrip` carries `samples + 1` vertices (so `samples == 32`
-    /// produces a 33-point polyline per curve, smooth enough for
+    /// `samples` is the number of *intervals*. A `curv` curve yields a
+    /// `LineStrip` of `samples + 1` vertices; a Bezier `surf` surface
+    /// yields a `Topology::Triangles` grid of `(samples + 1)²` vertices
+    /// (so `samples == 32` produces a 33×33 lattice, smooth enough for
     /// diagnostic display without overwhelming the buffer).
     ///
-    /// The synthesised primitives land on a synthetic mesh named
-    /// `"obj:curves"`; each primitive carries
-    /// `extras["obj:tessellated_curve"] == true` so downstream
-    /// consumers that don't want the curve geometry can filter it
+    /// Curve primitives land on a synthetic mesh named `"obj:curves"`;
+    /// Bezier surface primitives land on `"obj:surfaces"`. Each carries
+    /// `extras["obj:tessellated_curve"] == true` (surfaces also carry
+    /// `extras["obj:tessellated_surface"] == true`) so downstream
+    /// consumers that don't want the derived geometry can filter it
     /// out. The free-form directive sequence remains preserved in
     /// `Scene3D::extras["obj:freeform_directives"]` so re-encoding
-    /// regenerates the original `cstype` / `deg` / `curv` / `parm` /
-    /// `end` section.
+    /// regenerates the original `cstype` / `deg` / `curv` / `surf` /
+    /// `parm` / `end` section.
     ///
     /// `samples == 0` (the default) disables tessellation, matching
-    /// the round 1-6 behaviour. Cardinal / Taylor / basis-matrix
-    /// bases and `surf` 2D surfaces remain captured-only.
+    /// the round 1-6 behaviour. Non-Bezier `surf` surfaces (B-spline /
+    /// Cardinal / Taylor / basis-matrix) remain captured-only.
     pub fn with_curve_tessellation(mut self, samples: u32) -> Self {
         self.curve_tessellation_samples = samples;
         self

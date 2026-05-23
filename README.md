@@ -66,9 +66,10 @@ modern loaders actually load):
   pool) and `Scene3D::extras["obj:freeform_directives"]` (sequence
   of `[keyword, arg1, arg2, …]` arrays). The encoder replays both
   after the polygonal section so a decode → encode round-trip
-  preserves the directive order and arguments. No tessellation —
-  consumers that need to evaluate the curves walk the directive
-  sequence themselves.
+  preserves the directive order and arguments. Verbatim by default;
+  opt-in tessellation of `curv` curves and Bezier `surf` surfaces is
+  available via `ObjDecoder::with_curve_tessellation(samples)` (see
+  the per-round notes below).
 
 The companion **MTL** parser/serialiser handles:
 
@@ -221,10 +222,35 @@ replays the original `cstype bmatrix` block unchanged. Cubic
 Bezier expressed as `cstype bmatrix` matches the closed-form
 Bernstein evaluation; the Hermite spec example interpolates its
 endpoints.
+Round 11: Bezier `surf` surface tessellation — the same
+`with_curve_tessellation(samples)` knob now also evaluates `surf`
+elements under a `cstype bezier` (or `cstype rat bezier`) header
+into a real `Topology::Triangles` grid on a synthetic mesh named
+`"obj:surfaces"`, via the bivariate tensor-product de Casteljau
+algorithm (spec §"Rational and non-rational curves and surfaces",
+§"Bezier"). Control points are read in the spec's row-major
+u-fastest order (§"Surface vertex data — control points": "i = 0
+to K1 for j = 0, …"); the `surf` line's `v/vt/vn` references are
+parsed for their leading position index (negative relative-from-end
+indices honoured). A single patch of declared degree `deg degu degv`
+needs exactly `(degu + 1) × (degv + 1)` control points; mismatched
+counts (multi-patch grids, which Bezier can't decompose without a
+`step` stride) are left captured-only. The surface is sampled at a
+`(samples + 1) × (samples + 1)` lattice and triangulated CCW
+(front = u-right, v-up per the spec note). Each synthetic primitive
+carries provenance extras (`obj:tessellated_surface`,
+`obj:surface_kind`, `obj:surface_degree`, `obj:surface_u_range`,
+`obj:surface_v_range`, `obj:surface_samples`) plus the shared
+`obj:tessellated_curve` sentinel so the encoder filters it out and
+replays the original `cstype` / `deg` / `surf` / `parm` / `end`
+block unchanged from `Scene3D::extras["obj:freeform_directives"]`.
+The rational form uses each control point's 4th `w` weight and
+projects the weighted blend back to 3D.
 
-The `.mod` binary form remains out of scope; `surf` 2-parameter
-surface tessellation and trim/hole loop evaluation are the
-remaining gaps.
+The `.mod` binary form remains out of scope; non-Bezier `surf`
+surfaces (B-spline / NURBS / Cardinal / Taylor / basis-matrix),
+multi-patch Bezier surface decomposition, and trim/hole loop
+evaluation are the remaining gaps.
 
 ## License
 

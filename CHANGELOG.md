@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Bezier `surf` surface tessellation under
+  `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
+  evaluates `surf` elements that sit under a `cstype bezier` (or
+  `cstype rat bezier`) header into a triangulated `Topology::Triangles`
+  primitive on a synthetic mesh named `"obj:surfaces"`, via the
+  bivariate tensor-product de Casteljau algorithm (spec §"Rational and
+  non-rational curves and surfaces" + §"Bezier"). Control points are
+  read in the spec's row-major u-fastest order (§"Surface vertex data —
+  control points": "listed in the order i = 0 to K1 for j = 0, followed
+  by i = 0 to K1 for j = 1, …"); the `surf` line's `v/vt/vn` control-
+  vertex references are parsed for their leading position index, with
+  negative relative-from-end indices honoured. A single Bezier patch of
+  declared degree `deg degu degv` requires exactly
+  `(degu + 1) × (degv + 1)` control points; counts that don't match a
+  single patch (multi-patch grids, which the Bezier basis can't
+  decompose without a `step` stride) are left captured-only. The patch
+  is sampled at a `(samples + 1) × (samples + 1)` lattice and
+  triangulated counter-clockwise (front = u-increases-right,
+  v-increases-up per the spec `surf` note). The rational form lifts each
+  control point to its homogeneous `(w·x, w·y, w·z, w)` form, runs both
+  de Casteljau passes in 4D, and projects back via `x / w`. Synthetic
+  primitives carry `obj:tessellated_surface = true`, `obj:surface_kind`
+  (`"bezier"` / `"rat_bezier"`), `obj:surface_degree` (`[degu, degv]`),
+  `obj:surface_u_range` (`[s0, s1]`), `obj:surface_v_range`
+  (`[t0, t1]`), and `obj:surface_samples` provenance extras, plus the
+  shared `obj:tessellated_curve = true` sentinel so the encoder filters
+  the synthetic geometry out and replays the original
+  `cstype` / `deg` / `surf` / `parm` / `end` block verbatim from
+  `Scene3D::extras["obj:freeform_directives"]`. Non-Bezier `surf` bases
+  remain captured-only.
 - Basis-matrix curve tessellation under
   `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
   evaluates `cstype bmatrix` `curv` directives per spec §"Basis matrix"

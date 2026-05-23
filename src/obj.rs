@@ -803,9 +803,10 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
 /// values across its evaluation interval. The resulting points become a
 /// polyline.
 ///
-/// `cstype` modifiers other than the listed kinds are ignored
-/// (NURBS surfaces / `surf` 2-parameter tessellation are deferred —
-/// only 1D `curv` is handled here).
+/// `cstype` modifiers other than the listed kinds are ignored. This
+/// function handles only 1D `curv` directives; 2-parameter `surf`
+/// surfaces are evaluated separately by [`tessellate_surfaces`] (Bezier
+/// tensor-product, round 11). NURBS surfaces remain captured-only.
 ///
 /// Per-curve provenance lands on `Primitive::extras`:
 ///
@@ -976,8 +977,9 @@ fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
             // `surf`, `curv2`, `trim`, `hole`, `scrv`, `sp`, `bzp`,
             // `bsp` etc. are tracked through `freeform_directives` but
             // don't influence 1D-curve tessellation directly. `surf`
-            // (a 2-parameter surface) needs a separate evaluator —
-            // deferred to a future round.
+            // (a 2-parameter surface) is evaluated by the separate
+            // `tessellate_surfaces` pass (round 11, Bezier tensor-
+            // product).
             _ => {}
         }
     }
@@ -1217,6 +1219,346 @@ fn flush_block(
 
         out.push(prim);
     }
+}
+
+/// Tessellate every `surf` element that sits under a `cstype bezier` /
+/// `cstype rat bezier` header into a triangulated [`Topology::Triangles`]
+/// primitive (round 11). Mirrors [`tessellate_curves`] but evaluates the
+/// bivariate Bezier tensor product (spec §"Rational and non-rational
+/// curves and surfaces", §"Bezier", §"Surface vertex data — control
+/// points").
+///
+/// Only the Bezier basis is handled here; B-spline / Cardinal / Taylor /
+/// basis-matrix surfaces are captured-only (the directive sequence still
+/// round-trips through `Scene3D::extras["obj:freeform_directives"]`).
+///
+/// `surf` token layout (spec §"surf s0 s1 t0 t1 v1/vt1/vn1 …"):
+/// `surf s0 s1 t0 t1` followed by `v/vt/vn` control-vertex references.
+/// Only the leading position index of each `v/vt/vn` token is consumed;
+/// texture / normal references are interpolation extras the renderer
+/// would blend with the same basis (spec §"Texture vertices …",
+/// §"Vertex normals …") but they don't change the surface shape, so the
+/// position-only evaluation is sufficient for the polyline/triangle
+/// approximation.
+///
+/// Control-point ordering (spec §"Surface vertex data — control
+/// points"): "listed in the order i = 0 to K1 for j = 0, followed by
+/// i = 0 to K1 for j = 1, and so on until j = K2." That is row-major
+/// with the u index (`i`) varying fastest. For a single Bezier patch
+/// `K1 = degu` and `K2 = degv`, so the control grid is
+/// `(degu + 1) × (degv + 1)`.
+///
+/// Per-surface provenance lands on `Primitive::extras`:
+///   * `obj:tessellated_curve` — `true` (shared sentinel so the encoder's
+///     existing filter skips this synthetic geometry).
+///   * `obj:tessellated_surface` — `true` (surface-specific sentinel).
+///   * `obj:surface_kind` — `"bezier"` / `"rat_bezier"`.
+///   * `obj:surface_degree` — `[degu, degv]`.
+///   * `obj:surface_u_range` / `obj:surface_v_range` — `[s0, s1]` /
+///     `[t0, t1]` from the `surf` directive.
+///   * `obj:surface_samples` — sample count per parametric direction.
+fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
+    let mut out: Vec<Primitive> = Vec::new();
+    if samples == 0 {
+        return out;
+    }
+
+    // Block state, accumulated between `cstype` … `end`.
+    let mut active_kind: Option<&'static str> = None;
+    let mut deg_u: Option<u32> = None;
+    let mut deg_v: Option<u32> = None;
+    let mut pending_surfs: Vec<&Vec<String>> = Vec::new();
+
+    let flush = |out: &mut Vec<Primitive>,
+                 kind: Option<&'static str>,
+                 deg_u: Option<u32>,
+                 deg_v: Option<u32>,
+                 surfs: &[&Vec<String>]| {
+        let Some(kind) = kind else {
+            return;
+        };
+        for entry in surfs {
+            if let Some(prim) = flush_surface(doc, kind, deg_u, deg_v, entry, samples) {
+                out.push(prim);
+            }
+        }
+    };
+
+    for entry in &doc.freeform_directives {
+        if entry.is_empty() {
+            continue;
+        }
+        match entry[0].as_str() {
+            "cstype" => {
+                flush(&mut out, active_kind, deg_u, deg_v, &pending_surfs);
+                pending_surfs.clear();
+                deg_u = None;
+                deg_v = None;
+                // Spec §"Curve and surface type": `cstype [rat] type`.
+                let mut iter = entry.iter().skip(1);
+                let first = iter.next().map(String::as_str);
+                let second = iter.next().map(String::as_str);
+                active_kind = match (first, second) {
+                    (Some("bezier"), _) => Some("bezier"),
+                    (Some("rat"), Some("bezier")) => Some("rat_bezier"),
+                    // Other surface bases stay captured-only for now.
+                    _ => None,
+                };
+            }
+            "deg" => {
+                // Spec §"Degree": `deg degu [degv]`. For surfaces both
+                // are required; `degv` defaults to `degu` only if a
+                // single value was given (matches the spec note that
+                // `degv` is "required only for surfaces").
+                deg_u = entry.get(1).and_then(|t| t.parse::<u32>().ok());
+                deg_v = entry.get(2).and_then(|t| t.parse::<u32>().ok()).or(deg_u);
+            }
+            "surf" => pending_surfs.push(entry),
+            "end" => {
+                flush(&mut out, active_kind, deg_u, deg_v, &pending_surfs);
+                pending_surfs.clear();
+                active_kind = None;
+                deg_u = None;
+                deg_v = None;
+            }
+            _ => {}
+        }
+    }
+    // Tail flush — defensive against a missing closing `end`.
+    flush(&mut out, active_kind, deg_u, deg_v, &pending_surfs);
+    out
+}
+
+/// Evaluate one `surf` element against an active Bezier `cstype` and
+/// return the triangulated primitive, or `None` when the directive is
+/// incomplete / malformed (lenient-loader pattern — the directive still
+/// round-trips through `obj:freeform_directives`).
+fn flush_surface(
+    doc: &ObjDoc,
+    kind: &'static str,
+    deg_u: Option<u32>,
+    deg_v: Option<u32>,
+    entry: &[String],
+    samples: u32,
+) -> Option<Primitive> {
+    // `surf s0 s1 t0 t1 v1/vt1/vn1 …` — minimum is the keyword + 4
+    // range scalars + at least one control vertex.
+    if entry.len() < 6 {
+        return None;
+    }
+    let s0 = entry[1].parse::<f32>().ok()?;
+    let s1 = entry[2].parse::<f32>().ok()?;
+    let t0 = entry[3].parse::<f32>().ok()?;
+    let t1 = entry[4].parse::<f32>().ok()?;
+
+    // Spec §"surf": both degu and degv are required for a surface.
+    let du = deg_u? as usize;
+    let dv = deg_v? as usize;
+    // Single-patch Bezier needs exactly (degu + 1) × (degv + 1) control
+    // points. Multi-patch surfaces (where the control-point count is a
+    // larger grid stitched together) are not split here; they would need
+    // the `step` stride which the Bezier basis doesn't carry, so we only
+    // tessellate the single-patch case and leave bigger grids
+    // captured-only.
+    let cols = du + 1; // u-direction count (K1 + 1)
+    let rows = dv + 1; // v-direction count (K2 + 1)
+    let expected = cols * rows;
+
+    let n_pos = doc.positions.len() as i64;
+    let mut grid: Vec<[f32; 3]> = Vec::with_capacity(expected);
+    let mut weights: Vec<f32> = Vec::with_capacity(expected);
+    for tok in &entry[5..] {
+        // Each control vertex is a `v/vt/vn` reference; we only need the
+        // leading position index.
+        let first_field = tok.split('/').next().unwrap_or(tok);
+        let raw = first_field.parse::<i64>().ok()?;
+        let resolved = if raw < 0 { n_pos + 1 + raw } else { raw };
+        if resolved <= 0 || resolved > n_pos {
+            return None;
+        }
+        grid.push(doc.positions[(resolved as usize) - 1]);
+        let w = doc.position_weights[(resolved as usize) - 1].unwrap_or(1.0);
+        weights.push(w);
+    }
+    if grid.len() != expected {
+        // Not a single patch of the declared degree — leave it captured-
+        // only rather than guessing the patch decomposition.
+        return None;
+    }
+
+    let positions = sample_bezier_surface(&grid, &weights, kind, cols, rows, samples);
+    if positions.is_empty() {
+        return None;
+    }
+
+    // Build a triangle grid over the (samples + 1) × (samples + 1)
+    // sample lattice. Vertex (su, sv) lives at index sv * stride + su.
+    let stride = samples as usize + 1;
+    let mut indices: Vec<u32> = Vec::with_capacity((samples as usize) * (samples as usize) * 6);
+    for sv in 0..samples as usize {
+        for su in 0..samples as usize {
+            let i00 = (sv * stride + su) as u32;
+            let i10 = (sv * stride + su + 1) as u32;
+            let i01 = ((sv + 1) * stride + su) as u32;
+            let i11 = ((sv + 1) * stride + su + 1) as u32;
+            // Two CCW triangles per cell (spec §"surf" note: the front
+            // of the surface is the side where u increases to the right
+            // and v increases upward).
+            indices.push(i00);
+            indices.push(i10);
+            indices.push(i11);
+            indices.push(i00);
+            indices.push(i11);
+            indices.push(i01);
+        }
+    }
+
+    let mut prim = Primitive::new(Topology::Triangles);
+    let n_verts = positions.len() as u32;
+    prim.positions = positions;
+    prim.indices = if n_verts > u16::MAX as u32 {
+        Some(Indices::U32(indices))
+    } else {
+        Some(Indices::U16(indices.iter().map(|&i| i as u16).collect()))
+    };
+
+    prim.extras.insert(
+        "obj:tessellated_curve".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    prim.extras.insert(
+        "obj:tessellated_surface".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    prim.extras.insert(
+        "obj:surface_kind".to_string(),
+        serde_json::Value::String(kind.to_string()),
+    );
+    prim.extras.insert(
+        "obj:surface_degree".to_string(),
+        serde_json::Value::Array(vec![
+            serde_json::Value::from(du as u64),
+            serde_json::Value::from(dv as u64),
+        ]),
+    );
+    prim.extras.insert(
+        "obj:surface_u_range".to_string(),
+        serde_json::Value::Array(vec![
+            serde_json::Value::from(s0 as f64),
+            serde_json::Value::from(s1 as f64),
+        ]),
+    );
+    prim.extras.insert(
+        "obj:surface_v_range".to_string(),
+        serde_json::Value::Array(vec![
+            serde_json::Value::from(t0 as f64),
+            serde_json::Value::from(t1 as f64),
+        ]),
+    );
+    prim.extras.insert(
+        "obj:surface_samples".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(samples as u64)),
+    );
+
+    Some(prim)
+}
+
+/// Evaluate a Bezier (or rational-Bezier) surface patch at a
+/// `(samples + 1) × (samples + 1)` lattice via the tensor-product de
+/// Casteljau algorithm.
+///
+/// `grid` is the control mesh in row-major order with the u index
+/// varying fastest (spec §"Surface vertex data — control points"):
+/// `cols` control points per v-row, `rows` v-rows. For each `(u, v)`
+/// sample the surface is `S(u, v) = Σ_i Σ_j B_i(u) · B_j(v) · d_{i,j}`.
+/// We collapse the inner u sum first by running de Casteljau on each
+/// v-row, then a second de Casteljau on the resulting `rows` points in
+/// the v direction.
+///
+/// For `kind == "rat_bezier"` each control point is lifted to its
+/// homogeneous `(w·x, w·y, w·z, w)` form, both de Casteljau passes run
+/// in 4D, and the result is projected back via `x / w` (spec
+/// §"Rational and non-rational curves and surfaces").
+///
+/// Output vertices are ordered row-major in the sample lattice: sample
+/// `(su, sv)` lands at index `sv * (samples + 1) + su`.
+fn sample_bezier_surface(
+    grid: &[[f32; 3]],
+    weights: &[f32],
+    kind: &str,
+    cols: usize,
+    rows: usize,
+    samples: u32,
+) -> Vec<[f32; 3]> {
+    if samples == 0 || cols == 0 || rows == 0 || grid.len() != cols * rows {
+        return Vec::new();
+    }
+    let rational = kind == "rat_bezier";
+    // Lift to homogeneous 4D so a single de Casteljau loop handles both
+    // forms (non-rational uses w == 1).
+    let homo: Vec<[f32; 4]> = grid
+        .iter()
+        .zip(weights.iter())
+        .map(|(p, w)| {
+            let weight = if rational { *w } else { 1.0 };
+            [p[0] * weight, p[1] * weight, p[2] * weight, weight]
+        })
+        .collect();
+
+    let n = samples as usize + 1;
+    let mut out: Vec<[f32; 3]> = Vec::with_capacity(n * n);
+    for sv in 0..n {
+        let v = if n == 1 {
+            0.0
+        } else {
+            sv as f32 / (n - 1) as f32
+        };
+        for su in 0..n {
+            let u = if n == 1 {
+                0.0
+            } else {
+                su as f32 / (n - 1) as f32
+            };
+            // Inner pass: de Casteljau across each v-row in u, leaving
+            // one homogeneous point per row.
+            let mut col_pts: Vec<[f32; 4]> = Vec::with_capacity(rows);
+            for r in 0..rows {
+                let row = &homo[r * cols..r * cols + cols];
+                col_pts.push(de_casteljau_4d(row, u));
+            }
+            // Outer pass: de Casteljau in v over the collapsed points.
+            let pt = de_casteljau_4d(&col_pts, v);
+            let [x, y, z, w] = pt;
+            if rational && w.abs() > f32::EPSILON {
+                out.push([x / w, y / w, z / w]);
+            } else {
+                out.push([x, y, z]);
+            }
+        }
+    }
+    out
+}
+
+/// de Casteljau evaluation of a homogeneous 4D Bezier control polygon at
+/// parameter `t ∈ [0, 1]`. Shared by the row and column passes of
+/// [`sample_bezier_surface`].
+fn de_casteljau_4d(points: &[[f32; 4]], t: f32) -> [f32; 4] {
+    if points.is_empty() {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let mut buf: Vec<[f32; 4]> = points.to_vec();
+    let n = buf.len();
+    for level in 1..n {
+        for j in 0..(n - level) {
+            buf[j] = [
+                (1.0 - t) * buf[j][0] + t * buf[j + 1][0],
+                (1.0 - t) * buf[j][1] + t * buf[j + 1][1],
+                (1.0 - t) * buf[j][2] + t * buf[j + 1][2],
+                (1.0 - t) * buf[j][3] + t * buf[j + 1][3],
+            ];
+        }
+    }
+    buf[0]
 }
 
 /// Evaluate a Bezier (or rational-Bezier) curve at `samples + 1`
@@ -2202,11 +2544,29 @@ where
         Vec::new()
     };
 
+    // Surface tessellation pass — the same sample knob drives Bezier
+    // `surf` tensor-product evaluation (round 11). Synthesises a
+    // `Topology::Triangles` mesh; the directives still ride on
+    // `Scene3D::extras["obj:freeform_directives"]` for round-trip.
+    let tessellated_surfaces = if options.curve_tessellation_samples > 0 {
+        tessellate_surfaces(&doc, options.curve_tessellation_samples)
+    } else {
+        Vec::new()
+    };
+
     let mut scene = build_scene(doc)?;
 
     if !tessellated.is_empty() {
         let mut mesh = Mesh::new(Some("obj:curves".to_string()));
         for prim in tessellated {
+            mesh.primitives.push(prim);
+        }
+        scene.add_mesh(mesh);
+    }
+
+    if !tessellated_surfaces.is_empty() {
+        let mut mesh = Mesh::new(Some("obj:surfaces".to_string()));
+        for prim in tessellated_surfaces {
             mesh.primitives.push(prim);
         }
         scene.add_mesh(mesh);
