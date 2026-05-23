@@ -67,9 +67,10 @@ modern loaders actually load):
   of `[keyword, arg1, arg2, …]` arrays). The encoder replays both
   after the polygonal section so a decode → encode round-trip
   preserves the directive order and arguments. Verbatim by default;
-  opt-in tessellation of `curv` curves and Bezier `surf` surfaces is
-  available via `ObjDecoder::with_curve_tessellation(samples)` (see
-  the per-round notes below).
+  opt-in tessellation of `curv` curves and Bezier / B-spline `surf`
+  surfaces is available via
+  `ObjDecoder::with_curve_tessellation(samples)` (see the per-round
+  notes below).
 
 The companion **MTL** parser/serialiser handles:
 
@@ -246,11 +247,32 @@ replays the original `cstype` / `deg` / `surf` / `parm` / `end`
 block unchanged from `Scene3D::extras["obj:freeform_directives"]`.
 The rational form uses each control point's 4th `w` weight and
 projects the weighted blend back to 3D.
+Round 12: B-spline / NURBS `surf` surface tessellation — the same
+`with_curve_tessellation(samples)` knob now also evaluates `surf`
+elements under a `cstype bspline` (or `cstype rat bspline`) header
+into a `Topology::Triangles` grid on the synthetic `"obj:surfaces"`
+mesh, via the bivariate tensor-product Cox-deBoor formula
+`S(u, v) = Σ_i Σ_j N_{i,nu}(u) · N_{j,nv}(v) · d_{i,j}` (spec
+§"B-spline"). The per-direction control-grid size comes from the
+`parm u` / `parm v` knot vectors (`(len(parm u) − degu − 1) ×
+(len(parm v) − degv − 1)`, spec §"B-spline" condition 6 applied
+independently in u and v); the `surf` range is clipped against each
+direction's `[x_n, x_{K+1}]` evaluation window. The rational (NURBS)
+form blends the per-vertex `w` weights and projects via the weighted
+denominator. Reuses the round-8 `bspline_basis` Cox-deBoor routine,
+so a clamped quadratic patch matches the equivalent Bezier patch
+sample-for-sample. Synthetic primitives carry the same
+`obj:tessellated_surface` / `obj:surface_kind`
+(`"bspline"` / `"rat_bspline"`) / `obj:surface_degree` /
+`obj:surface_u_range` / `obj:surface_v_range` / `obj:surface_samples`
+provenance and the encoder filters them out, replaying the original
+`cstype` / `deg` / `surf` / `parm u` / `parm v` / `end` block
+unchanged.
 
-The `.mod` binary form remains out of scope; non-Bezier `surf`
-surfaces (B-spline / NURBS / Cardinal / Taylor / basis-matrix),
-multi-patch Bezier surface decomposition, and trim/hole loop
-evaluation are the remaining gaps.
+The `.mod` binary form remains out of scope; non-Bezier/non-B-spline
+`surf` surfaces (Cardinal / Taylor / basis-matrix), multi-patch
+Bezier surface decomposition, and trim/hole loop evaluation are the
+remaining gaps.
 
 ## License
 

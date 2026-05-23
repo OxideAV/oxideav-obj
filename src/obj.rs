@@ -1221,16 +1221,24 @@ fn flush_block(
     }
 }
 
-/// Tessellate every `surf` element that sits under a `cstype bezier` /
-/// `cstype rat bezier` header into a triangulated [`Topology::Triangles`]
-/// primitive (round 11). Mirrors [`tessellate_curves`] but evaluates the
-/// bivariate Bezier tensor product (spec §"Rational and non-rational
-/// curves and surfaces", §"Bezier", §"Surface vertex data — control
-/// points").
+/// Tessellate every `surf` element that sits under a supported `cstype`
+/// header into a triangulated [`Topology::Triangles`] primitive. Mirrors
+/// [`tessellate_curves`] but evaluates a bivariate tensor product (spec
+/// §"Rational and non-rational curves and surfaces", §"Bezier",
+/// §"B-spline", §"Surface vertex data — control points").
 ///
-/// Only the Bezier basis is handled here; B-spline / Cardinal / Taylor /
-/// basis-matrix surfaces are captured-only (the directive sequence still
-/// round-trips through `Scene3D::extras["obj:freeform_directives"]`).
+/// Supported `cstype` values:
+///   * `bezier` / `rat bezier` (round 11) — bivariate tensor-product de
+///     Casteljau; single patch of `(degu + 1) × (degv + 1)` control
+///     points.
+///   * `bspline` / `rat bspline` (round 12) — bivariate tensor-product
+///     Cox-deBoor evaluation; the `parm u` / `parm v` knot vectors define
+///     the control-grid extents (`(len(parm u) − degu − 1) ×
+///     (len(parm v) − degv − 1)` per spec §"B-spline" condition 6).
+///
+/// Cardinal / Taylor / basis-matrix surfaces remain captured-only (the
+/// directive sequence still round-trips through
+/// `Scene3D::extras["obj:freeform_directives"]`).
 ///
 /// `surf` token layout (spec §"surf s0 s1 t0 t1 v1/vt1/vn1 …"):
 /// `surf s0 s1 t0 t1` followed by `v/vt/vn` control-vertex references.
@@ -1252,7 +1260,8 @@ fn flush_block(
 ///   * `obj:tessellated_curve` — `true` (shared sentinel so the encoder's
 ///     existing filter skips this synthetic geometry).
 ///   * `obj:tessellated_surface` — `true` (surface-specific sentinel).
-///   * `obj:surface_kind` — `"bezier"` / `"rat_bezier"`.
+///   * `obj:surface_kind` — `"bezier"` / `"rat_bezier"` / `"bspline"` /
+///     `"rat_bspline"`.
 ///   * `obj:surface_degree` — `[degu, degv]`.
 ///   * `obj:surface_u_range` / `obj:surface_v_range` — `[s0, s1]` /
 ///     `[t0, t1]` from the `surf` directive.
@@ -1263,22 +1272,35 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
         return out;
     }
 
-    // Block state, accumulated between `cstype` … `end`.
+    // Block state, accumulated between `cstype` … `end`. Like the curve
+    // tessellator, a `surf` header is syntactically ahead of the `parm u`
+    // / `parm v` body statements that supply the B-spline knot vectors,
+    // so the whole block is buffered and evaluated on `end` (or `cstype`
+    // / tail flush) once the body is fully visible.
     let mut active_kind: Option<&'static str> = None;
     let mut deg_u: Option<u32> = None;
     let mut deg_v: Option<u32> = None;
+    // Spec §"parm u/v": for B-spline surfaces these are the u/v knot
+    // vectors (unused by the Bezier basis but parsed regardless).
+    let mut parm_u: Vec<f32> = Vec::new();
+    let mut parm_v: Vec<f32> = Vec::new();
     let mut pending_surfs: Vec<&Vec<String>> = Vec::new();
 
+    #[allow(clippy::too_many_arguments)]
     let flush = |out: &mut Vec<Primitive>,
                  kind: Option<&'static str>,
                  deg_u: Option<u32>,
                  deg_v: Option<u32>,
+                 parm_u: &[f32],
+                 parm_v: &[f32],
                  surfs: &[&Vec<String>]| {
         let Some(kind) = kind else {
             return;
         };
         for entry in surfs {
-            if let Some(prim) = flush_surface(doc, kind, deg_u, deg_v, entry, samples) {
+            if let Some(prim) =
+                flush_surface(doc, kind, deg_u, deg_v, parm_u, parm_v, entry, samples)
+            {
                 out.push(prim);
             }
         }
@@ -1290,10 +1312,20 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
         }
         match entry[0].as_str() {
             "cstype" => {
-                flush(&mut out, active_kind, deg_u, deg_v, &pending_surfs);
+                flush(
+                    &mut out,
+                    active_kind,
+                    deg_u,
+                    deg_v,
+                    &parm_u,
+                    &parm_v,
+                    &pending_surfs,
+                );
                 pending_surfs.clear();
                 deg_u = None;
                 deg_v = None;
+                parm_u.clear();
+                parm_v.clear();
                 // Spec §"Curve and surface type": `cstype [rat] type`.
                 let mut iter = entry.iter().skip(1);
                 let first = iter.next().map(String::as_str);
@@ -1301,7 +1333,10 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                 active_kind = match (first, second) {
                     (Some("bezier"), _) => Some("bezier"),
                     (Some("rat"), Some("bezier")) => Some("rat_bezier"),
-                    // Other surface bases stay captured-only for now.
+                    (Some("bspline"), _) => Some("bspline"),
+                    (Some("rat"), Some("bspline")) => Some("rat_bspline"),
+                    // Cardinal / Taylor / basis-matrix surfaces stay
+                    // captured-only for now.
                     _ => None,
                 };
             }
@@ -1313,31 +1348,67 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                 deg_u = entry.get(1).and_then(|t| t.parse::<u32>().ok());
                 deg_v = entry.get(2).and_then(|t| t.parse::<u32>().ok()).or(deg_u);
             }
+            // Spec §"parm u/v": `parm u p1 p2 …` / `parm v p1 p2 …`. For
+            // B-spline surfaces these are the knot vectors in each
+            // parametric direction.
+            "parm" if entry.get(1).map(String::as_str) == Some("u") => {
+                parm_u = entry[2..]
+                    .iter()
+                    .filter_map(|t| t.parse::<f32>().ok())
+                    .collect();
+            }
+            "parm" if entry.get(1).map(String::as_str) == Some("v") => {
+                parm_v = entry[2..]
+                    .iter()
+                    .filter_map(|t| t.parse::<f32>().ok())
+                    .collect();
+            }
             "surf" => pending_surfs.push(entry),
             "end" => {
-                flush(&mut out, active_kind, deg_u, deg_v, &pending_surfs);
+                flush(
+                    &mut out,
+                    active_kind,
+                    deg_u,
+                    deg_v,
+                    &parm_u,
+                    &parm_v,
+                    &pending_surfs,
+                );
                 pending_surfs.clear();
                 active_kind = None;
                 deg_u = None;
                 deg_v = None;
+                parm_u.clear();
+                parm_v.clear();
             }
             _ => {}
         }
     }
     // Tail flush — defensive against a missing closing `end`.
-    flush(&mut out, active_kind, deg_u, deg_v, &pending_surfs);
+    flush(
+        &mut out,
+        active_kind,
+        deg_u,
+        deg_v,
+        &parm_u,
+        &parm_v,
+        &pending_surfs,
+    );
     out
 }
 
-/// Evaluate one `surf` element against an active Bezier `cstype` and
-/// return the triangulated primitive, or `None` when the directive is
-/// incomplete / malformed (lenient-loader pattern — the directive still
-/// round-trips through `obj:freeform_directives`).
+/// Evaluate one `surf` element against an active Bezier or B-spline
+/// `cstype` and return the triangulated primitive, or `None` when the
+/// directive is incomplete / malformed (lenient-loader pattern — the
+/// directive still round-trips through `obj:freeform_directives`).
+#[allow(clippy::too_many_arguments)]
 fn flush_surface(
     doc: &ObjDoc,
     kind: &'static str,
     deg_u: Option<u32>,
     deg_v: Option<u32>,
+    parm_u: &[f32],
+    parm_v: &[f32],
     entry: &[String],
     samples: u32,
 ) -> Option<Primitive> {
@@ -1354,14 +1425,29 @@ fn flush_surface(
     // Spec §"surf": both degu and degv are required for a surface.
     let du = deg_u? as usize;
     let dv = deg_v? as usize;
-    // Single-patch Bezier needs exactly (degu + 1) × (degv + 1) control
-    // points. Multi-patch surfaces (where the control-point count is a
-    // larger grid stitched together) are not split here; they would need
-    // the `step` stride which the Bezier basis doesn't carry, so we only
-    // tessellate the single-patch case and leave bigger grids
-    // captured-only.
-    let cols = du + 1; // u-direction count (K1 + 1)
-    let rows = dv + 1; // v-direction count (K2 + 1)
+
+    let bspline = matches!(kind, "bspline" | "rat_bspline");
+    // Determine the expected single-patch control grid.
+    //   * Bezier: a single patch is exactly (degu + 1) × (degv + 1)
+    //     control points (spec §"Bezier"). Larger grids are multi-patch
+    //     and need a `step` stride the Bezier basis doesn't carry, so they
+    //     stay captured-only.
+    //   * B-spline: the control-point count per direction is fixed by the
+    //     knot vector — spec §"B-spline" condition 6, `K = q − n − 1`, so
+    //     there are `len(parm) − deg − 1` control points in that
+    //     direction. A single `surf` already covers the whole grid (the
+    //     knot vector internally encodes the piecewise segments), so no
+    //     patch decomposition is needed.
+    let (cols, rows) = if bspline {
+        // Need at least `deg + 2` knots per direction for ≥ 1 control
+        // point.
+        if parm_u.len() < du + 2 || parm_v.len() < dv + 2 {
+            return None;
+        }
+        (parm_u.len() - du - 1, parm_v.len() - dv - 1) // (K1 + 1, K2 + 1)
+    } else {
+        (du + 1, dv + 1)
+    };
     let expected = cols * rows;
 
     let n_pos = doc.positions.len() as i64;
@@ -1381,12 +1467,20 @@ fn flush_surface(
         weights.push(w);
     }
     if grid.len() != expected {
-        // Not a single patch of the declared degree — leave it captured-
-        // only rather than guessing the patch decomposition.
+        // Not a single patch of the declared degree (Bezier) or the knot-
+        // vector-implied grid size (B-spline) — leave it captured-only
+        // rather than guessing the patch decomposition.
         return None;
     }
 
-    let positions = sample_bezier_surface(&grid, &weights, kind, cols, rows, samples);
+    let positions = if bspline {
+        sample_bspline_surface(
+            &grid, &weights, kind, du as u32, dv as u32, parm_u, parm_v, s0, s1, t0, t1, cols,
+            rows, samples,
+        )
+    } else {
+        sample_bezier_surface(&grid, &weights, kind, cols, rows, samples)
+    };
     if positions.is_empty() {
         return None;
     }
@@ -1559,6 +1653,166 @@ fn de_casteljau_4d(points: &[[f32; 4]], t: f32) -> [f32; 4] {
         }
     }
     buf[0]
+}
+
+/// Evaluate a B-spline (or rational B-spline / NURBS) surface patch at a
+/// `(samples + 1) × (samples + 1)` lattice via the bivariate
+/// tensor-product Cox-deBoor formula (spec §"B-spline", §"Rational and
+/// non-rational curves and surfaces", §"Surface vertex data — control
+/// points").
+///
+/// `grid` is the control mesh in row-major order with the u index varying
+/// fastest (`cols` control points per v-row, `rows` v-rows). The surface
+/// is
+///
+///   S(u, v) = Σ_i Σ_j N_{i,nu}(u) · N_{j,nv}(v) · d_{i,j}
+///
+/// for the non-rational case and
+///
+///   S(u, v) = Σ_i Σ_j N_{i,nu}(u) · N_{j,nv}(v) · w_{i,j} · d_{i,j}
+///             ─────────────────────────────────────────────────────
+///                  Σ_i Σ_j N_{i,nu}(u) · N_{j,nv}(v) · w_{i,j}
+///
+/// for the rational (NURBS) case. `nu` / `nv` are the u / v degrees and
+/// `knots_u` (`parm u`) / `knots_v` (`parm v`) are the per-direction knot
+/// vectors. The basis functions are evaluated with the same
+/// [`bspline_basis`] routine the 1D curve path uses.
+///
+/// `s0`..`s1` and `t0`..`t1` are the `surf` parameter ranges; each is
+/// clipped against the spec §"B-spline" condition-5 evaluation window
+/// `[x_n, x_{K+1}]` of its direction's knot vector. The half-open
+/// knot-span convention `x_i ≤ t < x_{i+1}` means an endpoint exactly at
+/// the upper bound would yield an all-zero basis, so the last sample in
+/// each direction is nudged fractionally below the bound (the same
+/// standard NURBS-evaluator pattern as [`sample_bspline`]).
+///
+/// Output vertices are ordered row-major in the sample lattice: sample
+/// `(su, sv)` lands at index `sv * (samples + 1) + su`.
+#[allow(clippy::too_many_arguments)]
+fn sample_bspline_surface(
+    grid: &[[f32; 3]],
+    weights: &[f32],
+    kind: &str,
+    deg_u: u32,
+    deg_v: u32,
+    knots_u: &[f32],
+    knots_v: &[f32],
+    s0: f32,
+    s1: f32,
+    t0: f32,
+    t1: f32,
+    cols: usize,
+    rows: usize,
+    samples: u32,
+) -> Vec<[f32; 3]> {
+    if samples == 0 || cols == 0 || rows == 0 || grid.len() != cols * rows {
+        return Vec::new();
+    }
+    let nu = deg_u as usize;
+    let nv = deg_v as usize;
+    // Spec §"B-spline" condition 6: q + 1 knots ⇒ K + 1 = q − n control
+    // points ⇒ knots.len() == control_count + degree + 1.
+    if knots_u.len() != cols + nu + 1 || knots_v.len() != rows + nv + 1 {
+        return Vec::new();
+    }
+
+    // Per-direction evaluation windows (spec condition 5:
+    // x_n ≤ t_min < t_max ≤ x_{K+1}). Clip the `surf` ranges into the
+    // valid span of each knot vector.
+    let u_lo_bound = knots_u[nu];
+    let u_hi_bound = knots_u[cols]; // x_{K1+1}, K1+1 = cols.
+    let v_lo_bound = knots_v[nv];
+    let v_hi_bound = knots_v[rows]; // x_{K2+1}, K2+1 = rows.
+    let u_min = s0.max(u_lo_bound);
+    let u_max = s1.min(u_hi_bound);
+    let v_min = t0.max(v_lo_bound);
+    let v_max = t1.min(v_hi_bound);
+    if u_min > u_max || v_min > v_max {
+        return Vec::new();
+    }
+
+    let rational = kind == "rat_bspline";
+    let n = samples as usize + 1;
+
+    // Precompute one row of u-basis values per sample column and one
+    // column of v-basis values per sample row; the tensor product reuses
+    // them across the lattice.
+    let nudge = |t: f32, lo: f32, hi: f32| -> f32 {
+        // When t lands exactly on the upper bound the half-open spans give
+        // an all-zero basis; bias it fractionally inside the last span.
+        if t >= hi {
+            let biased = hi - (hi - lo).abs() * 1e-7 - f32::EPSILON;
+            if biased < lo { lo } else { biased }
+        } else {
+            t
+        }
+    };
+
+    let u_basis_rows: Vec<Vec<f32>> = (0..n)
+        .map(|i| {
+            let t01 = if n == 1 {
+                0.0
+            } else {
+                i as f32 / (n - 1) as f32
+            };
+            let u = nudge(u_min + t01 * (u_max - u_min), u_lo_bound, u_hi_bound);
+            bspline_basis(u, knots_u, nu)
+        })
+        .collect();
+    let v_basis_rows: Vec<Vec<f32>> = (0..n)
+        .map(|j| {
+            let t01 = if n == 1 {
+                0.0
+            } else {
+                j as f32 / (n - 1) as f32
+            };
+            let v = nudge(v_min + t01 * (v_max - v_min), v_lo_bound, v_hi_bound);
+            bspline_basis(v, knots_v, nv)
+        })
+        .collect();
+
+    let mut out: Vec<[f32; 3]> = Vec::with_capacity(n * n);
+    for vb in v_basis_rows.iter() {
+        for ub in u_basis_rows.iter() {
+            // Tensor product: S = Σ_j vb[j] · Σ_i ub[i] · w_{i,j} · d_{i,j}
+            // accumulated together with the weighted denominator.
+            let mut acc = [0.0f32; 3];
+            let mut wsum = 0.0f32;
+            for (j, &bv) in vb.iter().enumerate().take(rows) {
+                if bv == 0.0 {
+                    continue;
+                }
+                for (i, &bu) in ub.iter().enumerate().take(cols) {
+                    if bu == 0.0 {
+                        continue;
+                    }
+                    let idx = j * cols + i;
+                    let w = if rational { weights[idx] } else { 1.0 };
+                    let coeff = bu * bv * w;
+                    if coeff == 0.0 {
+                        continue;
+                    }
+                    wsum += coeff;
+                    acc[0] += coeff * grid[idx][0];
+                    acc[1] += coeff * grid[idx][1];
+                    acc[2] += coeff * grid[idx][2];
+                }
+            }
+            if wsum.abs() > f32::EPSILON {
+                // Non-rational basis functions form a partition of unity
+                // inside the valid window, so the division is a no-op there
+                // (wsum ≈ 1); the rational form needs it. Dividing in both
+                // cases keeps a single code path and is numerically safe.
+                out.push([acc[0] / wsum, acc[1] / wsum, acc[2] / wsum]);
+            } else {
+                // Sample fell outside the support of every basis function
+                // (pathological knot vector); emit the zero accumulator so
+                // the lattice size still matches (samples + 1)^2.
+                out.push(acc);
+            }
+        }
+    }
+    out
 }
 
 /// Evaluate a Bezier (or rational-Bezier) curve at `samples + 1`

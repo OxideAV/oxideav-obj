@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- B-spline / NURBS `surf` surface tessellation under
+  `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
+  evaluates `surf` elements that sit under a `cstype bspline` (or
+  `cstype rat bspline`) header into a triangulated `Topology::Triangles`
+  primitive on the synthetic `"obj:surfaces"` mesh, via the bivariate
+  tensor-product Cox-deBoor formula
+  `S(u, v) = Σ_i Σ_j N_{i,nu}(u) · N_{j,nv}(v) · d_{i,j}` (spec
+  §"B-spline" + §"Rational and non-rational curves and surfaces"). The
+  per-direction control-grid extents are derived from the `parm u` /
+  `parm v` knot vectors (`(len(parm u) − degu − 1) ×
+  (len(parm v) − degv − 1)` per spec §"B-spline" condition 6, applied
+  independently in u and v); control points are read in the spec's
+  row-major u-fastest order (§"Surface vertex data — control points")
+  with negative relative-from-end indices honoured. Each `surf` line's
+  `s0 s1 t0 t1` range is clipped against the condition-5 evaluation
+  window `[x_n, x_{K+1}]` of its direction's knot vector, and the last
+  sample per direction is nudged fractionally below the upper bound so
+  the half-open knot-span convention doesn't zero the basis at the
+  endpoint (same NURBS-evaluator pattern as the round-8 curve path). The
+  rational (NURBS) form blends the per-vertex `w` weights from the `v`
+  lines and projects via the weighted denominator
+  `Σ N·N·w·d / Σ N·N·w`. The basis is evaluated with the same
+  `bspline_basis` Cox-deBoor routine the 1D `curv` path uses, so a
+  clamped quadratic B-spline patch (`parm 0 0 0 1 1 1`) reproduces the
+  equivalent quadratic Bezier patch sample-for-sample, and the spec's
+  cubic B-spline surface example tessellates inside its control-net
+  convex hull. Synthetic primitives carry
+  `obj:tessellated_surface = true`, `obj:surface_kind`
+  (`"bspline"` / `"rat_bspline"`), `obj:surface_degree`,
+  `obj:surface_u_range`, `obj:surface_v_range`, and `obj:surface_samples`
+  provenance plus the shared `obj:tessellated_curve = true` sentinel so
+  the encoder filters the synthetic geometry out and replays the original
+  `cstype` / `deg` / `surf` / `parm u` / `parm v` / `end` block verbatim
+  from `Scene3D::extras["obj:freeform_directives"]`. Knot/control-count
+  mismatches and malformed blocks are left captured-only. Cardinal /
+  Taylor / basis-matrix `surf` bases remain captured-only.
 - Bezier `surf` surface tessellation under
   `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
   evaluates `surf` elements that sit under a `cstype bezier` (or
