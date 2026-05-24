@@ -1235,9 +1235,15 @@ fn flush_block(
 ///     Cox-deBoor evaluation; the `parm u` / `parm v` knot vectors define
 ///     the control-grid extents (`(len(parm u) − degu − 1) ×
 ///     (len(parm v) − degv − 1)` per spec §"B-spline" condition 6).
+///   * `cardinal` / `rat cardinal` (round 13) — cubic-only bivariate
+///     tensor-product Cardinal (Catmull-Rom) evaluation via the spec
+///     §"Cardinal" Cardinal→Bezier conversion applied per parametric
+///     direction over a sliding 4-point window; the control grid is the
+///     `parm`-derived extent (`parm_count + 1` per direction) or a
+///     square single patch when `parm` only carries the 2-value range.
 ///
-/// Cardinal / Taylor / basis-matrix surfaces remain captured-only (the
-/// directive sequence still round-trips through
+/// Taylor / basis-matrix surfaces remain captured-only (the directive
+/// sequence still round-trips through
 /// `Scene3D::extras["obj:freeform_directives"]`).
 ///
 /// `surf` token layout (spec §"surf s0 s1 t0 t1 v1/vt1/vn1 …"):
@@ -1261,7 +1267,7 @@ fn flush_block(
 ///     existing filter skips this synthetic geometry).
 ///   * `obj:tessellated_surface` — `true` (surface-specific sentinel).
 ///   * `obj:surface_kind` — `"bezier"` / `"rat_bezier"` / `"bspline"` /
-///     `"rat_bspline"`.
+///     `"rat_bspline"` / `"cardinal"`.
 ///   * `obj:surface_degree` — `[degu, degv]`.
 ///   * `obj:surface_u_range` / `obj:surface_v_range` — `[s0, s1]` /
 ///     `[t0, t1]` from the `surf` directive.
@@ -1335,8 +1341,15 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     (Some("rat"), Some("bezier")) => Some("rat_bezier"),
                     (Some("bspline"), _) => Some("bspline"),
                     (Some("rat"), Some("bspline")) => Some("rat_bspline"),
-                    // Cardinal / Taylor / basis-matrix surfaces stay
-                    // captured-only for now.
+                    // Spec §"Cardinal": cubic, first-derivative-continuous
+                    // surface (round 13). The `rat` qualifier maps to the
+                    // same kind — the spec note (§"Free-form curve/surface
+                    // body statements") says the unit-weight default is
+                    // reasonable for Cardinal because its basis functions
+                    // sum to 1, so we don't differentiate `rat cardinal`.
+                    (Some("cardinal"), _) => Some("cardinal"),
+                    (Some("rat"), Some("cardinal")) => Some("cardinal"),
+                    // Taylor / basis-matrix surfaces stay captured-only.
                     _ => None,
                 };
             }
@@ -1427,6 +1440,7 @@ fn flush_surface(
     let dv = deg_v? as usize;
 
     let bspline = matches!(kind, "bspline" | "rat_bspline");
+    let cardinal = kind == "cardinal";
     // Determine the expected single-patch control grid.
     //   * Bezier: a single patch is exactly (degu + 1) × (degv + 1)
     //     control points (spec §"Bezier"). Larger grids are multi-patch
@@ -1438,6 +1452,14 @@ fn flush_surface(
     //     direction. A single `surf` already covers the whole grid (the
     //     knot vector internally encodes the piecewise segments), so no
     //     patch decomposition is needed.
+    //   * Cardinal: cubic-only (spec §"Cardinal": "only defined for the
+    //     cubic case"). The control count per direction relates to the
+    //     `parm` count by the spec condition `parm = K − n + 2` (n = 3),
+    //     i.e. `K_dir = parm_count + 1`. When a `parm` directive only
+    //     spells out the 2-value global parameter range (as the spec
+    //     Cardinal-surface example does), there is no per-direction split
+    //     to read, so the grid is taken to be square — `cols = rows =
+    //     sqrt(total)` — which recovers the canonical single 4×4 patch.
     let (cols, rows) = if bspline {
         // Need at least `deg + 2` knots per direction for ≥ 1 control
         // point.
@@ -1445,6 +1467,29 @@ fn flush_surface(
             return None;
         }
         (parm_u.len() - du - 1, parm_v.len() - dv - 1) // (K1 + 1, K2 + 1)
+    } else if cardinal {
+        // Cardinal must be cubic per spec; reject any other degree (the
+        // directive still round-trips verbatim through extras).
+        if du != 3 || dv != 3 {
+            return None;
+        }
+        let total = entry.len() - 5; // control-vertex token count.
+        // Prefer the per-direction `parm` extents when they carry more
+        // than just the range endpoints (`parm = K − n + 2`); otherwise
+        // fall back to a square single-patch grid.
+        let cols = if parm_u.len() > 2 {
+            parm_u.len() + 1
+        } else {
+            isqrt_exact(total)?
+        };
+        let rows = if parm_v.len() > 2 {
+            parm_v.len() + 1
+        } else if cols != 0 && total % cols == 0 {
+            total / cols
+        } else {
+            return None;
+        };
+        (cols, rows)
     } else {
         (du + 1, dv + 1)
     };
@@ -1478,6 +1523,8 @@ fn flush_surface(
             &grid, &weights, kind, du as u32, dv as u32, parm_u, parm_v, s0, s1, t0, t1, cols,
             rows, samples,
         )
+    } else if cardinal {
+        sample_cardinal_surface(&grid, cols, rows, samples)
     } else {
         sample_bezier_surface(&grid, &weights, kind, cols, rows, samples)
     };
@@ -2155,6 +2202,145 @@ fn sample_cardinal(control_points: &[[f32; 3]], samples: u32) -> Vec<[f32; 3]> {
         out.push(p);
     }
     out
+}
+
+/// Evaluate a single cubic Cardinal (Catmull-Rom) control polygon at the
+/// global parameter `s ∈ [0, len − 3]`, where the integer part of `s`
+/// selects the 4-point segment window and the fractional part is the
+/// local `t ∈ [0, 1]` inside that segment.
+///
+/// Spec §"Cardinal": each segment over `c0, c1, c2, c3` converts to a
+/// cubic Bezier (`b0 = c1`, `b1 = c1 + (c2 − c0) / 6`,
+/// `b2 = c2 − (c3 − c1) / 6`, `b3 = c2`) and is then evaluated with the
+/// Bernstein cubic basis. The curve interpolates every interior control
+/// point exactly. This is the 1D building block the tensor-product
+/// surface evaluator reuses in both parametric directions.
+fn cardinal_eval_1d(points: &[[f32; 3]], s: f32) -> [f32; 3] {
+    // Caller guarantees `points.len() >= 4`.
+    let n_segments = points.len() - 3;
+    let mut seg = s.floor() as isize;
+    let mut t = s - seg as f32;
+    if seg < 0 {
+        seg = 0;
+        t = 0.0;
+    } else if seg as usize >= n_segments {
+        seg = n_segments as isize - 1;
+        t = 1.0;
+    }
+    let seg = seg as usize;
+    let c0 = points[seg];
+    let c1 = points[seg + 1];
+    let c2 = points[seg + 2];
+    let c3 = points[seg + 3];
+    // Spec §"Cardinal" Bezier conversion (component-wise per axis).
+    let mut b: [[f32; 3]; 4] = [[0.0; 3]; 4];
+    for a in 0..3 {
+        b[0][a] = c1[a];
+        b[1][a] = c1[a] + (c2[a] - c0[a]) / 6.0;
+        b[2][a] = c2[a] - (c3[a] - c1[a]) / 6.0;
+        b[3][a] = c2[a];
+    }
+    let u = 1.0 - t;
+    let w0 = u * u * u;
+    let w1 = 3.0 * u * u * t;
+    let w2 = 3.0 * u * t * t;
+    let w3 = t * t * t;
+    [
+        w0 * b[0][0] + w1 * b[1][0] + w2 * b[2][0] + w3 * b[3][0],
+        w0 * b[0][1] + w1 * b[1][1] + w2 * b[2][1] + w3 * b[3][1],
+        w0 * b[0][2] + w1 * b[1][2] + w2 * b[2][2] + w3 * b[3][2],
+    ]
+}
+
+/// Evaluate a cubic Cardinal (Catmull-Rom) surface patch at a
+/// `(samples + 1) × (samples + 1)` lattice via the bivariate
+/// tensor-product Cardinal evaluation (spec §"Cardinal").
+///
+/// `grid` is the control mesh in row-major order with the u index varying
+/// fastest (`cols` control points per v-row, `rows` v-rows; spec
+/// §"Surface vertex data — control points"). The surface is the tensor
+/// product of two cubic Cardinal bases:
+///
+///   S(u, v) = Σ_i Σ_j C_i(u) · C_j(v) · d_{i,j}
+///
+/// where `C_·` are the cubic Cardinal basis functions. We collapse the
+/// inner u sum first by running the 1D Cardinal evaluator on each v-row,
+/// then a second 1D Cardinal evaluation in the v direction over the
+/// `rows` collapsed points (spec §"Cardinal": "For surfaces, all but the
+/// first and last row and column of control points are interpolated").
+///
+/// The global parameter domain is `[0, cols − 3] × [0, rows − 3]` (one
+/// unit per Cardinal segment); samples are spread uniformly over it. The
+/// `surf` range scalars are provenance only (Cardinal is segment-
+/// normalised, like the round-9 curve path), so they are not used to
+/// re-parameterise the evaluation.
+///
+/// Weights / rationality: spec §"Free-form curve/surface body
+/// statements" notes the unit-weight default is reasonable for Cardinal
+/// (its basis functions sum to 1), so per-vertex `w` weights are not
+/// applied — `rat cardinal` routes here too.
+///
+/// Output vertices are ordered row-major in the sample lattice: sample
+/// `(su, sv)` lands at index `sv * (samples + 1) + su`.
+fn sample_cardinal_surface(
+    grid: &[[f32; 3]],
+    cols: usize,
+    rows: usize,
+    samples: u32,
+) -> Vec<[f32; 3]> {
+    // Cardinal needs at least a 4×4 control window per direction.
+    if samples == 0 || cols < 4 || rows < 4 || grid.len() != cols * rows {
+        return Vec::new();
+    }
+    let n = samples as usize + 1;
+    let u_span = (cols - 3) as f32; // number of u-segments.
+    let v_span = (rows - 3) as f32; // number of v-segments.
+
+    let mut out: Vec<[f32; 3]> = Vec::with_capacity(n * n);
+    for sv in 0..n {
+        let v = if n == 1 {
+            0.0
+        } else {
+            sv as f32 / (n - 1) as f32 * v_span
+        };
+        for su in 0..n {
+            let u = if n == 1 {
+                0.0
+            } else {
+                su as f32 / (n - 1) as f32 * u_span
+            };
+            // Inner pass: evaluate each v-row's 1D Cardinal curve at u,
+            // leaving one point per row.
+            let mut col_pts: Vec<[f32; 3]> = Vec::with_capacity(rows);
+            for r in 0..rows {
+                let row = &grid[r * cols..r * cols + cols];
+                col_pts.push(cardinal_eval_1d(row, u));
+            }
+            // Outer pass: 1D Cardinal evaluation in v over the collapsed
+            // points.
+            out.push(cardinal_eval_1d(&col_pts, v));
+        }
+    }
+    out
+}
+
+/// Integer square root that returns `Some(r)` only when `n == r * r`
+/// (i.e. `n` is a perfect square). Used to recover the square single-
+/// patch control-grid dimension for a Cardinal `surf` whose `parm`
+/// directives carry only the 2-value global parameter range.
+fn isqrt_exact(n: usize) -> Option<usize> {
+    if n == 0 {
+        return None;
+    }
+    let mut r = (n as f64).sqrt() as usize;
+    // Guard against floating-point rounding on either side.
+    while r * r > n {
+        r -= 1;
+    }
+    while (r + 1) * (r + 1) <= n {
+        r += 1;
+    }
+    if r * r == n { Some(r) } else { None }
 }
 
 /// Evaluate a Taylor polynomial curve at `samples + 1` uniformly-spaced

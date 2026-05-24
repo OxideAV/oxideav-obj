@@ -376,18 +376,18 @@ fn tessellated_surface_is_not_emitted_as_v_lines_by_encoder() {
 
 #[test]
 fn unsupported_surface_basis_is_left_captured_only() {
-    // A `cstype cardinal` `surf` has no surface evaluator yet — the
+    // A `cstype taylor` `surf` has no surface evaluator yet — the
     // tessellator must not synthesise a mesh for it; the directive
     // sequence still round-trips through `obj:freeform_directives`.
-    // (B-spline / rat B-spline surfaces ARE now tessellated — see
-    // `bspline_surface_*` tests below.)
+    // (Bezier / B-spline / Cardinal surfaces ARE now tessellated — see
+    // the dedicated test groups below.)
     let text = "\
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
 v 0.0 1.0 0.0
 v 1.0 1.0 0.0
-cstype cardinal
-deg 3 3
+cstype taylor
+deg 1 1
 surf 0.0 1.0 0.0 1.0 1 2 3 4
 parm u 0.0 1.0
 parm v 0.0 1.0
@@ -399,7 +399,7 @@ end
         .unwrap();
     assert!(
         scene.meshes.is_empty(),
-        "Cardinal surfaces stay captured-only; no synthetic mesh expected"
+        "Taylor surfaces stay captured-only; no synthetic mesh expected"
     );
     // The directives are still preserved for round-trip.
     assert!(scene.extras.contains_key("obj:freeform_directives"));
@@ -821,4 +821,384 @@ end
         "knot-vector/control-count mismatch should skip tessellation"
     );
     assert!(scene.extras.contains_key("obj:freeform_directives"));
+}
+
+// ---------------------------------------------------------------------------
+// Cardinal (Catmull-Rom) `surf` surface tessellation (round 13).
+//
+// Spec references: §"Cardinal" (cubic-only; Cardinal→Bezier conversion;
+// "For surfaces, all but the first and last row and column of control
+// points are interpolated"; "Cardinal splines are only defined for the
+// cubic case"), §"deg degu degv" (per-direction degree), §"surf s0 s1 t0
+// t1 v1/vt1/vn1 …" (element statement), §"Surface vertex data — control
+// points" (row-major u-fastest ordering), §"Free-form curve/surface body
+// statements" (Cardinal unit-weight default is reasonable).
+// ---------------------------------------------------------------------------
+
+/// Spec Example 4 — a planar Cardinal surface. A 4×4 control grid all at
+/// z = 0 (`deg 3 3`), so a Cardinal patch over it must also be flat: every
+/// tessellated sample stays on z = 0.
+const CARDINAL_SURF_SPEC_EX4: &str = "\
+v -5.000000 -5.000000 0.000000
+v -5.000000 -1.666667 0.000000
+v -5.000000 1.666667 0.000000
+v -5.000000 5.000000 0.000000
+v -1.666667 -5.000000 0.000000
+v -1.666667 -1.666667 0.000000
+v -1.666667 1.666667 0.000000
+v -1.666667 5.000000 0.000000
+v 1.666667 -5.000000 0.000000
+v 1.666667 -1.666667 0.000000
+v 1.666667 1.666667 0.000000
+v 1.666667 5.000000 0.000000
+v 5.000000 -5.000000 0.000000
+v 5.000000 -1.666667 0.000000
+v 5.000000 1.666667 0.000000
+v 5.000000 5.000000 0.000000
+cstype cardinal
+deg 3 3
+surf 0.000000 1.000000 0.000000 1.000000 13 14 15 16 9 10 11 12 5 6 7 8 1 2 3 4
+parm u 0.000000 1.000000
+parm v 0.000000 1.000000
+end
+";
+
+#[test]
+fn default_decoder_does_not_tessellate_cardinal_surfaces() {
+    let bare = ObjDecoder::new()
+        .decode(CARDINAL_SURF_SPEC_EX4.as_bytes())
+        .unwrap();
+    assert!(
+        bare.meshes.is_empty(),
+        "default decoder must not synthesise Cardinal surface meshes"
+    );
+}
+
+#[test]
+fn cardinal_spec_example4_tessellates_into_a_flat_grid() {
+    let samples = 4u32;
+    let scene = ObjDecoder::new()
+        .with_curve_tessellation(samples)
+        .decode(CARDINAL_SURF_SPEC_EX4.as_bytes())
+        .unwrap();
+    assert_eq!(scene.meshes.len(), 1, "one synthetic surface mesh expected");
+    let mesh = &scene.meshes[0];
+    assert_eq!(mesh.name.as_deref(), Some("obj:surfaces"));
+    assert_eq!(mesh.primitives.len(), 1);
+
+    let prim = &mesh.primitives[0];
+    assert_eq!(prim.topology, Topology::Triangles);
+    assert_eq!(prim.positions.len(), 25, "(samples + 1)^2 lattice vertices");
+    assert_eq!(prim.indices.as_ref().unwrap().len(), 96);
+
+    // The whole control net is z = 0 ⇒ the Cardinal patch is flat.
+    for p in &prim.positions {
+        assert!(p[2].abs() < 1e-4, "vertex off the z=0 plane: {p:?}");
+    }
+
+    // Provenance.
+    assert_eq!(
+        prim.extras
+            .get("obj:tessellated_curve")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        prim.extras
+            .get("obj:tessellated_surface")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        prim.extras.get("obj:surface_kind").and_then(|v| v.as_str()),
+        Some("cardinal")
+    );
+    let deg = prim
+        .extras
+        .get("obj:surface_degree")
+        .and_then(|v| v.as_array())
+        .unwrap();
+    assert_eq!(deg[0].as_u64(), Some(3));
+    assert_eq!(deg[1].as_u64(), Some(3));
+}
+
+/// A 4×4 Cardinal control grid whose boundary ring is flat (z = 0) but
+/// whose interior 2×2 block is lifted in z. Spec §"Cardinal": for
+/// surfaces, all but the first and last row and column of control points
+/// are interpolated — so a single bicubic Cardinal patch (one segment per
+/// direction, parameter domain [0,1]²) has parametric corners that land
+/// exactly on the four *interior* control points. We verify those four
+/// parametric corners interpolate the lifted interior points exactly.
+const CARDINAL_INTERIOR_BULGE: &str = "\
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 2.0 0.0 0.0
+v 3.0 0.0 0.0
+v 0.0 1.0 0.0
+v 1.0 1.0 0.5
+v 2.0 1.0 0.7
+v 3.0 1.0 0.0
+v 0.0 2.0 0.0
+v 1.0 2.0 0.9
+v 2.0 2.0 0.3
+v 3.0 2.0 0.0
+v 0.0 3.0 0.0
+v 1.0 3.0 0.0
+v 2.0 3.0 0.0
+v 3.0 3.0 0.0
+cstype cardinal
+deg 3 3
+surf 0.0 1.0 0.0 1.0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
+parm u 0.0 1.0
+parm v 0.0 1.0
+end
+";
+
+#[test]
+fn cardinal_surface_interpolates_interior_control_points() {
+    let samples = 6u32;
+    let scene = ObjDecoder::new()
+        .with_curve_tessellation(samples)
+        .decode(CARDINAL_INTERIOR_BULGE.as_bytes())
+        .unwrap();
+    let prim = &scene.meshes[0].primitives[0];
+    let n = samples as usize + 1;
+    assert_eq!(prim.positions.len(), n * n);
+
+    // The interior 2×2 control block is, in the row-major grid (cols=4),
+    // grid[1][1] = v6 (1,1,0.5), grid[1][2] = v7 (2,1,0.7),
+    // grid[2][1] = v10 (1,2,0.9), grid[2][2] = v11 (2,2,0.3).
+    // A single Cardinal patch (one u-segment, one v-segment) maps the
+    // parametric corners to those interior points:
+    //   (u=0, v=0) ⇒ grid[1][1] = v6
+    //   (u=1, v=0) ⇒ grid[1][2] = v7
+    //   (u=0, v=1) ⇒ grid[2][1] = v10
+    //   (u=1, v=1) ⇒ grid[2][2] = v11
+    let p00 = prim.positions[0];
+    let p10 = prim.positions[n - 1];
+    let p01 = prim.positions[(n - 1) * n];
+    let p11 = prim.positions[n * n - 1];
+    let approx = |a: [f32; 3], b: [f32; 3]| {
+        (a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4 && (a[2] - b[2]).abs() < 1e-4
+    };
+    assert!(approx(p00, [1.0, 1.0, 0.5]), "(0,0) corner: {p00:?}");
+    assert!(approx(p10, [2.0, 1.0, 0.7]), "(1,0) corner: {p10:?}");
+    assert!(approx(p01, [1.0, 2.0, 0.9]), "(0,1) corner: {p01:?}");
+    assert!(approx(p11, [2.0, 2.0, 0.3]), "(1,1) corner: {p11:?}");
+}
+
+#[test]
+fn cardinal_surface_matches_cardinal_to_bezier_reference() {
+    // Cross-check the tensor-product evaluator against an independent
+    // Cardinal→Bezier reference (spec §"Cardinal" conversion applied per
+    // direction). For a single 4×4 patch each parametric direction is one
+    // Cardinal segment over c0..c3, converted to a cubic Bezier and
+    // evaluated with the Bernstein basis. The tensor product runs the u
+    // pass on each v-row, then a v pass on the four collapsed points.
+    let grid: [[f32; 3]; 16] = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+        [3.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 1.0, 0.5],
+        [2.0, 1.0, 0.7],
+        [3.0, 1.0, 0.0],
+        [0.0, 2.0, 0.0],
+        [1.0, 2.0, 0.9],
+        [2.0, 2.0, 0.3],
+        [3.0, 2.0, 0.0],
+        [0.0, 3.0, 0.0],
+        [1.0, 3.0, 0.0],
+        [2.0, 3.0, 0.0],
+        [3.0, 3.0, 0.0],
+    ];
+    // Cardinal→Bezier for a single 4-point segment, then Bernstein eval.
+    fn cardinal_seg(c: &[[f32; 3]; 4], t: f32) -> [f32; 3] {
+        let mut b = [[0.0f32; 3]; 4];
+        for a in 0..3 {
+            b[0][a] = c[1][a];
+            b[1][a] = c[1][a] + (c[2][a] - c[0][a]) / 6.0;
+            b[2][a] = c[2][a] - (c[3][a] - c[1][a]) / 6.0;
+            b[3][a] = c[2][a];
+        }
+        let u = 1.0 - t;
+        let w = [u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t];
+        let mut p = [0.0f32; 3];
+        for a in 0..3 {
+            p[a] = w[0] * b[0][a] + w[1] * b[1][a] + w[2] * b[2][a] + w[3] * b[3][a];
+        }
+        p
+    }
+    fn reference(grid: &[[f32; 3]; 16], u: f32, v: f32) -> [f32; 3] {
+        // u pass: collapse each of the 4 v-rows.
+        let mut col = [[0.0f32; 3]; 4];
+        for (r, slot) in col.iter_mut().enumerate() {
+            let row: [[f32; 3]; 4] = [
+                grid[r * 4],
+                grid[r * 4 + 1],
+                grid[r * 4 + 2],
+                grid[r * 4 + 3],
+            ];
+            *slot = cardinal_seg(&row, u);
+        }
+        // v pass over the collapsed points.
+        cardinal_seg(&col, v)
+    }
+
+    let samples = 5u32;
+    let scene = ObjDecoder::new()
+        .with_curve_tessellation(samples)
+        .decode(CARDINAL_INTERIOR_BULGE.as_bytes())
+        .unwrap();
+    let prim = &scene.meshes[0].primitives[0];
+    let n = samples as usize + 1;
+    for sv in 0..n {
+        let v = sv as f32 / (n - 1) as f32;
+        for su in 0..n {
+            let u = su as f32 / (n - 1) as f32;
+            let expect = reference(&grid, u, v);
+            let got = prim.positions[sv * n + su];
+            for k in 0..3 {
+                assert!(
+                    (got[k] - expect[k]).abs() < 1e-4,
+                    "Cardinal surface ≠ reference at (u={u}, v={v}) axis {k}: \
+                     got {got:?}, expected {expect:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cardinal_surface_round_trips_directives_without_leaking_samples() {
+    // Decoder tessellates → encoder must skip the synthetic triangle mesh
+    // and replay the original Cardinal directives verbatim. The 25 sample
+    // points must not pollute the `v` pool (only the 16 control points may
+    // appear), and no `o obj:surfaces` block may be re-emitted.
+    let scene = ObjDecoder::new()
+        .with_curve_tessellation(4)
+        .decode(CARDINAL_SURF_SPEC_EX4.as_bytes())
+        .unwrap();
+    assert_eq!(scene.meshes.len(), 1, "synthetic surface mesh present");
+
+    let bytes = obj::serialize_obj(&scene, None).unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+
+    let v_lines = text.lines().filter(|l| l.starts_with("v ")).count();
+    assert!(
+        v_lines <= 16,
+        "tessellation samples leaked as `v` lines; got {v_lines}:\n{text}"
+    );
+    assert!(
+        !text.contains("o obj:surfaces"),
+        "synthetic surface mesh must not be re-emitted as a polygonal `o` block"
+    );
+    for keyword in ["cstype cardinal", "deg 3 3", "surf 0", "end"] {
+        assert!(
+            text.lines().any(|l| l.starts_with(keyword)),
+            "missing `{keyword}` line in:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn non_cubic_cardinal_surface_is_rejected() {
+    // Spec §"Cardinal": "Cardinal splines are only defined for the cubic
+    // case." A `deg 2 2` Cardinal surface must be left captured-only.
+    let text = "\
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 2.0 0.0 0.0
+v 0.0 1.0 0.0
+v 1.0 1.0 0.0
+v 2.0 1.0 0.0
+v 0.0 2.0 0.0
+v 1.0 2.0 0.0
+v 2.0 2.0 0.0
+cstype cardinal
+deg 2 2
+surf 0.0 1.0 0.0 1.0 1 2 3 4 5 6 7 8 9
+parm u 0.0 1.0
+parm v 0.0 1.0
+end
+";
+    let scene = ObjDecoder::new()
+        .with_curve_tessellation(4)
+        .decode(text.as_bytes())
+        .unwrap();
+    assert!(
+        scene.meshes.is_empty(),
+        "non-cubic Cardinal surfaces stay captured-only"
+    );
+    assert!(scene.extras.contains_key("obj:freeform_directives"));
+}
+
+/// A 4-col × 5-row Cardinal control grid (one u-segment, two v-segments)
+/// exercising the multi-segment path. The grid is laid out row-major with
+/// the u index (4 columns, x = 0..3) varying fastest and 5 v-rows
+/// (y = 0..4). cols is read from `parm u` (3 values ⇒ `K = parm + 1 = 4`)
+/// and rows from `parm v` (4 values ⇒ `K = parm + 1 = 5`). Two genuine
+/// interior control points (row 2, cols 1 and 2) lift in z; the surface
+/// must tessellate and the bulge must reach into the sampled domain.
+const CARDINAL_MULTISEG: &str = "\
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 2.0 0.0 0.0
+v 3.0 0.0 0.0
+v 0.0 1.0 0.0
+v 1.0 1.0 0.0
+v 2.0 1.0 0.0
+v 3.0 1.0 0.0
+v 0.0 2.0 0.0
+v 1.0 2.0 0.6
+v 2.0 2.0 0.6
+v 3.0 2.0 0.0
+v 0.0 3.0 0.0
+v 1.0 3.0 0.0
+v 2.0 3.0 0.0
+v 3.0 3.0 0.0
+v 0.0 4.0 0.0
+v 1.0 4.0 0.0
+v 2.0 4.0 0.0
+v 3.0 4.0 0.0
+cstype cardinal
+deg 3 3
+surf 0.0 2.0 0.0 1.0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20
+parm u 0.0 1.0 2.0
+parm v 0.0 1.0 2.0 3.0
+end
+";
+
+#[test]
+fn cardinal_multi_segment_surface_tessellates() {
+    // cols = parm_u.len() + 1 = 4 (3 parm-u values); rows = parm_v.len() + 1
+    // = 5 (4 parm-v values). The 4×5 grid (one u-segment, two v-segments)
+    // must tessellate.
+    let samples = 4u32;
+    let scene = ObjDecoder::new()
+        .with_curve_tessellation(samples)
+        .decode(CARDINAL_MULTISEG.as_bytes())
+        .unwrap();
+    assert_eq!(scene.meshes.len(), 1, "multi-segment Cardinal surface");
+    let prim = &scene.meshes[0].primitives[0];
+    let n = samples as usize + 1;
+    assert_eq!(prim.positions.len(), n * n);
+    assert_eq!(prim.indices.as_ref().unwrap().len(), 96);
+    // Cardinal (Catmull-Rom) is NOT convex-hull-bounded — its tangent
+    // construction can overshoot — so we don't impose a hull clamp.
+    // Instead, verify the interior bulge surfaces: the v = 1 segment
+    // boundary interpolates control row 2 (whose interior points sit at
+    // z = 0.6), so the sampled domain must rise above the flat boundary.
+    let max_z = prim.positions.iter().map(|p| p[2]).fold(f32::MIN, f32::max);
+    assert!(
+        max_z > 0.3,
+        "interior bulge should lift the surface above z = 0; max_z = {max_z}"
+    );
+    // The x/y footprint stays roughly inside the [0,3] × [0,4] control net
+    // (small Cardinal overshoot at the edges is allowed).
+    for p in &prim.positions {
+        assert!(p[0] >= -0.5 && p[0] <= 3.5, "x off the net: {p:?}");
+        assert!(p[1] >= -0.5 && p[1] <= 4.5, "y off the net: {p:?}");
+    }
 }

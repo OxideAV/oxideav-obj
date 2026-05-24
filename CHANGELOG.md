@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Cardinal (Catmull-Rom) `surf` surface tessellation under
+  `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
+  evaluates `surf` elements that sit under a `cstype cardinal` (or
+  `cstype rat cardinal`) header into a triangulated
+  `Topology::Triangles` primitive on the synthetic `"obj:surfaces"`
+  mesh, via the bivariate tensor-product Cardinal evaluation
+  `S(u, v) = Σ_i Σ_j C_i(u) · C_j(v) · d_{i,j}` (spec §"Cardinal"). Each
+  parametric direction reuses the spec's Cardinal→Bezier per-segment
+  conversion (`b0 = c1`, `b1 = c1 + (c2 − c0) / 6`,
+  `b2 = c2 − (c3 − c1) / 6`, `b3 = c2`, then a cubic Bernstein blend)
+  over a sliding 4-point window: the inner pass collapses every v-row at
+  the sample u, then a second 1-D Cardinal pass runs in v over the
+  collapsed points. Cardinal is cubic-only per spec ("Cardinal splines
+  are only defined for the cubic case"), so any `deg` other than `3 3`
+  leaves the surface captured-only. The control grid is read from the
+  `parm u` / `parm v` extents (`K = parm_count + 1` per direction, from
+  the spec relation `parm = K − n + 2` with `n = 3`); when `parm` only
+  carries the 2-value global parameter range (as the spec's
+  Cardinal-surface example does), the grid is taken to be the square
+  single patch (`cols = rows = √total`). Per spec §"Cardinal" — "For
+  surfaces, all but the first and last row and column of control points
+  are interpolated" — a single bicubic patch's parametric corners land
+  exactly on the interior 2×2 control block, which the tests verify, and
+  a cross-check confirms the tensor-product evaluator matches an
+  independent Cardinal→Bezier reference sample-for-sample. The
+  `rat cardinal` qualifier routes to the same evaluator (spec
+  §"Free-form curve/surface body statements" notes the unit-weight
+  default is reasonable for Cardinal because its basis functions sum to
+  1), so per-vertex `w` weights are not applied. Synthetic primitives
+  carry `obj:tessellated_surface = true`, `obj:surface_kind`
+  (`"cardinal"`), `obj:surface_degree`, `obj:surface_u_range`,
+  `obj:surface_v_range`, and `obj:surface_samples` provenance plus the
+  shared `obj:tessellated_curve = true` sentinel so the encoder filters
+  the synthetic geometry out and replays the original
+  `cstype` / `deg` / `surf` / `parm u` / `parm v` / `end` block verbatim
+  from `Scene3D::extras["obj:freeform_directives"]`. Non-cubic Cardinal,
+  Taylor, and basis-matrix `surf` bases remain captured-only.
 - B-spline / NURBS `surf` surface tessellation under
   `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
   evaluates `surf` elements that sit under a `cstype bspline` (or

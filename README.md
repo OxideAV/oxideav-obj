@@ -67,8 +67,8 @@ modern loaders actually load):
   of `[keyword, arg1, arg2, …]` arrays). The encoder replays both
   after the polygonal section so a decode → encode round-trip
   preserves the directive order and arguments. Verbatim by default;
-  opt-in tessellation of `curv` curves and Bezier / B-spline `surf`
-  surfaces is available via
+  opt-in tessellation of `curv` curves and Bezier / B-spline /
+  Cardinal `surf` surfaces is available via
   `ObjDecoder::with_curve_tessellation(samples)` (see the per-round
   notes below).
 
@@ -268,9 +268,32 @@ sample-for-sample. Synthetic primitives carry the same
 provenance and the encoder filters them out, replaying the original
 `cstype` / `deg` / `surf` / `parm u` / `parm v` / `end` block
 unchanged.
+Round 13: Cardinal (Catmull-Rom) `surf` surface tessellation — the
+same `with_curve_tessellation(samples)` knob now also evaluates `surf`
+elements under a `cstype cardinal` (or `cstype rat cardinal`) header
+into a `Topology::Triangles` grid on the synthetic `"obj:surfaces"`
+mesh, via the bivariate tensor-product Cardinal evaluation
+`S(u, v) = Σ_i Σ_j C_i(u) · C_j(v) · d_{i,j}` (spec §"Cardinal").
+Each parametric direction reuses the spec's Cardinal→Bezier per-
+segment conversion (`b0 = c1`, `b1 = c1 + (c2 − c0) / 6`,
+`b2 = c2 − (c3 − c1) / 6`, `b3 = c2`) on a sliding 4-point window: the
+u pass collapses every v-row, then a v pass runs over the collapsed
+points. Cardinal is cubic-only per spec, so non-`3 3` degrees stay
+captured-only; the control grid comes from the `parm u` / `parm v`
+extents (`K = parm_count + 1` per direction) or, when `parm` carries
+only the 2-value range, the square single patch (`√total`). A single
+bicubic patch's parametric corners interpolate the interior 2×2
+control block exactly (spec: "all but the first and last row and
+column of control points are interpolated"). The `rat cardinal` form
+routes to the same evaluator (unit-weight default). Synthetic
+primitives carry the same `obj:tessellated_surface` / `obj:surface_kind`
+(`"cardinal"`) / `obj:surface_degree` / `obj:surface_u_range` /
+`obj:surface_v_range` / `obj:surface_samples` provenance and the
+encoder filters them out, replaying the original
+`cstype` / `deg` / `surf` / `parm` / `end` block unchanged.
 
-The `.mod` binary form remains out of scope; non-Bezier/non-B-spline
-`surf` surfaces (Cardinal / Taylor / basis-matrix), multi-patch
+The `.mod` binary form remains out of scope; non-Bezier/non-B-spline/
+non-Cardinal `surf` surfaces (Taylor / basis-matrix), multi-patch
 Bezier surface decomposition, and trim/hole loop evaluation are the
 remaining gaps.
 

@@ -45,9 +45,12 @@ impl ObjDecoder {
     ///     *and* 2D `surf` surfaces via tensor-product de Casteljau).
     ///   * `cstype bspline` / `cstype rat bspline` — Cox-deBoor
     ///     recursive basis on the knot vector supplied by the most-
-    ///     recent `parm u …` directive (1D `curv` only).
-    ///   * `cstype cardinal` / `cstype taylor` / `cstype bmatrix` — 1D
-    ///     `curv` only.
+    ///     recent `parm u …` directive (1D `curv` *and* 2D `surf`
+    ///     surfaces via tensor-product Cox-deBoor).
+    ///   * `cstype cardinal` / `cstype rat cardinal` — cubic
+    ///     Catmull-Rom (1D `curv` *and* 2D `surf` surfaces via
+    ///     tensor-product Cardinal evaluation).
+    ///   * `cstype taylor` / `cstype bmatrix` — 1D `curv` only.
     ///
     /// `samples` is the number of *intervals*. A `curv` curve yields a
     /// `LineStrip` of `samples + 1` vertices; a Bezier `surf` surface
@@ -66,8 +69,9 @@ impl ObjDecoder {
     /// `parm` / `end` section.
     ///
     /// `samples == 0` (the default) disables tessellation, matching
-    /// the round 1-6 behaviour. Non-Bezier `surf` surfaces (B-spline /
-    /// Cardinal / Taylor / basis-matrix) remain captured-only.
+    /// the round 1-6 behaviour. Bezier / B-spline / Cardinal `surf`
+    /// surfaces are tessellated; Taylor / basis-matrix surfaces remain
+    /// captured-only.
     pub fn with_curve_tessellation(mut self, samples: u32) -> Self {
         self.curve_tessellation_samples = samples;
         self
