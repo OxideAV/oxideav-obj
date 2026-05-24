@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-obj/compare/v0.0.1...v0.0.2) - 2026-05-24
+
+### Other
+
+- Round 13: Cardinal (Catmull-Rom) surf surface tessellation
+- Round 12: B-spline / NURBS surf surface tessellation
+- round 11: Bezier surf surface tessellation (tensor-product de Casteljau)
+- round 10: basis-matrix curve tessellation (cstype bmatrix + bmat + step)
+- Round 9: Cardinal (Catmull-Rom) + Taylor curve tessellation
+- Round 8: B-spline / NURBS curve tessellation ([#3](https://github.com/OxideAV/oxideav-obj/pull/3))
+- Round 7: Bezier curve tessellation evaluator
+
 ### Added
 
 - Cardinal (Catmull-Rom) `surf` surface tessellation under
