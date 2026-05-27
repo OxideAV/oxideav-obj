@@ -291,6 +291,31 @@ primitives carry the same `obj:tessellated_surface` / `obj:surface_kind`
 `obj:surface_v_range` / `obj:surface_samples` provenance and the
 encoder filters them out, replaying the original
 `cstype` / `deg` / `surf` / `parm` / `end` block unchanged.
+Round 14 (depth): `cargo fuzz` harness — `fuzz/fuzz_targets/parse_obj.rs`
+and `fuzz/fuzz_targets/parse_mtl.rs` drive attacker-controlled bytes
+through every public decoder entry point and assert panic-freedom (no
+panic / abort / debug-overflow / out-of-bounds index for any input).
+The first 180-second `parse_obj` run found two real crashes that are
+now fixed and pinned by regression tests in `tests/fuzz_regressions.rs`:
+  * `parse_face_vertex` admitted an empty leading slot (so `f /1 /2`
+    and `p /13` and `l /1 /2` produced `fv.v == 0` which then panicked
+    on `(fv.v - 1) as usize` underflow downstream). Fix: require a
+    non-empty position component at parse time so the `fv.v >= 1`
+    invariant holds end-to-end.
+  * `tessellate_surfaces` allocated `Vec::with_capacity(cols * rows)`
+    for the Bezier control-grid pool without bounding the product
+    against the declared control-vertex count, so `deg 111111` blew
+    past available memory. Fix: `checked_add` / `checked_mul` on the
+    grid extents and an early "expected != entry control-count" bail
+    so the allocation never runs for mismatched grids. Same defence
+    applied to the `cstype bmatrix` `(n + 1) × (n + 1)` basis-size
+    check.
+Subsequent 180-second runs against `parse_obj` (corpus grew to ~8.8k
+discovered inputs) and `parse_mtl` (corpus grew to ~1.1k) finished
+without further crashes / OOM / timeouts. The fuzz subcrate's
+`Cargo.lock` is tracked for reproducible builds; transient
+`fuzz/target/`, `fuzz/corpus/`, and `fuzz/artifacts/` paths sit on
+`.gitignore`.
 
 The `.mod` binary form remains out of scope; non-Bezier/non-B-spline/
 non-Cardinal `surf` surfaces (Taylor / basis-matrix), multi-patch

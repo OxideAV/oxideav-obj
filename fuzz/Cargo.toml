@@ -1,0 +1,136 @@
+[package]
+name = "oxideav-obj-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The OBJ + MTL surface worth fuzzing is the line-oriented parser: a
+# UTF-8 text document with a large grammar (vertex / face / line /
+# point elements, the four `f` index syntaxes including the negative-
+# from-end shorthand, multi-name `g`, smoothing-group + display-attr
+# state-setters, n-gon fan triangulation, plus the entire free-form
+# block — `cstype` / `deg` / `curv` / `surf` / `parm` / `bmat` / `step`
+# / `trim` / `hole` / `scrv` / `sp` / `end`). The companion MTL grammar
+# adds Phong colours, PBR extensions, transmission-filter alternatives
+# (`Tf spectral|xyz|r g b`), typed reflection maps (`refl -type cube_*`),
+# and the seven `map_*` directive option flags (`-blendu`, `-clamp`,
+# `-bm`, `-boost`, `-mm`, `-imfchan`, `-type`, …). Every reachable
+# parse path that turns bytes into a `Scene3D` must return a `Result`
+# for any attacker input — never panic, never abort, never
+# debug-overflow, never index out of bounds.
+#
+# Classic OBJ / MTL danger spots this crate hammers:
+#
+# * **Negative-index arithmetic** — `f -3 -2 -1` resolves against the
+#   current vertex-pool length via `len - n`; an attacker can craft a
+#   negative index larger than the pool which must surface as `Err`
+#   rather than wrap to a giant positive index and panic on the
+#   subsequent slice. Same hazard on `l` and `p` and the free-form
+#   `surf` / `curv` references that also accept negative indices.
+# * **Per-face arity** — n-gon fan triangulation produces `n - 2`
+#   triangles; a `f` line with a billion indices would otherwise
+#   allocate a billion triangles. The parser caps each line length
+#   indirectly via the input length but the triangulation loop itself
+#   must hold up under degenerate (1- or 2-vertex) faces.
+# * **UTF-8 split on whitespace** — every line is tokenised on ASCII
+#   whitespace, but the OBJ grammar allows comments mid-line via `#`
+#   and the MTL `map_*` parser walks `-flag value` chunks. The walker
+#   must not panic on truncated `-flag` (no value) or on multi-byte
+#   UTF-8 characters embedded in option arguments.
+# * **Free-form directive sequence** — `cstype` / `parm` / `deg` /
+#   `bmat` / `step` are state-setters whose interaction with
+#   `curv` / `surf` is order-dependent. A `surf` with no preceding
+#   `cstype` (or a `parm u` with no matching `cstype bspline` header)
+#   must be captured-only (the directive rides on
+#   `Scene3D::extras["obj:freeform_directives"]` verbatim) without
+#   panicking on the optional-`cstype` lookup. The tessellator
+#   additionally walks `parm u` knot vectors whose length must satisfy
+#   the spec condition `len == K + degree + 2` — a malformed length
+#   must yield "captured-only", never an out-of-bounds index into the
+#   knot array.
+# * **`curv` / `surf` u-range parsing** — every `curv` line starts with
+#   `u_min u_max ctl_indices…`; the parser splits on whitespace and
+#   parses the first two tokens as f32. A missing or non-numeric token
+#   must surface as `Err` rather than `unwrap()` on the `parse::<f32>`
+#   result.
+# * **MTL `map_*` option-flag walker** — the parser strips `-blendu`,
+#   `-blendv`, `-cc`, `-clamp`, `-bm`, `-boost`, `-mm`, `-o`, `-s`,
+#   `-t`, `-texres`, `-imfchan`, `-type` (with 0/1/3-argument shapes)
+#   out of the filename. A truncated `-mm` (no values) or a `-type`
+#   with an unknown qualifier must not panic.
+# * **MTL transmission-filter alternatives** — `Tf spectral file [factor]`
+#   and `Tf xyz x [y [z]]` and `Tf r [g [b]]` share a keyword; the
+#   first token disambiguates. A `Tf` line with no tokens past the
+#   keyword must surface as `Err`, never panic.
+# * **`refl -type cube_*`** — six face-name variants
+#   (`cube_top|cube_bottom|cube_front|cube_back|cube_left|cube_right`)
+#   plus `sphere`; the parser switches on the qualifier. An unknown
+#   `-type` value must be tolerated (captured-only via extras).
+# * **Per-vertex colour extension** — `v x y z r g b` (6-token) and
+#   `v x y z w r g b` (7-token) widths share the prefix with `v x y z`
+#   and `v x y z w`; the dispatcher counts tokens and routes. A
+#   5-token `v` is spec-ambiguous (rejected); 8+ tokens must surface
+#   as `Err`.
+# * **MTL `d -halo factor`** — the `d` line has two forms:
+#   `d <factor>` and `d -halo <factor>`. The parser sniffs the
+#   `-halo` token; a `d -halo` with no following factor must
+#   surface as `Err`, not `unwrap()` on the empty iterator.
+#
+# No external library worth dlopen-ing as a cross-decode oracle: the
+# clean-room wall bars third-party OBJ-loader source code, and a
+# black-box differential against an opaque DCC tool's scripting host
+# would need a heavy CI bootstrap not worth the maintenance cost for a
+# panic-freedom contract. Decode-only panic-freedom is the contract
+# under test here.
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-obj]
+path = ".."
+
+[dependencies.oxideav-mesh3d]
+version = "0.0"
+# We exercise the trait-based `Mesh3DDecoder::decode` entry point so the
+# parent crate's `registry` feature is on by default (default-features=true
+# on the path-dep above takes care of the chain).
+
+[lib]
+name = "oxideav_obj_fuzz"
+path = "src/lib.rs"
+
+# Prevent this fuzz package from being pulled into the umbrella
+# workspace at `crates/*` glob-resolve time.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# ------------------------------------------------------------------
+# Fuzz targets.
+# ------------------------------------------------------------------
+
+# Panic-freedom over the OBJ + MTL text parser. Drives attacker-
+# controlled bytes through `ObjDecoder::decode` (the trait surface
+# downstream consumers actually hit) and ALSO calls the lower-level
+# `obj::parse_obj` directly along with the curve-tessellation variant
+# so the free-form evaluator gets exercised on attacker inputs.
+[[bin]]
+name = "parse_obj"
+path = "fuzz_targets/parse_obj.rs"
+test = false
+doc = false
+
+# Panic-freedom over the standalone MTL parser. The MTL grammar is
+# narrower than OBJ's but has its own hazards: `Tf` alternative-form
+# dispatch, `map_*` option-flag walker, `refl -type cube_*` set
+# bundling, `d -halo` dissolve, and the PBR `Pr|Pm|Pc|Ps` extension.
+[[bin]]
+name = "parse_mtl"
+path = "fuzz_targets/parse_mtl.rs"
+test = false
+doc = false

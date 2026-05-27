@@ -21,6 +21,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `cargo fuzz` harness — two libfuzzer-driven panic-freedom targets
+  (`fuzz/fuzz_targets/parse_obj.rs` and `fuzz/fuzz_targets/parse_mtl.rs`)
+  that drive attacker-controlled bytes through every public decoder
+  entry point and assert no call panics, aborts, debug-overflows, or
+  indexes out of bounds. `parse_obj` exercises `ObjDecoder::decode`
+  (the trait surface), `ObjDecoder::with_curve_tessellation(8).decode`
+  (the free-form evaluator path — Bezier / B-spline / Cardinal /
+  Taylor / basis-matrix curves and Bezier / B-spline / Cardinal
+  surfaces), the lower-level `obj::parse_obj` free function, the
+  explicit `obj::parse_obj_with_options` entry, and 4 truncated
+  prefixes per input. `parse_mtl` exercises `MtlDecoder::decode`,
+  `mtl::parse_mtl`, and `mtl::parse_mtl_with_scene`. The fuzz
+  subcrate's `Cargo.lock` is tracked under `fuzz/` for reproducible
+  builds; `fuzz/target` / `fuzz/corpus` / `fuzz/artifacts` are
+  `.gitignore`-d.
+- `tests/fuzz_regressions.rs` — three panic-freedom regression tests
+  pinning the crashes discovered by the first 180-second `parse_obj`
+  fuzz run (see "Fixed" below).
+
+### Fixed
+
+- `parse_face_vertex` rejected an empty leading slot in `f` / `l` / `p`
+  index tokens (e.g. `f /1/2 /3/4 /5/6` or `p /13`) at parse time
+  instead of letting them coalesce to `v == 0` and trip the downstream
+  `(fv.v - 1) as usize` underflow inside `build_scene`. The position
+  component is mandatory per spec ("v is the index of the geometric
+  vertex … required for every reference"); the parser now surfaces
+  the missing-position case as `Err(Error::invalid)` so the `fv.v >= 1`
+  invariant holds end-to-end. Found by libfuzzer on the new
+  `parse_obj` target.
+- `tessellate_surfaces` Bezier branch capped attacker-controlled
+  `(degu + 1, degv + 1)` grid extents with `checked_add` /
+  `checked_mul` and an early "expected == entry-control-count" gate
+  so a malformed `deg 111111` (or other huge value) bails before
+  `Vec::with_capacity(expected)` would request a multi-gibibyte
+  allocation. The same defence covers the `cstype bmatrix`
+  `(n + 1) × (n + 1)` basis-matrix size check in `flush_block` and
+  the corresponding helper `sample_bmatrix`. Found by libfuzzer +
+  AddressSanitizer's `allocation-size-too-big` detector on the new
+  `parse_obj` target.
+
+### Added
+
 - Cardinal (Catmull-Rom) `surf` surface tessellation under
   `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
   evaluates `surf` elements that sit under a `cstype cardinal` (or

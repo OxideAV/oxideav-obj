@@ -185,11 +185,22 @@ fn preprocess_lines(text: &str) -> Vec<String> {
 /// Each component is a non-zero integer (negative => relative-from-end).
 /// Resolution to 1-based positive indices happens here; 0-based
 /// primitive-local indexing happens in [`build_scene`].
+///
+/// The position component (the part before the first `/`) is mandatory
+/// per spec ("v is the index of the geometric vertex, … required for
+/// every reference"); an empty or missing `v` slot surfaces as
+/// `Err(Error::invalid)` rather than coalescing to `0` and tripping the
+/// downstream `(fv.v - 1) as usize` underflow.
 fn parse_face_vertex(tok: &str, n_pos: i64, n_tex: i64, n_norm: i64) -> Result<FaceVert> {
     let mut parts = tok.split('/');
     let v = parts
         .next()
         .ok_or_else(|| Error::invalid(format!("face vertex missing position: {tok:?}")))?;
+    if v.is_empty() {
+        return Err(Error::invalid(format!(
+            "face vertex missing position index: {tok:?}"
+        )));
+    }
     let vt = parts.next().unwrap_or("");
     let vn = parts.next().unwrap_or("");
 
@@ -1143,8 +1154,17 @@ fn flush_block(
                 let Some(step) = step_u else {
                     continue;
                 };
-                let n_plus_1 = degree as usize + 1;
-                if bmat_u.len() != n_plus_1 * n_plus_1 {
+                // `checked_add` / `checked_mul` here guard against
+                // attacker-supplied huge `deg` values whose squared
+                // basis-matrix size would overflow `usize`; fall through
+                // to captured-only on overflow.
+                let Some(n_plus_1) = (degree as usize).checked_add(1) else {
+                    continue;
+                };
+                let Some(expected_bmat) = n_plus_1.checked_mul(n_plus_1) else {
+                    continue;
+                };
+                if bmat_u.len() != expected_bmat {
                     continue;
                 }
                 if step == 0 {
@@ -1462,8 +1482,13 @@ fn flush_surface(
     //     sqrt(total)` — which recovers the canonical single 4×4 patch.
     let (cols, rows) = if bspline {
         // Need at least `deg + 2` knots per direction for ≥ 1 control
-        // point.
-        if parm_u.len() < du + 2 || parm_v.len() < dv + 2 {
+        // point. The `du + 2` / `dv + 2` arithmetic guards against
+        // attacker-supplied `deg` values that would overflow `usize` on
+        // the subsequent subtraction; an out-of-range degree leaves the
+        // surface captured-only.
+        let need_u = du.checked_add(2)?;
+        let need_v = dv.checked_add(2)?;
+        if parm_u.len() < need_u || parm_v.len() < need_v {
             return None;
         }
         (parm_u.len() - du - 1, parm_v.len() - dv - 1) // (K1 + 1, K2 + 1)
@@ -1491,9 +1516,24 @@ fn flush_surface(
         };
         (cols, rows)
     } else {
-        (du + 1, dv + 1)
+        // Bezier: `(degu + 1) × (degv + 1)` control points per single
+        // patch. `checked_add` guards against attacker-supplied huge
+        // degree values (e.g. `deg 111111`) whose `+1` would still fit
+        // in `usize` but whose product blows past available memory in
+        // the `Vec::with_capacity(expected)` below.
+        (du.checked_add(1)?, dv.checked_add(1)?)
     };
-    let expected = cols * rows;
+    // Cap the expected control-grid size: a single `surf` line carries
+    // `entry.len() - 5` control-vertex tokens, so any `expected` that
+    // doesn't match that count is captured-only anyway (per the
+    // `grid.len() != expected` check at the end of the read loop). Bail
+    // here before the `Vec::with_capacity(expected)` allocation to keep
+    // attacker `deg` / `parm` values from triggering an
+    // allocation-size-too-big abort.
+    let expected = cols.checked_mul(rows)?;
+    if expected != entry.len().saturating_sub(5) {
+        return None;
+    }
 
     let n_pos = doc.positions.len() as i64;
     let mut grid: Vec<[f32; 3]> = Vec::with_capacity(expected);
@@ -2434,11 +2474,17 @@ fn sample_bmatrix(
     step: u32,
     samples: u32,
 ) -> Vec<[f32; 3]> {
-    let n_plus_1 = degree as usize + 1;
-    if control_points.len() < n_plus_1
-        || bmat_u.len() != n_plus_1 * n_plus_1
-        || step == 0
-        || samples == 0
+    // `checked_add` / `checked_mul` are defensive — the public-facing
+    // `flush_block` caller already filters degrees whose `(n+1)²`
+    // overflows `usize`, but this helper is also reachable from future
+    // call sites and the cost of the saturation check is negligible.
+    let Some(n_plus_1) = (degree as usize).checked_add(1) else {
+        return Vec::new();
+    };
+    let Some(expected_bmat) = n_plus_1.checked_mul(n_plus_1) else {
+        return Vec::new();
+    };
+    if control_points.len() < n_plus_1 || bmat_u.len() != expected_bmat || step == 0 || samples == 0
     {
         return Vec::new();
     }
