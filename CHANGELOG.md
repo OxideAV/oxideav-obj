@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-obj/compare/v0.0.2...v0.0.3) - 2026-05-29
+
+### Other
+
+- Round 188: curv2 2D trimming-curve tessellation
+- Round 182: basis-matrix surf surface tessellation
+- Round 14: Taylor polynomial `surf` surface tessellation
+- Round 14 (depth): cargo-fuzz harness + two parse-time panic fixes
+
 ### Added
 
 - 2D trimming-curve (`curv2`) tessellation under
