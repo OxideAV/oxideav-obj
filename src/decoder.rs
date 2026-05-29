@@ -50,7 +50,11 @@ impl ObjDecoder {
     ///   * `cstype cardinal` / `cstype rat cardinal` — cubic
     ///     Catmull-Rom (1D `curv` *and* 2D `surf` surfaces via
     ///     tensor-product Cardinal evaluation).
-    ///   * `cstype taylor` / `cstype bmatrix` — 1D `curv` only.
+    ///   * `cstype taylor` / `cstype rat taylor` — direct
+    ///     polynomial evaluation (1D `curv` Horner-rule *and* 2D
+    ///     `surf` surfaces via tensor-product bivariate Horner-rule
+    ///     evaluation).
+    ///   * `cstype bmatrix` — 1D `curv` only.
     ///
     /// `samples` is the number of *intervals*. A `curv` curve yields a
     /// `LineStrip` of `samples + 1` vertices; a Bezier `surf` surface
@@ -69,8 +73,8 @@ impl ObjDecoder {
     /// `parm` / `end` section.
     ///
     /// `samples == 0` (the default) disables tessellation, matching
-    /// the round 1-6 behaviour. Bezier / B-spline / Cardinal `surf`
-    /// surfaces are tessellated; Taylor / basis-matrix surfaces remain
+    /// the round 1-6 behaviour. Bezier / B-spline / Cardinal / Taylor
+    /// `surf` surfaces are tessellated; basis-matrix surfaces remain
     /// captured-only.
     pub fn with_curve_tessellation(mut self, samples: u32) -> Self {
         self.curve_tessellation_samples = samples;

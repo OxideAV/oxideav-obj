@@ -1261,9 +1261,17 @@ fn flush_block(
 ///     direction over a sliding 4-point window; the control grid is the
 ///     `parm`-derived extent (`parm_count + 1` per direction) or a
 ///     square single patch when `parm` only carries the 2-value range.
+///   * `taylor` (round 14) — bivariate tensor-product polynomial
+///     evaluation `S(u, v) = Σ_i Σ_j c_{i,j} · u^i · v^j` per spec
+///     §"Taylor" (the control points are the polynomial coefficients).
+///     Single patch of `(degu + 1) × (degv + 1)` coefficient vectors.
+///     `rat taylor` routes to the same evaluator without weight
+///     blending — the spec note in §"Free-form curve/surface body
+///     statements" explicitly says the rational form "does not make
+///     sense for Taylor".
 ///
-/// Taylor / basis-matrix surfaces remain captured-only (the directive
-/// sequence still round-trips through
+/// Basis-matrix surfaces remain captured-only (the directive sequence
+/// still round-trips through
 /// `Scene3D::extras["obj:freeform_directives"]`).
 ///
 /// `surf` token layout (spec §"surf s0 s1 t0 t1 v1/vt1/vn1 …"):
@@ -1287,7 +1295,7 @@ fn flush_block(
 ///     existing filter skips this synthetic geometry).
 ///   * `obj:tessellated_surface` — `true` (surface-specific sentinel).
 ///   * `obj:surface_kind` — `"bezier"` / `"rat_bezier"` / `"bspline"` /
-///     `"rat_bspline"` / `"cardinal"`.
+///     `"rat_bspline"` / `"cardinal"` / `"taylor"`.
 ///   * `obj:surface_degree` — `[degu, degv]`.
 ///   * `obj:surface_u_range` / `obj:surface_v_range` — `[s0, s1]` /
 ///     `[t0, t1]` from the `surf` directive.
@@ -1369,7 +1377,16 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     // sum to 1, so we don't differentiate `rat cardinal`.
                     (Some("cardinal"), _) => Some("cardinal"),
                     (Some("rat"), Some("cardinal")) => Some("cardinal"),
-                    // Taylor / basis-matrix surfaces stay captured-only.
+                    // Spec §"Taylor": arbitrary-degree polynomial surface
+                    // S(u,v) = Σ_i Σ_j c_{i,j} · u^i · v^j (round 14).
+                    // The spec note in §"Free-form curve/surface body
+                    // statements" says the unit-weight default "does
+                    // not make sense for Taylor"; we accept `rat
+                    // taylor` for syntactic compatibility but evaluate
+                    // it the same way (no per-vertex weights).
+                    (Some("taylor"), _) => Some("taylor"),
+                    (Some("rat"), Some("taylor")) => Some("taylor"),
+                    // Basis-matrix surfaces stay captured-only.
                     _ => None,
                 };
             }
@@ -1430,10 +1447,11 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
     out
 }
 
-/// Evaluate one `surf` element against an active Bezier or B-spline
-/// `cstype` and return the triangulated primitive, or `None` when the
-/// directive is incomplete / malformed (lenient-loader pattern — the
-/// directive still round-trips through `obj:freeform_directives`).
+/// Evaluate one `surf` element against an active Bezier / B-spline /
+/// Cardinal / Taylor `cstype` and return the triangulated primitive,
+/// or `None` when the directive is incomplete / malformed (lenient-
+/// loader pattern — the directive still round-trips through
+/// `obj:freeform_directives`).
 #[allow(clippy::too_many_arguments)]
 fn flush_surface(
     doc: &ObjDoc,
@@ -1461,6 +1479,7 @@ fn flush_surface(
 
     let bspline = matches!(kind, "bspline" | "rat_bspline");
     let cardinal = kind == "cardinal";
+    let taylor = kind == "taylor";
     // Determine the expected single-patch control grid.
     //   * Bezier: a single patch is exactly (degu + 1) × (degv + 1)
     //     control points (spec §"Bezier"). Larger grids are multi-patch
@@ -1480,6 +1499,12 @@ fn flush_surface(
     //     Cardinal-surface example does), there is no per-direction split
     //     to read, so the grid is taken to be square — `cols = rows =
     //     sqrt(total)` — which recovers the canonical single 4×4 patch.
+    //   * Taylor: the control points are the polynomial coefficients
+    //     `c_{i,j}` for `S(u,v) = Σ_i Σ_j c_{i,j} · u^i · v^j` (spec
+    //     §"Taylor"). A single Taylor "patch" of declared degree
+    //     `deg degu degv` therefore needs exactly
+    //     `(degu + 1) × (degv + 1)` coefficient vectors, matching the
+    //     Bezier control-grid extents.
     let (cols, rows) = if bspline {
         // Need at least `deg + 2` knots per direction for ≥ 1 control
         // point. The `du + 2` / `dv + 2` arithmetic guards against
@@ -1516,11 +1541,12 @@ fn flush_surface(
         };
         (cols, rows)
     } else {
-        // Bezier: `(degu + 1) × (degv + 1)` control points per single
-        // patch. `checked_add` guards against attacker-supplied huge
-        // degree values (e.g. `deg 111111`) whose `+1` would still fit
-        // in `usize` but whose product blows past available memory in
-        // the `Vec::with_capacity(expected)` below.
+        // Bezier / Taylor: `(degu + 1) × (degv + 1)` control points
+        // per single patch. `checked_add` guards against attacker-
+        // supplied huge degree values (e.g. `deg 111111`) whose `+1`
+        // would still fit in `usize` but whose product blows past
+        // available memory in the `Vec::with_capacity(expected)`
+        // below.
         (du.checked_add(1)?, dv.checked_add(1)?)
     };
     // Cap the expected control-grid size: a single `surf` line carries
@@ -1565,6 +1591,8 @@ fn flush_surface(
         )
     } else if cardinal {
         sample_cardinal_surface(&grid, cols, rows, samples)
+    } else if taylor {
+        sample_taylor_surface(&grid, cols, rows, s0, s1, t0, t1, samples)
     } else {
         sample_bezier_surface(&grid, &weights, kind, cols, rows, samples)
     };
@@ -2359,6 +2387,106 @@ fn sample_cardinal_surface(
             // Outer pass: 1D Cardinal evaluation in v over the collapsed
             // points.
             out.push(cardinal_eval_1d(&col_pts, v));
+        }
+    }
+    out
+}
+
+/// Evaluate a Taylor polynomial surface patch at a
+/// `(samples + 1) × (samples + 1)` lattice via direct bivariate
+/// polynomial evaluation.
+///
+/// Spec §"Taylor": the control points are the polynomial coefficients
+/// `c_{i,j}` for the bivariate polynomial:
+///
+/// ```text
+///   S(u, v) = Σ_{i=0..degu} Σ_{j=0..degv} c_{i,j} · u^i · v^j
+/// ```
+///
+/// Applied component-wise per axis. Each of the three output channels
+/// (x, y, z) is an independent polynomial in u and v whose coefficients
+/// are taken from the corresponding component of the control points.
+/// The control grid is row-major with the u index varying fastest (spec
+/// §"Surface vertex data — control points"), so the coefficient
+/// `c_{i,j}` lives at `grid[j * cols + i]` where `cols = degu + 1` and
+/// `rows = degv + 1`.
+///
+/// The `surf s0 s1 t0 t1` range supplies the global parameter clip
+/// (spec §"surf": "the [s0, s1] range gives the start/end values for
+/// the curve in the u direction" — analogous for `[t0, t1]` in v).
+/// Taylor curves and surfaces evaluate against the raw parameter values
+/// directly (not a normalised `[0, 1]` re-parameterisation), so we
+/// sample at `u_i = s0 + i / samples · (s1 - s0)` and similarly for v.
+///
+/// Implementation: we collapse the inner u sum first by Horner-rule
+/// evaluation across each v-row, leaving one point per row, then a
+/// second Horner-rule pass in v over the collapsed points. The inner-
+/// loop scratch buffer is heap-allocated once per `(su, sv)` sample at
+/// modest cost; the total surface sample count is `(samples + 1)²`.
+///
+/// Rationality: the spec note in §"Free-form curve/surface body
+/// statements" explicitly says the rational form "does not make sense
+/// for Taylor", so `rat taylor` routes here without weight blending.
+///
+/// Output vertices are ordered row-major in the sample lattice: sample
+/// `(su, sv)` lands at index `sv * (samples + 1) + su`.
+#[allow(clippy::too_many_arguments)]
+fn sample_taylor_surface(
+    grid: &[[f32; 3]],
+    cols: usize,
+    rows: usize,
+    s0: f32,
+    s1: f32,
+    t0: f32,
+    t1: f32,
+    samples: u32,
+) -> Vec<[f32; 3]> {
+    if samples == 0 || cols == 0 || rows == 0 || grid.len() != cols * rows {
+        return Vec::new();
+    }
+    let n = samples as usize + 1;
+    let mut out: Vec<[f32; 3]> = Vec::with_capacity(n * n);
+    // Scratch for the inner Horner-rule pass: one collapsed point per
+    // v-row at the current u sample.
+    let mut col_pts: Vec<[f32; 3]> = Vec::with_capacity(rows);
+    for sv in 0..n {
+        let v = if n == 1 {
+            0.0
+        } else {
+            t0 + (sv as f32 / (n - 1) as f32) * (t1 - t0)
+        };
+        for su in 0..n {
+            let u = if n == 1 {
+                0.0
+            } else {
+                s0 + (su as f32 / (n - 1) as f32) * (s1 - s0)
+            };
+            // Inner pass: Horner's rule in u across each v-row,
+            // collapsing each row to a single point at the sample u.
+            //
+            //   row(u) = (((c_{degu,j} · u + c_{degu-1,j}) · u + …) · u
+            //            + c_{0,j})
+            col_pts.clear();
+            for r in 0..rows {
+                let row_start = r * cols;
+                let mut acc = grid[row_start + cols - 1];
+                for i in (0..cols - 1).rev() {
+                    let cij = grid[row_start + i];
+                    acc[0] = acc[0] * u + cij[0];
+                    acc[1] = acc[1] * u + cij[1];
+                    acc[2] = acc[2] * u + cij[2];
+                }
+                col_pts.push(acc);
+            }
+            // Outer pass: Horner's rule in v over the collapsed points.
+            let mut acc = col_pts[rows - 1];
+            for j in (0..rows - 1).rev() {
+                let cj = col_pts[j];
+                acc[0] = acc[0] * v + cj[0];
+                acc[1] = acc[1] * v + cj[1];
+                acc[2] = acc[2] * v + cj[2];
+            }
+            out.push(acc);
         }
     }
     out

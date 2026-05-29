@@ -291,6 +291,27 @@ primitives carry the same `obj:tessellated_surface` / `obj:surface_kind`
 `obj:surface_v_range` / `obj:surface_samples` provenance and the
 encoder filters them out, replaying the original
 `cstype` / `deg` / `surf` / `parm` / `end` block unchanged.
+Round 14: Taylor polynomial `surf` surface tessellation — the same
+`with_curve_tessellation(samples)` knob now also evaluates `surf`
+elements under a `cstype taylor` (or `cstype rat taylor`) header into
+a `Topology::Triangles` grid on the synthetic `"obj:surfaces"` mesh,
+via the bivariate tensor-product Horner-rule polynomial evaluation
+`S(u, v) = Σ_i Σ_j c_{i,j} · u^i · v^j` (spec §"Taylor"). Control
+points are the polynomial coefficients laid out row-major u-fastest
+(spec §"Surface vertex data — control points"); a single Taylor
+patch of declared degree `deg degu degv` needs exactly
+`(degu + 1) × (degv + 1)` coefficient vectors. The `surf s0 s1 t0 t1`
+range supplies the global parameter clip; Taylor surfaces evaluate
+against the raw parameter values directly (not a normalised `[0, 1]`
+re-parameterisation). The spec note in §"Free-form curve/surface
+body statements" says the rational form "does not make sense for
+Taylor", so `rat taylor` routes to the same evaluator without per-
+vertex weight blending. Synthetic primitives carry the same
+`obj:tessellated_surface` / `obj:surface_kind` (`"taylor"`) /
+`obj:surface_degree` / `obj:surface_u_range` / `obj:surface_v_range`
+/ `obj:surface_samples` provenance and the encoder filters them out,
+replaying the original `cstype` / `deg` / `surf` / `parm` / `end`
+block unchanged.
 Round 14 (depth): `cargo fuzz` harness — `fuzz/fuzz_targets/parse_obj.rs`
 and `fuzz/fuzz_targets/parse_mtl.rs` drive attacker-controlled bytes
 through every public decoder entry point and assert panic-freedom (no
@@ -317,10 +338,9 @@ without further crashes / OOM / timeouts. The fuzz subcrate's
 `fuzz/target/`, `fuzz/corpus/`, and `fuzz/artifacts/` paths sit on
 `.gitignore`.
 
-The `.mod` binary form remains out of scope; non-Bezier/non-B-spline/
-non-Cardinal `surf` surfaces (Taylor / basis-matrix), multi-patch
-Bezier surface decomposition, and trim/hole loop evaluation are the
-remaining gaps.
+The `.mod` binary form remains out of scope; basis-matrix `surf`
+surfaces, multi-patch Bezier surface decomposition, and trim/hole
+loop evaluation are the remaining gaps.
 
 ## License
 

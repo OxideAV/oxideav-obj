@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Taylor polynomial `surf` surface tessellation under
+  `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
+  evaluates `surf` elements that sit under a `cstype taylor` (or
+  `cstype rat taylor`) header into a triangulated `Topology::Triangles`
+  primitive on the synthetic `"obj:surfaces"` mesh, via the bivariate
+  tensor-product Horner-rule evaluation
+  `S(u, v) = Σ_i Σ_j c_{i,j} · u^i · v^j` (spec §"Taylor"). Control
+  points are the polynomial coefficients in spec §"Surface vertex data
+  — control points" row-major u-fastest order; a single Taylor patch
+  of declared degree `deg degu degv` needs exactly
+  `(degu + 1) × (degv + 1)` coefficient vectors. The `surf s0 s1 t0 t1`
+  range supplies the global parameter clip; Taylor surfaces evaluate
+  against the raw `[s0, s1]` × `[t0, t1]` window directly (not a
+  normalised `[0, 1]` re-parameterisation). The implementation
+  collapses the inner u sum via Horner's rule across each v-row, then
+  a second Horner-rule pass in v over the collapsed points; total
+  surface sample count is `(samples + 1)²`. The spec note in
+  §"Free-form curve/surface body statements" says the rational form
+  "does not make sense for Taylor", so `rat taylor` routes to the same
+  evaluator without per-vertex weight blending. Synthetic primitives
+  carry `obj:tessellated_surface = true`, `obj:surface_kind`
+  (`"taylor"`), `obj:surface_degree`, `obj:surface_u_range`,
+  `obj:surface_v_range`, and `obj:surface_samples` provenance plus the
+  shared `obj:tessellated_curve = true` sentinel so the encoder filters
+  the synthetic geometry out and replays the original
+  `cstype` / `deg` / `surf` / `parm` / `end` block verbatim from
+  `Scene3D::extras["obj:freeform_directives"]`. Basis-matrix `surf`
+  surfaces remain captured-only.
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-obj/compare/v0.0.1...v0.0.2) - 2026-05-24
 
 ### Other
