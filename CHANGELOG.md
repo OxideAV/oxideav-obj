@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Basis-matrix `surf` surface tessellation under
+  `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
+  evaluates `surf` elements that sit under a `cstype bmatrix` (or
+  `cstype rat bmatrix`) header into a triangulated `Topology::Triangles`
+  primitive on the synthetic `"obj:surfaces"` mesh, via the bivariate
+  tensor-product polynomial
+  `S(u, v) = Σ_a Σ_b (Σ_p B_u[a][p] · u^p) (Σ_q B_v[b][q] · v^q) ·
+  c_{base_u + a, base_v + b}` (spec §"Basis matrix",
+  §"bmat u/v matrix", §"step stepu stepv"). Per-direction basis
+  matrices come from `bmat u` / `bmat v` (row-major, column index
+  varying fastest); per-direction segment strides come from
+  `step stepu stepv`. The per-direction control-grid extent is the
+  inverse of the spec relation `parm = (K − n) / s + 2`, i.e.
+  `K = (parm − 2) · s + n + 1`, applied independently in u and v per
+  spec §"step stepu stepv" ("For surfaces, the above description
+  applies independently to each parametric direction."). Multi-patch
+  grids are now decomposed into `(K_u − n − 1) / stepu + 1` × `(K_v −
+  m − 1) / stepv + 1` polynomial segments; the global parameter `(u,
+  v)` partitions into per-segment `(seg_u, seg_v, t_u, t_v)` with the
+  patch-local control window starting at `(seg_u · stepu, seg_v ·
+  stepv)`. The cubic Bezier basis-matrix surface from the spec
+  §"Examples" reproduces the equivalent `cstype bezier` patch sample-
+  for-sample on its single-patch form. The `rat bmatrix` qualifier
+  routes to the same evaluator without per-vertex weight blending
+  (matches the round-10 1D curve behaviour — the user's basis is the
+  authoritative source). Malformed blocks (missing `bmat u` / `bmat v`,
+  missing `step`, wrong-size matrices, mismatched control-vertex
+  count) are silently dropped — the directive sequence still rides on
+  `Scene3D::extras["obj:freeform_directives"]` for round-trip.
+  Synthetic primitives carry `obj:tessellated_surface = true`,
+  `obj:surface_kind` (`"bmatrix"`), `obj:surface_degree`,
+  `obj:surface_u_range`, `obj:surface_v_range`, and
+  `obj:surface_samples` provenance plus the shared
+  `obj:tessellated_curve = true` sentinel so the encoder filters the
+  synthetic geometry out and replays the original
+  `cstype` / `deg` / `bmat u` / `bmat v` / `step` / `parm u` /
+  `parm v` / `surf` / `end` block verbatim. Trim/hole loop
+  evaluation remains out of scope.
 - Taylor polynomial `surf` surface tessellation under
   `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
   evaluates `surf` elements that sit under a `cstype taylor` (or

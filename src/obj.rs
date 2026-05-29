@@ -1269,10 +1269,17 @@ fn flush_block(
 ///     blending — the spec note in §"Free-form curve/surface body
 ///     statements" explicitly says the rational form "does not make
 ///     sense for Taylor".
-///
-/// Basis-matrix surfaces remain captured-only (the directive sequence
-/// still round-trips through
-/// `Scene3D::extras["obj:freeform_directives"]`).
+///   * `bmatrix` / `rat bmatrix` (round 182) — bivariate tensor-product
+///     basis-matrix evaluation `S(u, v) = Σ_a Σ_b (Σ_p B_u[a][p] u^p)
+///     (Σ_q B_v[b][q] v^q) · c_{base_u + a, base_v + b}` per spec
+///     §"Basis matrix". The per-direction control-grid extent is
+///     `(parm − 2) · s + n + 1` (inverse of spec §"Basis matrix"
+///     `parm = (K − n) / s + 2`); patch decomposition uses the
+///     per-direction `step stepu stepv` strides. Multi-patch grids
+///     are now supported (e.g. the spec §"Examples" cubic Bezier
+///     basis-matrix surface). The `rat bmatrix` form routes to the
+///     same evaluator without per-vertex weight blending, matching
+///     the round-10 1D curve path.
 ///
 /// `surf` token layout (spec §"surf s0 s1 t0 t1 v1/vt1/vn1 …"):
 /// `surf s0 s1 t0 t1` followed by `v/vt/vn` control-vertex references.
@@ -1295,7 +1302,7 @@ fn flush_block(
 ///     existing filter skips this synthetic geometry).
 ///   * `obj:tessellated_surface` — `true` (surface-specific sentinel).
 ///   * `obj:surface_kind` — `"bezier"` / `"rat_bezier"` / `"bspline"` /
-///     `"rat_bspline"` / `"cardinal"` / `"taylor"`.
+///     `"rat_bspline"` / `"cardinal"` / `"taylor"` / `"bmatrix"`.
 ///   * `obj:surface_degree` — `[degu, degv]`.
 ///   * `obj:surface_u_range` / `obj:surface_v_range` — `[s0, s1]` /
 ///     `[t0, t1]` from the `surf` directive.
@@ -1318,6 +1325,18 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
     // vectors (unused by the Bezier basis but parsed regardless).
     let mut parm_u: Vec<f32> = Vec::new();
     let mut parm_v: Vec<f32> = Vec::new();
+    // Spec §"bmat u/v matrix": for `cstype bmatrix` surfaces the per-
+    // direction basis matrices supply the polynomial coefficients of
+    // each `(n + 1)`-row in row-major form with column index `j`
+    // varying fastest (round 10 reuses the same layout for curves).
+    let mut bmat_u: Vec<f32> = Vec::new();
+    let mut bmat_v: Vec<f32> = Vec::new();
+    // Spec §"step stepu stepv": the per-direction segment stride
+    // controls patch decomposition for both bmatrix curves and bmatrix
+    // surfaces. `stepu` is mandatory for both; `stepv` is required
+    // only for surfaces.
+    let mut step_u: Option<u32> = None;
+    let mut step_v: Option<u32> = None;
     let mut pending_surfs: Vec<&Vec<String>> = Vec::new();
 
     #[allow(clippy::too_many_arguments)]
@@ -1327,14 +1346,19 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                  deg_v: Option<u32>,
                  parm_u: &[f32],
                  parm_v: &[f32],
+                 bmat_u: &[f32],
+                 bmat_v: &[f32],
+                 step_u: Option<u32>,
+                 step_v: Option<u32>,
                  surfs: &[&Vec<String>]| {
         let Some(kind) = kind else {
             return;
         };
         for entry in surfs {
-            if let Some(prim) =
-                flush_surface(doc, kind, deg_u, deg_v, parm_u, parm_v, entry, samples)
-            {
+            if let Some(prim) = flush_surface(
+                doc, kind, deg_u, deg_v, parm_u, parm_v, bmat_u, bmat_v, step_u, step_v, entry,
+                samples,
+            ) {
                 out.push(prim);
             }
         }
@@ -1353,6 +1377,10 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     deg_v,
                     &parm_u,
                     &parm_v,
+                    &bmat_u,
+                    &bmat_v,
+                    step_u,
+                    step_v,
                     &pending_surfs,
                 );
                 pending_surfs.clear();
@@ -1360,6 +1388,10 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                 deg_v = None;
                 parm_u.clear();
                 parm_v.clear();
+                bmat_u.clear();
+                bmat_v.clear();
+                step_u = None;
+                step_v = None;
                 // Spec §"Curve and surface type": `cstype [rat] type`.
                 let mut iter = entry.iter().skip(1);
                 let first = iter.next().map(String::as_str);
@@ -1386,7 +1418,16 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     // it the same way (no per-vertex weights).
                     (Some("taylor"), _) => Some("taylor"),
                     (Some("rat"), Some("taylor")) => Some("taylor"),
-                    // Basis-matrix surfaces stay captured-only.
+                    // Spec §"Basis matrix" (round 182 surfaces): the
+                    // user supplies `bmat u` + `bmat v` plus
+                    // `step stepu stepv` body statements; per spec
+                    // §"Free-form curve/surface body statements" the
+                    // `rat` form just signals per-vertex weight
+                    // blending, which we currently don't apply to the
+                    // bmatrix path (matches the round-10 curve
+                    // behaviour), so both forms map to the same kind.
+                    (Some("bmatrix"), _) => Some("bmatrix"),
+                    (Some("rat"), Some("bmatrix")) => Some("bmatrix"),
                     _ => None,
                 };
             }
@@ -1413,6 +1454,30 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     .filter_map(|t| t.parse::<f32>().ok())
                     .collect();
             }
+            // Spec §"bmat u/v matrix": `bmat u m_00 m_01 … m_nn` (and
+            // `bmat v` for surfaces) supplies the row-major
+            // `(n + 1) × (n + 1)` basis matrix with the column index
+            // varying fastest. Captured for the basis-matrix surface
+            // path; ignored by the other `cstype` branches.
+            "bmat" if entry.get(1).map(String::as_str) == Some("u") => {
+                bmat_u = entry[2..]
+                    .iter()
+                    .filter_map(|t| t.parse::<f32>().ok())
+                    .collect();
+            }
+            "bmat" if entry.get(1).map(String::as_str) == Some("v") => {
+                bmat_v = entry[2..]
+                    .iter()
+                    .filter_map(|t| t.parse::<f32>().ok())
+                    .collect();
+            }
+            // Spec §"step stepu stepv": `step stepu [stepv]`. `stepu`
+            // is mandatory; `stepv` is required only for surfaces and
+            // controls the v-direction patch decomposition.
+            "step" => {
+                step_u = entry.get(1).and_then(|t| t.parse::<u32>().ok());
+                step_v = entry.get(2).and_then(|t| t.parse::<u32>().ok());
+            }
             "surf" => pending_surfs.push(entry),
             "end" => {
                 flush(
@@ -1422,6 +1487,10 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     deg_v,
                     &parm_u,
                     &parm_v,
+                    &bmat_u,
+                    &bmat_v,
+                    step_u,
+                    step_v,
                     &pending_surfs,
                 );
                 pending_surfs.clear();
@@ -1430,6 +1499,10 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                 deg_v = None;
                 parm_u.clear();
                 parm_v.clear();
+                bmat_u.clear();
+                bmat_v.clear();
+                step_u = None;
+                step_v = None;
             }
             _ => {}
         }
@@ -1442,6 +1515,10 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
         deg_v,
         &parm_u,
         &parm_v,
+        &bmat_u,
+        &bmat_v,
+        step_u,
+        step_v,
         &pending_surfs,
     );
     out
@@ -1460,6 +1537,10 @@ fn flush_surface(
     deg_v: Option<u32>,
     parm_u: &[f32],
     parm_v: &[f32],
+    bmat_u: &[f32],
+    bmat_v: &[f32],
+    step_u: Option<u32>,
+    step_v: Option<u32>,
     entry: &[String],
     samples: u32,
 ) -> Option<Primitive> {
@@ -1480,6 +1561,7 @@ fn flush_surface(
     let bspline = matches!(kind, "bspline" | "rat_bspline");
     let cardinal = kind == "cardinal";
     let taylor = kind == "taylor";
+    let bmatrix = kind == "bmatrix";
     // Determine the expected single-patch control grid.
     //   * Bezier: a single patch is exactly (degu + 1) × (degv + 1)
     //     control points (spec §"Bezier"). Larger grids are multi-patch
@@ -1517,6 +1599,26 @@ fn flush_surface(
             return None;
         }
         (parm_u.len() - du - 1, parm_v.len() - dv - 1) // (K1 + 1, K2 + 1)
+    } else if bmatrix {
+        // Spec §"Basis matrix" / §"step stepu stepv": the per-direction
+        // control-vertex count is K = (parm_count − 2) · s + n + 1 (the
+        // inverse of the spec's `parm = (K − n) / s + 2`). Both `parm u`
+        // / `parm v` and `step stepu stepv` are required for a surface;
+        // missing either leaves the surface captured-only.
+        let su = step_u? as usize;
+        let sv = step_v? as usize;
+        if su == 0 || sv == 0 || parm_u.len() < 2 || parm_v.len() < 2 {
+            return None;
+        }
+        let cols = (parm_u.len() - 2)
+            .checked_mul(su)?
+            .checked_add(du)?
+            .checked_add(1)?;
+        let rows = (parm_v.len() - 2)
+            .checked_mul(sv)?
+            .checked_add(dv)?
+            .checked_add(1)?;
+        (cols, rows)
     } else if cardinal {
         // Cardinal must be cubic per spec; reject any other degree (the
         // directive still round-trips verbatim through extras).
@@ -1593,6 +1695,22 @@ fn flush_surface(
         sample_cardinal_surface(&grid, cols, rows, samples)
     } else if taylor {
         sample_taylor_surface(&grid, cols, rows, s0, s1, t0, t1, samples)
+    } else if bmatrix {
+        // Spec §"Basis matrix": validate the basis-matrix sizes
+        // (n + 1)² before evaluating. `flush_surface` already enforced
+        // the per-direction control-vertex count via the `parm` / `step`
+        // inverse formula, so a bmat-size mismatch here is the only
+        // remaining captured-only condition.
+        let need_u = du.checked_add(1)?.checked_mul(du.checked_add(1)?)?;
+        let need_v = dv.checked_add(1)?.checked_mul(dv.checked_add(1)?)?;
+        if bmat_u.len() != need_u || bmat_v.len() != need_v {
+            return None;
+        }
+        let su = step_u?;
+        let sv = step_v?;
+        sample_bmatrix_surface(
+            &grid, bmat_u, bmat_v, du as u32, dv as u32, su, sv, cols, rows, samples,
+        )
     } else {
         sample_bezier_surface(&grid, &weights, kind, cols, rows, samples)
     };
@@ -1743,6 +1861,180 @@ fn sample_bezier_surface(
             } else {
                 out.push([x, y, z]);
             }
+        }
+    }
+    out
+}
+
+/// Evaluate a basis-matrix surface patch (spec §"Basis matrix",
+/// §"step stepu stepv") at a `(samples + 1) × (samples + 1)` lattice
+/// via the bivariate tensor-product polynomial
+///
+///   S(u, v) = Σ_a Σ_b ( Σ_p B_u[a][p] · u^p )
+///                     ( Σ_q B_v[b][q] · v^q )
+///                     · c_{base_u + a, base_v + b}
+///
+/// where `B_u` / `B_v` are the per-direction basis matrices supplied by
+/// `bmat u` / `bmat v` (row-major, column index `j` varying fastest per
+/// spec §"bmat u/v matrix"), `deg_u` / `deg_v` are the per-direction
+/// polynomial degrees from `deg degu degv`, and `step_u` / `step_v` are
+/// the per-direction segment strides from `step stepu stepv`.
+///
+/// `grid` is the control mesh in row-major u-fastest order (spec
+/// §"Surface vertex data — control points": "i = 0 to K1 for j = 0,
+/// …"): `cols` control points per v-row, `rows` v-rows. Spec
+/// §"Basis matrix" gives the per-direction control count as
+/// `K = (parm − 2) · s + n + 1` (inverse of `parm = (K − n) / s + 2`);
+/// the caller in [`flush_surface`] enforces that `cols` and `rows`
+/// match this size before this routine runs.
+///
+/// Patch decomposition: each `(seg_u, seg_v)` pair traces a tensor-
+/// product polynomial segment whose control window starts at
+/// `(base_u, base_v) = (seg_u · step_u, seg_v · step_v)`. The total
+/// per-direction segment count is `(K − n − 1) / s + 1`, derived in the
+/// same way as the round-10 1D curve path (`sample_bmatrix`).
+///
+/// Output vertices are ordered row-major in the sample lattice:
+/// sample `(su, sv)` lands at index `sv · (samples + 1) + su`.
+///
+/// Spec §"Free-form curve/surface body statements" notes the rational
+/// `rat bmatrix` form would blend per-vertex `w` weights; we match the
+/// round-10 curve path and do not apply them here (the `rat bmatrix`
+/// kind routes to this same evaluator without weights), which keeps
+/// the basis-matrix path consistent with the user-authored polynomial
+/// definition.
+#[allow(clippy::too_many_arguments)]
+fn sample_bmatrix_surface(
+    grid: &[[f32; 3]],
+    bmat_u: &[f32],
+    bmat_v: &[f32],
+    deg_u: u32,
+    deg_v: u32,
+    step_u: u32,
+    step_v: u32,
+    cols: usize,
+    rows: usize,
+    samples: u32,
+) -> Vec<[f32; 3]> {
+    let n_plus_1 = match (deg_u as usize).checked_add(1) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let m_plus_1 = match (deg_v as usize).checked_add(1) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let need_bmat_u = match n_plus_1.checked_mul(n_plus_1) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let need_bmat_v = match m_plus_1.checked_mul(m_plus_1) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    if samples == 0
+        || cols == 0
+        || rows == 0
+        || step_u == 0
+        || step_v == 0
+        || grid.len() != cols * rows
+        || bmat_u.len() != need_bmat_u
+        || bmat_v.len() != need_bmat_v
+        || cols < n_plus_1
+        || rows < m_plus_1
+    {
+        return Vec::new();
+    }
+    let su_stride = step_u as usize;
+    let sv_stride = step_v as usize;
+    // Per-direction segment count: largest `i` with `i · s + n + 1 ≤ K`.
+    // Matches the round-10 1D derivation, applied independently to u
+    // and v per spec §"step stepu stepv" ("For surfaces, the above
+    // description applies independently to each parametric direction.").
+    let n_seg_u = (cols - n_plus_1) / su_stride + 1;
+    let n_seg_v = (rows - m_plus_1) / sv_stride + 1;
+    let n = samples as usize + 1;
+    let mut out: Vec<[f32; 3]> = Vec::with_capacity(n * n);
+
+    for sv_i in 0..n {
+        // Global v ∈ [0, n_seg_v]: integer part = segment, fractional
+        // part = local `t ∈ [0, 1]` within that segment. The last sample
+        // is pinned to the upper endpoint of the final segment so the
+        // surface closes on the spec-defined boundary.
+        let gv = if sv_i == n - 1 {
+            n_seg_v as f32
+        } else {
+            sv_i as f32 * n_seg_v as f32 / (n - 1) as f32
+        };
+        let mut seg_v = gv.floor() as usize;
+        let mut tv = gv - seg_v as f32;
+        if seg_v >= n_seg_v {
+            seg_v = n_seg_v - 1;
+            tv = 1.0;
+        }
+        let base_v = seg_v * sv_stride;
+
+        // tv^0 .. tv^m once per row.
+        let mut tv_pow: Vec<f32> = Vec::with_capacity(m_plus_1);
+        let mut pv = 1.0_f32;
+        for _ in 0..m_plus_1 {
+            tv_pow.push(pv);
+            pv *= tv;
+        }
+        // Row b's v-basis coefficient: Σ_q B_v[b][q] · tv^q.
+        let mut v_coef: Vec<f32> = Vec::with_capacity(m_plus_1);
+        for b in 0..m_plus_1 {
+            let mut c = 0.0_f32;
+            for q in 0..m_plus_1 {
+                c += bmat_v[b * m_plus_1 + q] * tv_pow[q];
+            }
+            v_coef.push(c);
+        }
+
+        for su_i in 0..n {
+            let gu = if su_i == n - 1 {
+                n_seg_u as f32
+            } else {
+                su_i as f32 * n_seg_u as f32 / (n - 1) as f32
+            };
+            let mut seg_u = gu.floor() as usize;
+            let mut tu = gu - seg_u as f32;
+            if seg_u >= n_seg_u {
+                seg_u = n_seg_u - 1;
+                tu = 1.0;
+            }
+            let base_u = seg_u * su_stride;
+
+            // tu^0 .. tu^n once per (su, sv) sample.
+            let mut tu_pow: Vec<f32> = Vec::with_capacity(n_plus_1);
+            let mut pu = 1.0_f32;
+            for _ in 0..n_plus_1 {
+                tu_pow.push(pu);
+                pu *= tu;
+            }
+            // Column a's u-basis coefficient: Σ_p B_u[a][p] · tu^p.
+            let mut u_coef: Vec<f32> = Vec::with_capacity(n_plus_1);
+            for a in 0..n_plus_1 {
+                let mut c = 0.0_f32;
+                for p in 0..n_plus_1 {
+                    c += bmat_u[a * n_plus_1 + p] * tu_pow[p];
+                }
+                u_coef.push(c);
+            }
+
+            // S(u, v) = Σ_a Σ_b u_coef[a] · v_coef[b] · grid[base_v+b][base_u+a].
+            let mut accum = [0.0_f32; 3];
+            for (b, vc) in v_coef.iter().enumerate() {
+                let row = (base_v + b) * cols;
+                for (a, uc) in u_coef.iter().enumerate() {
+                    let cp = grid[row + base_u + a];
+                    let w = uc * vc;
+                    accum[0] += w * cp[0];
+                    accum[1] += w * cp[1];
+                    accum[2] += w * cp[2];
+                }
+            }
+            out.push(accum);
         }
     }
     out

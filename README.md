@@ -337,9 +337,34 @@ without further crashes / OOM / timeouts. The fuzz subcrate's
 `Cargo.lock` is tracked for reproducible builds; transient
 `fuzz/target/`, `fuzz/corpus/`, and `fuzz/artifacts/` paths sit on
 `.gitignore`.
+Round 182: basis-matrix `surf` surface tessellation — the same
+`with_curve_tessellation(samples)` knob now also evaluates `surf`
+elements under a `cstype bmatrix` (or `cstype rat bmatrix`) header
+into a `Topology::Triangles` grid on the synthetic `"obj:surfaces"`
+mesh, via the bivariate tensor-product polynomial
+`S(u, v) = Σ_a Σ_b (Σ_p B_u[a][p] · u^p) (Σ_q B_v[b][q] · v^q) ·
+c_{base_u + a, base_v + b}` (spec §"Basis matrix",
+§"bmat u/v matrix", §"step stepu stepv"). Per-direction basis
+matrices come from `bmat u` / `bmat v` (row-major, column index
+varying fastest); per-direction segment strides come from
+`step stepu stepv`. The per-direction control-grid extent inverts the
+spec relation `parm = (K − n) / s + 2` to `K = (parm − 2) · s + n + 1`,
+applied independently in u and v ("For surfaces, the above description
+applies independently to each parametric direction."). Multi-patch
+grids decompose into per-segment patch windows starting at
+`(seg_u · stepu, seg_v · stepv)`, so the spec §"Examples" cubic
+Bezier-as-bmatrix surface single-patch case matches the equivalent
+`cstype bezier` patch sample-for-sample. The `rat bmatrix` qualifier
+routes to the same evaluator without per-vertex weight blending
+(matches the round-10 1D curve behaviour). Synthetic primitives carry
+the same `obj:tessellated_surface` / `obj:surface_kind` (`"bmatrix"`) /
+`obj:surface_degree` / `obj:surface_u_range` / `obj:surface_v_range` /
+`obj:surface_samples` provenance and the encoder filters them out,
+replaying the original `cstype` / `deg` / `bmat u` / `bmat v` /
+`step` / `parm u` / `parm v` / `surf` / `end` block unchanged.
 
-The `.mod` binary form remains out of scope; basis-matrix `surf`
-surfaces, multi-patch Bezier surface decomposition, and trim/hole
+The `.mod` binary form remains out of scope; multi-patch Bezier
+surface decomposition (Bezier carries no `step` stride) and trim/hole
 loop evaluation are the remaining gaps.
 
 ## License

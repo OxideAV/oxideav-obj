@@ -375,23 +375,21 @@ fn tessellated_surface_is_not_emitted_as_v_lines_by_encoder() {
 }
 
 #[test]
-fn unsupported_surface_basis_is_left_captured_only() {
-    // A `cstype bmatrix` `surf` has no surface evaluator yet — the
-    // tessellator must not synthesise a mesh for it; the directive
-    // sequence still round-trips through `obj:freeform_directives`.
-    // (Bezier / B-spline / Cardinal / Taylor surfaces ARE now
-    // tessellated — see the dedicated test groups below and the
-    // `taylor_surface_tessellation` test file.)
+fn unrecognised_surface_basis_is_left_captured_only() {
+    // A `cstype` value the tessellator does not know about leaves the
+    // `surf` element captured-only — the directive sequence still
+    // round-trips through `obj:freeform_directives` but no synthetic
+    // mesh is produced. Bezier / B-spline / Cardinal / Taylor /
+    // bmatrix surfaces ARE tessellated — see the dedicated test
+    // groups below and the `taylor_surface_tessellation` /
+    // `bmatrix_surface_tessellation` test files.
     let text = "\
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
 v 0.0 1.0 0.0
 v 1.0 1.0 0.0
-cstype bmatrix
+cstype mystery_basis
 deg 1 1
-bmat u 1 0 -1 1
-bmat v 1 0 -1 1
-step 1 1
 surf 0.0 1.0 0.0 1.0 1 2 3 4
 parm u 0.0 1.0
 parm v 0.0 1.0
@@ -403,7 +401,7 @@ end
         .unwrap();
     assert!(
         scene.meshes.is_empty(),
-        "basis-matrix surfaces stay captured-only; no synthetic mesh expected"
+        "unrecognised `cstype` surfaces stay captured-only; no synthetic mesh expected"
     );
     // The directives are still preserved for round-trip.
     assert!(scene.extras.contains_key("obj:freeform_directives"));
