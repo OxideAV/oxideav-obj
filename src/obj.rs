@@ -1241,6 +1241,360 @@ fn flush_block(
     }
 }
 
+/// Tessellate every `curv2` 2D trimming / special / connectivity curve
+/// (spec §"curv2") that sits under a supported `cstype` header into a
+/// parameter-space polyline ([`Topology::LineStrip`]).
+///
+/// Where [`tessellate_curves`] evaluates 3D space curves whose control
+/// points are geometric `v` vertices, a `curv2` references **parameter
+/// vertices** (`vp u v [w]`, spec §"vp u v w") and lies in the 2D
+/// parameter space of the surface it trims. The curve maths is identical
+/// — same Bezier / B-spline / Cardinal / Taylor / basis-matrix basis as
+/// the active `cstype` — so we reuse the 1D samplers component-wise by
+/// lifting each `vp (u, v)` into a `[u, v, 0.0]` control point. The
+/// sampled `x`/`y` are the parameter-space `(u, v)` coordinates; `z`
+/// stays `0.0` (the curve is flat in parameter space).
+///
+/// Differences from the 3D `curv` path (spec §"curv2"):
+///   * A `curv2` line carries **no** leading `u0 u1` range — it is just
+///     `curv2 vp1 vp2 …`. The evaluation range for the B-spline window
+///     comes from the block's `parm u` knot vector
+///     (`[parm_u[0], parm_u[last]]`); Bezier / Taylor / Cardinal sample
+///     uniformly on `[0, 1]` exactly as the 3D path does.
+///   * Control points are 2D (non-rational) or 2D/3D (rational, the
+///     optional 3rd `vp` coordinate is the weight, default 1.0). Since
+///     `vp` storage pads a missing 3rd coordinate with `0.0` and a
+///     zero rational weight is degenerate, a stored weight of exactly
+///     `0.0` is read back as the spec default `1.0` for rational
+///     evaluation.
+///
+/// Output primitives carry the same `obj:tessellated_curve` sentinel as
+/// the 3D path (so the encoder filters them out and replays the original
+/// `cstype` / `curv2` / `end` block verbatim from
+/// `Scene3D::extras["obj:freeform_directives"]`) plus a
+/// `obj:curve2 = true` marker and the
+/// `obj:curve_kind` / `obj:curve_degree` / `obj:curve_u_range` /
+/// `obj:curve_samples` provenance.
+fn tessellate_curve2(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
+    let mut out: Vec<Primitive> = Vec::new();
+
+    let mut active_kind: Option<&'static str> = None;
+    let mut active_degree: Option<u32> = None;
+    let mut parm_u: Vec<f32> = Vec::new();
+    let mut bmat_u: Vec<f32> = Vec::new();
+    let mut step_u: Option<u32> = None;
+    // `curv2` directives queued for this block — evaluated on `end`
+    // (mirrors the 3D `curv` two-pass deferral so the body `parm u`
+    // knot vector is visible before B-spline evaluation).
+    let mut pending: Vec<&Vec<String>> = Vec::new();
+
+    let flush = |out: &mut Vec<Primitive>,
+                 active_kind: Option<&'static str>,
+                 active_degree: Option<u32>,
+                 parm_u: &[f32],
+                 bmat_u: &[f32],
+                 step_u: Option<u32>,
+                 pending: &[&Vec<String>]| {
+        flush_curve2_block(
+            out,
+            doc,
+            active_kind,
+            active_degree,
+            parm_u,
+            bmat_u,
+            step_u,
+            pending,
+            samples,
+        );
+    };
+
+    for entry in &doc.freeform_directives {
+        if entry.is_empty() {
+            continue;
+        }
+        match entry[0].as_str() {
+            "cstype" => {
+                flush(
+                    &mut out,
+                    active_kind,
+                    active_degree,
+                    &parm_u,
+                    &bmat_u,
+                    step_u,
+                    &pending,
+                );
+                pending.clear();
+                parm_u.clear();
+                bmat_u.clear();
+                step_u = None;
+                active_degree = None;
+
+                let mut iter = entry.iter().skip(1);
+                let first = iter.next().map(String::as_str);
+                let second = iter.next().map(String::as_str);
+                active_kind = match (first, second) {
+                    (Some("bezier"), _) => Some("bezier"),
+                    (Some("rat"), Some("bezier")) => Some("rat_bezier"),
+                    (Some("bspline"), _) => Some("bspline"),
+                    (Some("rat"), Some("bspline")) => Some("rat_bspline"),
+                    (Some("cardinal"), _) => Some("cardinal"),
+                    (Some("rat"), Some("cardinal")) => Some("cardinal"),
+                    (Some("taylor"), _) => Some("taylor"),
+                    (Some("rat"), Some("taylor")) => Some("taylor"),
+                    (Some("bmatrix"), _) => Some("bmatrix"),
+                    (Some("rat"), Some("bmatrix")) => Some("bmatrix"),
+                    _ => None,
+                };
+            }
+            "deg" => {
+                if let Some(d) = entry.get(1).and_then(|t| t.parse::<u32>().ok()) {
+                    active_degree = Some(d);
+                }
+            }
+            "parm" if entry.get(1).map(String::as_str) == Some("u") => {
+                parm_u = entry[2..]
+                    .iter()
+                    .filter_map(|t| t.parse::<f32>().ok())
+                    .collect();
+            }
+            "bmat" if entry.get(1).map(String::as_str) == Some("u") => {
+                bmat_u = entry[2..]
+                    .iter()
+                    .filter_map(|t| t.parse::<f32>().ok())
+                    .collect();
+            }
+            "step" => {
+                step_u = entry.get(1).and_then(|t| t.parse::<u32>().ok());
+            }
+            "curv2" => {
+                pending.push(entry);
+            }
+            "end" => {
+                flush(
+                    &mut out,
+                    active_kind,
+                    active_degree,
+                    &parm_u,
+                    &bmat_u,
+                    step_u,
+                    &pending,
+                );
+                pending.clear();
+                parm_u.clear();
+                bmat_u.clear();
+                step_u = None;
+                active_kind = None;
+                active_degree = None;
+            }
+            _ => {}
+        }
+    }
+    // Tail flush for a malformed block missing its closing `end`.
+    flush(
+        &mut out,
+        active_kind,
+        active_degree,
+        &parm_u,
+        &bmat_u,
+        step_u,
+        &pending,
+    );
+    out
+}
+
+/// Evaluate every `curv2` entry queued for the current `cstype … end`
+/// block (helper for [`tessellate_curve2`]). A block whose state is
+/// incomplete (missing `cstype`, missing knot vector for B-spline,
+/// malformed `vp` indices, …) is silently dropped, matching the
+/// lenient-loader pattern used throughout the crate.
+#[allow(clippy::too_many_arguments)]
+fn flush_curve2_block(
+    out: &mut Vec<Primitive>,
+    doc: &ObjDoc,
+    active_kind: Option<&'static str>,
+    active_degree: Option<u32>,
+    parm_u: &[f32],
+    bmat_u: &[f32],
+    step_u: Option<u32>,
+    pending: &[&Vec<String>],
+    samples: u32,
+) {
+    let Some(kind) = active_kind else {
+        return;
+    };
+    let n_vp = doc.vp.len() as i64;
+    for entry in pending {
+        // `curv2 vp1 vp2 …` — keyword + at least two control points.
+        if entry.len() < 3 {
+            continue;
+        }
+        let mut control_points: Vec<[f32; 3]> = Vec::new();
+        let mut control_weights: Vec<f32> = Vec::new();
+        let mut bad = false;
+        for tok in &entry[1..] {
+            let Ok(raw) = tok.parse::<i64>() else {
+                bad = true;
+                break;
+            };
+            // Spec §"curv2": control points are parameter vertices;
+            // negative values are relative-from-end (spec §"vp").
+            let resolved = if raw < 0 { n_vp + 1 + raw } else { raw };
+            if resolved <= 0 || resolved > n_vp {
+                bad = true;
+                break;
+            }
+            let vp = doc.vp[(resolved as usize) - 1];
+            // Lift the 2D parameter coordinate into a flat 3D control
+            // point so the existing 1D samplers (which operate on
+            // `[f32; 3]` component-wise) evaluate the curve unchanged.
+            control_points.push([vp[0], vp[1], 0.0]);
+            // The optional 3rd `vp` coordinate is the rational weight
+            // (spec §"vp u v w"). `vp` storage pads a missing 3rd
+            // coordinate with `0.0`; a 0 weight is degenerate, so read
+            // it back as the spec default 1.0.
+            let w = if vp[2] == 0.0 { 1.0 } else { vp[2] };
+            control_weights.push(w);
+        }
+        if bad || control_points.len() < 2 {
+            continue;
+        }
+
+        // `curv2` carries no inline `u0 u1`; the evaluation range comes
+        // from the block's `parm u` knot vector when present (needed for
+        // the B-spline window clip), otherwise the canonical `[0, 1]`.
+        let (u_min, u_max) = match (parm_u.first(), parm_u.last()) {
+            (Some(&a), Some(&b)) if parm_u.len() >= 2 => (a, b),
+            _ => (0.0, 1.0),
+        };
+
+        let curve_points = match kind {
+            "bezier" | "rat_bezier" => sample_bezier(
+                &control_points,
+                &control_weights,
+                kind,
+                u_min,
+                u_max,
+                samples,
+            ),
+            "bspline" | "rat_bspline" => {
+                let Some(degree) = active_degree else {
+                    continue;
+                };
+                if parm_u.len() != control_points.len() + degree as usize + 1 {
+                    continue;
+                }
+                sample_bspline(
+                    &control_points,
+                    &control_weights,
+                    kind,
+                    degree,
+                    parm_u,
+                    u_min,
+                    u_max,
+                    samples,
+                )
+            }
+            "cardinal" => {
+                if active_degree.is_some_and(|d| d != 3) {
+                    continue;
+                }
+                if control_points.len() < 4 {
+                    continue;
+                }
+                sample_cardinal(&control_points, samples)
+            }
+            "taylor" => {
+                let degree = match active_degree {
+                    Some(d) => d as usize,
+                    None => control_points.len().saturating_sub(1),
+                };
+                if control_points.len() != degree + 1 {
+                    continue;
+                }
+                sample_taylor(&control_points, u_min, u_max, samples)
+            }
+            "bmatrix" => {
+                let Some(degree) = active_degree else {
+                    continue;
+                };
+                let Some(step) = step_u else {
+                    continue;
+                };
+                let Some(n_plus_1) = (degree as usize).checked_add(1) else {
+                    continue;
+                };
+                let Some(expected_bmat) = n_plus_1.checked_mul(n_plus_1) else {
+                    continue;
+                };
+                if bmat_u.len() != expected_bmat {
+                    continue;
+                }
+                if step == 0 {
+                    continue;
+                }
+                if control_points.len() < n_plus_1 {
+                    continue;
+                }
+                sample_bmatrix(&control_points, bmat_u, degree, step, samples)
+            }
+            _ => continue,
+        };
+        if curve_points.len() < 2 {
+            continue;
+        }
+
+        let mut prim = Primitive::new(Topology::LineStrip);
+        let n = curve_points.len() as u32;
+        prim.positions = curve_points;
+        if n > u16::MAX as u32 {
+            prim.indices = Some(Indices::U32((0..n).collect()));
+        } else {
+            prim.indices = Some(Indices::U16((0..n).map(|i| i as u16).collect()));
+        }
+
+        prim.extras.insert(
+            "obj:tessellated_curve".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        // 2D-parameter-space marker so consumers can tell a `curv2`
+        // polyline apart from a 3D `curv` one (the positions are
+        // `(u, v, 0)` parameter-space coordinates, not model space).
+        prim.extras
+            .insert("obj:curve2".to_string(), serde_json::Value::Bool(true));
+        prim.extras.insert(
+            "obj:curve_kind".to_string(),
+            serde_json::Value::String(kind.to_string()),
+        );
+        let reported_degree = match kind {
+            "bezier" | "rat_bezier" => (control_points.len() - 1) as u64,
+            "bspline" | "rat_bspline" => active_degree.unwrap_or(0) as u64,
+            "cardinal" => 3,
+            "taylor" => active_degree
+                .map(u64::from)
+                .unwrap_or_else(|| (control_points.len() - 1) as u64),
+            "bmatrix" => active_degree.map(u64::from).unwrap_or(0),
+            _ => 0,
+        };
+        prim.extras.insert(
+            "obj:curve_degree".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(reported_degree)),
+        );
+        prim.extras.insert(
+            "obj:curve_u_range".to_string(),
+            serde_json::Value::Array(vec![
+                serde_json::Value::from(u_min as f64),
+                serde_json::Value::from(u_max as f64),
+            ]),
+        );
+        prim.extras.insert(
+            "obj:curve_samples".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(samples as u64)),
+        );
+
+        out.push(prim);
+    }
+}
+
 /// Tessellate every `surf` element that sits under a supported `cstype`
 /// header into a triangulated [`Topology::Triangles`] primitive. Mirrors
 /// [`tessellate_curves`] but evaluates a bivariate tensor product (spec
@@ -3450,6 +3804,18 @@ where
         Vec::new()
     };
 
+    // 2D trimming-curve (`curv2`) tessellation pass — the same sample
+    // knob evaluates the parameter-space trimming / special /
+    // connectivity curves (spec §"curv2") into `LineStrip` polylines on
+    // a dedicated `obj:curves2` mesh. The directives still ride on
+    // `Scene3D::extras["obj:freeform_directives"]` for verbatim
+    // round-trip; the encoder filters the synthetic primitives out.
+    let tessellated_curve2 = if options.curve_tessellation_samples > 0 {
+        tessellate_curve2(&doc, options.curve_tessellation_samples)
+    } else {
+        Vec::new()
+    };
+
     // Surface tessellation pass — the same sample knob drives Bezier
     // `surf` tensor-product evaluation (round 11). Synthesises a
     // `Topology::Triangles` mesh; the directives still ride on
@@ -3465,6 +3831,14 @@ where
     if !tessellated.is_empty() {
         let mut mesh = Mesh::new(Some("obj:curves".to_string()));
         for prim in tessellated {
+            mesh.primitives.push(prim);
+        }
+        scene.add_mesh(mesh);
+    }
+
+    if !tessellated_curve2.is_empty() {
+        let mut mesh = Mesh::new(Some("obj:curves2".to_string()));
+        for prim in tessellated_curve2 {
             mesh.primitives.push(prim);
         }
         scene.add_mesh(mesh);

@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- 2D trimming-curve (`curv2`) tessellation under
+  `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
+  evaluates every `curv2` directive — the parameter-space curve used as
+  an outer / inner trimming loop, a special curve, or for connectivity
+  (spec §"curv2") — into a `Topology::LineStrip` polyline on a new
+  synthetic mesh named `"obj:curves2"`. A `curv2` references `vp`
+  parameter vertices (spec §"vp u v w") and lies in the 2D parameter
+  space of the surface it trims, so each `vp (u, v)` is lifted into a
+  `[u, v, 0.0]` control point and run through the same Bezier /
+  B-spline / Cardinal / Taylor / basis-matrix evaluators the 3D `curv`
+  path uses; the sampled `x`/`y` are the parameter-space coordinates and
+  `z` stays `0.0`. Unlike `curv`, a `curv2` line carries no inline
+  `u0 u1` range — the B-spline evaluation window is taken from the
+  block's `parm u` knot vector (`[parm_u[0], parm_u[last]]`). The
+  optional 3rd `vp` coordinate is the rational weight (default `1.0`; a
+  stored `0.0` — the `vp` padding default — is read back as `1.0` for
+  the rational forms since a zero weight is degenerate). Negative
+  `curv2` indices resolve relative-from-end against the `vp` pool (spec
+  §"Special point" example `curv2 -6 -5 …`). Synthetic primitives carry
+  the shared `obj:tessellated_curve` sentinel (so the encoder filters
+  them out and replays the original `cstype` / `curv2` / `end` block
+  verbatim from `Scene3D::extras["obj:freeform_directives"]`) plus a
+  `obj:curve2 = true` marker and the
+  `obj:curve_kind` / `obj:curve_degree` / `obj:curve_u_range` /
+  `obj:curve_samples` provenance. Malformed `curv2` blocks (missing
+  `cstype`, missing knot vector for B-spline, fewer than two control
+  points, out-of-range `vp` indices) are silently dropped. The
+  `trim` / `hole` / `scrv` statements that reference these curves by
+  index still ride on `freeform_directives` verbatim — surface clipping
+  against the loops remains future work.
 - Basis-matrix `surf` surface tessellation under
   `ObjDecoder::with_curve_tessellation(samples: u32)`. The decoder now
   evaluates `surf` elements that sit under a `cstype bmatrix` (or

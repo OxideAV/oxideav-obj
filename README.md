@@ -67,8 +67,9 @@ modern loaders actually load):
   of `[keyword, arg1, arg2, …]` arrays). The encoder replays both
   after the polygonal section so a decode → encode round-trip
   preserves the directive order and arguments. Verbatim by default;
-  opt-in tessellation of `curv` curves and Bezier / B-spline /
-  Cardinal `surf` surfaces is available via
+  opt-in tessellation of `curv` 3D space curves, `curv2` 2D
+  parameter-space trimming curves, and Bezier / B-spline / Cardinal /
+  Taylor / basis-matrix `surf` surfaces is available via
   `ObjDecoder::with_curve_tessellation(samples)` (see the per-round
   notes below).
 
@@ -362,10 +363,34 @@ the same `obj:tessellated_surface` / `obj:surface_kind` (`"bmatrix"`) /
 `obj:surface_samples` provenance and the encoder filters them out,
 replaying the original `cstype` / `deg` / `bmat u` / `bmat v` /
 `step` / `parm u` / `parm v` / `surf` / `end` block unchanged.
+Round 188: 2D trimming-curve (`curv2`) tessellation — the same
+`with_curve_tessellation(samples)` knob now also evaluates every
+`curv2` directive (the parameter-space curve referenced by
+`trim` / `hole` / `scrv`, spec §"curv2") into a `Topology::LineStrip`
+polyline on a new synthetic mesh named `"obj:curves2"`. A `curv2`
+references `vp` parameter vertices (spec §"vp u v w") and lies in the
+2D parameter space of the surface it trims, so each `vp (u, v)` is
+lifted into a flat `[u, v, 0.0]` control point and run through the
+same Bezier / B-spline / Cardinal / Taylor / basis-matrix evaluators
+the 3D `curv` path uses — the sampled `x`/`y` are the parameter-space
+coordinates, `z` stays `0.0`. Unlike `curv`, a `curv2` line carries
+no inline `u0 u1`; the B-spline evaluation window comes from the
+block's `parm u` knot vector. The optional 3rd `vp` coordinate is the
+rational weight (default `1.0`; the `vp` `0.0` padding default reads
+back as `1.0` for the rational forms). Negative `curv2` indices
+resolve relative-from-end against the `vp` pool (spec §"Special point"
+example `curv2 -6 -5 …`). Synthetic primitives carry the shared
+`obj:tessellated_curve` sentinel plus a `obj:curve2` marker and the
+`obj:curve_kind` / `obj:curve_degree` / `obj:curve_u_range` /
+`obj:curve_samples` provenance; the encoder filters them out and
+replays the original `cstype` / `curv2` / `parm` / `end` block
+unchanged from `Scene3D::extras["obj:freeform_directives"]`.
 
 The `.mod` binary form remains out of scope; multi-patch Bezier
-surface decomposition (Bezier carries no `step` stride) and trim/hole
-loop evaluation are the remaining gaps.
+surface decomposition (Bezier carries no `step` stride) and full
+surface clipping against the `trim` / `hole` loops (the loops' `curv2`
+curves now tessellate, but the surface mesh is not yet clipped to
+them) are the remaining gaps.
 
 ## License
 
