@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 206: special-curve (`scrv`) tessellation. Under
+  `ObjDecoder::with_curve_tessellation(samples: u32)`, every `scrv`
+  directive inside a `cstype … end` block (spec §"Special curve",
+  §"scrv u0 u1 curv2d u0 u1 curv2d …") is now resolved into a
+  parameter-space `Topology::LineStrip` polyline on a new synthetic
+  mesh named `"obj:scrvs"`. A `scrv` carries the same
+  `(u0, u1, curv2d)` triple shape that `trim` / `hole` use, but
+  unlike those it is **not** a closed loop — the spec describes it
+  as a "sequence of curves which lie on a given surface to build a
+  single special curve" that must appear as a sequence of triangle
+  edges in the surface's final triangulation. Until surface-aware
+  triangulation honours that constraint, the special curve is
+  emitted as a stand-alone parameter-space polyline so consumers
+  can resolve it without re-walking the directive stream. Curv2d
+  references are 1-based global per spec ("This curve must have
+  been previously defined with the curv2 statement"), resolved
+  against the same `collect_all_curv2_polylines` pre-pass the
+  round-201 trim/hole clipper uses so a `scrv` declared in one
+  block can still reference a `curv2` first defined in any earlier
+  block. The shared `append_curv2_segment` helper concatenates each
+  `(u0, u1)` slice in source order (with the first vertex of each
+  segment-after-the-first dropped to avoid duplicate-at-join);
+  segments whose referenced `curv2` failed to tessellate
+  (incomplete block state, missing knot vector, malformed `vp`
+  index, etc.) are silently dropped, and the surrounding `scrv`
+  still produces a partial polyline if at least two vertices
+  survive. Per-`scrv` primitives carry the shared
+  `obj:tessellated_curve` sentinel (so the encoder's existing
+  filter skips them), plus an `obj:scrv = true` marker, an
+  `obj:scrv_segments` count, and an `obj:scrv_curv2_refs` array of
+  `[curv2d_index, u0, u1]` provenance triples in source order. The
+  free-form directive sequence still rides on
+  `Scene3D::extras["obj:freeform_directives"]` so a decode → encode
+  cycle replays the original `cstype` / `surf` / `scrv` / `end`
+  block verbatim — the encoder filters the synthetic polyline out
+  via the shared `obj:tessellated_curve` sentinel exactly like the
+  un-clipped surface and curv2 paths.
+
 - Round 201: surface trim/hole clipping. Under
   `ObjDecoder::with_curve_tessellation(samples: u32)`, every `surf`
   block whose enclosing `cstype … end` now also carries one or more

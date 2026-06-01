@@ -1908,6 +1908,150 @@ fn flush_curve2_block(
     }
 }
 
+/// Tessellate every `scrv` (special-curve) directive that sits inside a
+/// `cstype … end` block into a single parameter-space polyline
+/// ([`Topology::LineStrip`]). Spec §"Special curve", §"scrv u0 u1 curv2d
+/// u0 u1 curv2d …".
+///
+/// A `scrv` is structurally identical to `trim` / `hole`: each directive
+/// is a sequence of `(u0, u1, curv2d)` triples that select sub-ranges of
+/// previously-defined `curv2` parameter-space curves. Unlike trim/hole,
+/// the resulting polyline is **not** a closed loop — the spec describes
+/// it as "a sequence of curves which lie on a given surface to build a
+/// single special curve" that will appear as triangle edges in the
+/// surface's final triangulation. Until the surface triangulator
+/// honours that constraint, this round emits the special curve as a
+/// stand-alone parameter-space polyline on the synthetic `"obj:scrvs"`
+/// mesh so consumers that care about the special-curve geometry can
+/// resolve it without re-walking the directive stream.
+///
+/// Per-`scrv` provenance lands on `Primitive::extras`:
+///   * `obj:tessellated_curve` — `true` (shared encoder-filter sentinel).
+///   * `obj:scrv` — `true` (special-curve marker).
+///   * `obj:scrv_segments` — number of `(u0, u1, curv2d)` segments
+///     concatenated into the polyline.
+///   * `obj:scrv_curv2_refs` — array of `[curv2d_index_1based, u0, u1]`
+///     triples in source order (provenance for the segment list).
+///
+/// The free-form directive sequence still rides on
+/// `Scene3D::extras["obj:freeform_directives"]` so a decode → encode
+/// cycle replays the original `cstype` / `surf` / `scrv` / `end` block
+/// verbatim — the encoder filters the synthetic polyline out via the
+/// shared `obj:tessellated_curve` sentinel.
+///
+/// `curv2d` references are 1-based global per spec §"scrv u0 u1
+/// curv2d" — "This curve must have been previously defined with the
+/// curv2 statement". Segments whose referenced `curv2` failed to
+/// tessellate (incomplete block state, missing knot vector, …) are
+/// silently dropped; the surrounding `scrv` may still produce a
+/// partial polyline if at least two vertices survive across the
+/// successfully-resolved segments.
+fn tessellate_scrv(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
+    let mut out: Vec<Primitive> = Vec::new();
+    if samples == 0 {
+        return out;
+    }
+
+    // Reuse the same pre-resolution pass the surface trim/hole clipper
+    // uses (spec §"trim u0 u1 curv2d" / §"hole u0 u1 curv2d" /
+    // §"scrv u0 u1 curv2d" — all three reference `curv2` by 1-based
+    // global index).
+    let curv2_polylines = collect_all_curv2_polylines(doc, samples);
+
+    for entry in &doc.freeform_directives {
+        if entry.first().map(String::as_str) != Some("scrv") {
+            continue;
+        }
+        // `scrv u0 u1 curv2d u0 u1 curv2d …` — keyword + N triples.
+        let toks = &entry[1..];
+        if toks.len() < 3 || toks.len() % 3 != 0 {
+            continue;
+        }
+
+        let mut polyline: Vec<[f32; 2]> = Vec::new();
+        let mut refs: Vec<serde_json::Value> = Vec::new();
+        let mut segments: u32 = 0;
+        let mut bad = false;
+        for chunk in toks.chunks(3) {
+            let Ok(u0) = chunk[0].parse::<f32>() else {
+                bad = true;
+                break;
+            };
+            let Ok(u1) = chunk[1].parse::<f32>() else {
+                bad = true;
+                break;
+            };
+            let Ok(idx) = chunk[2].parse::<i64>() else {
+                bad = true;
+                break;
+            };
+            // Spec §"scrv u0 u1 curv2d": the curv2 index is 1-based and
+            // references an earlier definition. The spec doesn't describe
+            // a negative-from-end form here (those would predate the
+            // curve being defined), matching the trim/hole semantics.
+            if idx <= 0 {
+                continue;
+            }
+            let slot = idx as usize - 1;
+            let Some(entry) = curv2_polylines.get(slot).and_then(|e| e.as_ref()) else {
+                // The referenced curv2 didn't tessellate (block state
+                // incomplete, malformed `vp` index, etc.). Skip this
+                // segment but keep walking the rest of the scrv — the
+                // spec doesn't require all-or-nothing.
+                continue;
+            };
+            let (curve_u_min, curve_u_max, segment_polyline) = entry;
+            append_curv2_segment(
+                &mut polyline,
+                segment_polyline,
+                *curve_u_min,
+                *curve_u_max,
+                u0,
+                u1,
+            );
+            refs.push(serde_json::Value::Array(vec![
+                serde_json::Value::from(idx),
+                serde_json::Value::from(u0 as f64),
+                serde_json::Value::from(u1 as f64),
+            ]));
+            segments += 1;
+        }
+        if bad || polyline.len() < 2 {
+            continue;
+        }
+
+        // Lift the 2D parameter-space samples into a flat 3D position
+        // list (z = 0). Matches the `curv2` synthetic primitive layout
+        // so consumers can treat scrv and curv2 polylines uniformly.
+        let positions: Vec<[f32; 3]> = polyline.iter().map(|p| [p[0], p[1], 0.0]).collect();
+        let n = positions.len() as u32;
+        let mut prim = Primitive::new(Topology::LineStrip);
+        prim.positions = positions;
+        prim.indices = if n > u16::MAX as u32 {
+            Some(Indices::U32((0..n).collect()))
+        } else {
+            Some(Indices::U16((0..n).map(|i| i as u16).collect()))
+        };
+        prim.extras.insert(
+            "obj:tessellated_curve".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        prim.extras
+            .insert("obj:scrv".to_string(), serde_json::Value::Bool(true));
+        prim.extras.insert(
+            "obj:scrv_segments".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(segments as u64)),
+        );
+        prim.extras.insert(
+            "obj:scrv_curv2_refs".to_string(),
+            serde_json::Value::Array(refs),
+        );
+        out.push(prim);
+    }
+
+    out
+}
+
 /// Tessellate every `surf` element that sits under a supported `cstype`
 /// header into a triangulated [`Topology::Triangles`] primitive. Mirrors
 /// [`tessellate_curves`] but evaluates a bivariate tensor product (spec
@@ -4284,6 +4428,18 @@ where
         Vec::new()
     };
 
+    // Special-curve (`scrv`) tessellation pass (round 206) — evaluates
+    // every `scrv` directive into a parameter-space LineStrip polyline
+    // (spec §"Special curve", §"scrv u0 u1 curv2d u0 u1 curv2d …"). The
+    // directives still ride on `Scene3D::extras["obj:freeform_directives"]`
+    // for verbatim round-trip; the encoder filters the synthetic
+    // primitives out via the shared `obj:tessellated_curve` sentinel.
+    let tessellated_scrv = if options.curve_tessellation_samples > 0 {
+        tessellate_scrv(&doc, options.curve_tessellation_samples)
+    } else {
+        Vec::new()
+    };
+
     let mut scene = build_scene(doc)?;
 
     if !tessellated.is_empty() {
@@ -4305,6 +4461,14 @@ where
     if !tessellated_surfaces.is_empty() {
         let mut mesh = Mesh::new(Some("obj:surfaces".to_string()));
         for prim in tessellated_surfaces {
+            mesh.primitives.push(prim);
+        }
+        scene.add_mesh(mesh);
+    }
+
+    if !tessellated_scrv.is_empty() {
+        let mut mesh = Mesh::new(Some("obj:scrvs".to_string()));
+        for prim in tessellated_scrv {
             mesh.primitives.push(prim);
         }
         scene.add_mesh(mesh);

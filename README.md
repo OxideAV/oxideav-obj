@@ -417,13 +417,43 @@ example `curv2 -6 -5 …`). Synthetic primitives carry the shared
 `obj:curve_samples` provenance; the encoder filters them out and
 replays the original `cstype` / `curv2` / `parm` / `end` block
 unchanged from `Scene3D::extras["obj:freeform_directives"]`.
+Round 206: special-curve (`scrv`) tessellation — the same
+`with_curve_tessellation(samples)` knob now also evaluates every
+`scrv` directive (spec §"Special curve", §"scrv u0 u1 curv2d u0 u1
+curv2d …") into a parameter-space `Topology::LineStrip` polyline on
+a new synthetic mesh named `"obj:scrvs"`. A `scrv` shares the
+`(u0, u1, curv2d)` triple shape `trim` / `hole` use, but unlike
+those it is **not** a closed loop — the spec describes it as a
+"sequence of curves which lie on a given surface to build a single
+special curve" that must appear as a sequence of triangle edges in
+the surface's final triangulation. Until surface-aware triangulation
+honours that constraint, the special curve is emitted as a
+stand-alone parameter-space polyline so consumers can resolve it
+without re-walking the directive stream. The `curv2d` references
+are 1-based global per spec ("This curve must have been previously
+defined with the curv2 statement"), resolved against the same
+`collect_all_curv2_polylines` pre-pass the round-201 trim/hole
+clipper uses, so a `scrv` declared in one block can still reference
+a `curv2` first defined in any earlier block. Segments whose
+referenced `curv2` failed to tessellate (incomplete block state,
+missing knot vector, …) are silently dropped; the surrounding
+`scrv` still produces a partial polyline if at least two vertices
+survive across the successfully-resolved segments. Per-`scrv`
+primitives carry the shared `obj:tessellated_curve` sentinel plus an
+`obj:scrv` marker, an `obj:scrv_segments` count, and an
+`obj:scrv_curv2_refs` array of `[curv2d_index, u0, u1]` provenance
+triples in source order; the encoder filters them out and replays
+the original `cstype` / `surf` / `scrv` / `end` block unchanged
+from `Scene3D::extras["obj:freeform_directives"]`.
 
 The `.mod` binary form remains out of scope; multi-patch Bezier
-surface decomposition (Bezier carries no `step` stride) and sub-cell
-re-meshing of the surface mesh against the `trim` / `hole` loop
-boundaries (round 201 lands a conservative per-triangle clip that
-keeps the boundary jagged at the lattice grain) are the remaining
-gaps.
+surface decomposition (Bezier carries no `step` stride),
+surface-aware triangulation against `scrv` polylines (the special
+curve must appear as triangle edges per spec §"Special curve"), and
+sub-cell re-meshing of the surface mesh against the `trim` / `hole`
+loop boundaries (round 201 lands a conservative per-triangle clip
+that keeps the boundary jagged at the lattice grain) are the
+remaining gaps.
 
 ## License
 
