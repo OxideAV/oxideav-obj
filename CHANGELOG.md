@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Round 201: surface trim/hole clipping. Under
+  `ObjDecoder::with_curve_tessellation(samples: u32)`, every `surf`
+  block whose enclosing `cstype … end` now also carries one or more
+  `trim u0 u1 curv2d …` (outer) and/or `hole u0 u1 curv2d …` (inner)
+  loops (spec §"Trimming Loops") has its tessellated triangle grid
+  clipped against those loops. The clip works in parameter `(u, v)`
+  space: every `curv2` referenced by a `trim` / `hole` is resolved
+  via a one-pass walk over `freeform_directives` (1-based global
+  ordering per spec §"trim u0 u1 curv2d" — "This curve must have
+  been previously defined") into the same Bezier / B-spline /
+  Cardinal / Taylor / basis-matrix polyline the stand-alone
+  round-188 `curv2` path produces, with the requested `[u0, u1]`
+  sub-range mapped linearly into the curve's own evaluation window.
+  Per-loop segments concatenate into a closed polygon. Each
+  surface-lattice vertex's `(u, v)` is point-in-polygon-tested via
+  the standard Jordan-curve ray cast: a triangle survives iff all
+  three vertices lie inside at least one trim polygon (or there are
+  no trim loops, in which case the surface's full parameter
+  rectangle is taken as the implicit outer loop per spec — "If no
+  trim or hole statements are specified, then the surface is trimmed
+  at its parameter range") AND outside every hole polygon. This is
+  a conservative clip — boundary cells whose corners straddle a loop
+  edge are dropped rather than re-meshed sub-cell, so the trim edge
+  stays jagged at the lattice grain. Provenance lands on the
+  synthetic primitive's extras: `obj:surface_trimmed = true`,
+  `obj:surface_trim_loops` (count), and `obj:surface_hole_loops`
+  (count). The free-form directive sequence still rides on
+  `Scene3D::extras["obj:freeform_directives"]` so a decode → encode
+  cycle replays the original `cstype` / `surf` / `trim` / `hole` /
+  `end` block verbatim; the encoder filters the synthetic clipped
+  surface out via the shared `obj:tessellated_curve` sentinel
+  exactly like the un-clipped surface path.
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-obj/compare/v0.0.2...v0.0.3) - 2026-05-29
 
 ### Other

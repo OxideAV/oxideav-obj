@@ -363,6 +363,38 @@ the same `obj:tessellated_surface` / `obj:surface_kind` (`"bmatrix"`) /
 `obj:surface_samples` provenance and the encoder filters them out,
 replaying the original `cstype` / `deg` / `bmat u` / `bmat v` /
 `step` / `parm u` / `parm v` / `surf` / `end` block unchanged.
+Round 201: surface trim/hole clipping — the same
+`with_curve_tessellation(samples)` knob now also applies the
+`trim u0 u1 curv2d …` (outer) and `hole u0 u1 curv2d …` (inner)
+trimming loops declared inside a `surf` block (spec §"Trimming
+Loops", §"trim", §"hole") to the tessellated surface mesh. Every
+`curv2` referenced by an enclosing `trim` / `hole` is resolved to its
+parameter-space `(u, v)` polyline (via the same Bezier / B-spline /
+Cardinal / Taylor / basis-matrix evaluator the round-188 stand-alone
+`curv2` path uses), and the per-`trim` / per-`hole` segments are
+concatenated into a closed polygon. Each `(samples + 1)²` lattice
+vertex of the surface is then point-in-polygon-tested via Jordan-
+curve ray casting: a triangle is kept iff all three vertices lie
+inside at least one trim loop (or there are no trim loops — spec:
+"If no trim or hole statements are specified, then the surface is
+trimmed at its parameter range") AND outside every hole loop. This
+is a conservative clip — boundary cells whose corners straddle a
+loop edge are dropped wholesale rather than sub-cell re-meshed, so
+the trim edge stays jagged at the lattice grain. The free-form
+directive sequence still rides on
+`Scene3D::extras["obj:freeform_directives"]` so a decode → encode
+cycle replays the original `cstype` / `deg` / `surf` / `parm` /
+`trim` / `hole` / `end` block verbatim; the encoder filters the
+synthetic clipped surface out via the shared
+`obj:tessellated_curve` sentinel. Per-clipped primitive,
+provenance lands on `obj:surface_trimmed = true`,
+`obj:surface_trim_loops` (count), and `obj:surface_hole_loops`
+(count). Curv2 references on `trim` / `hole` are 1-based global
+(spec §"trim u0 u1 curv2d" — "This curve must have been previously
+defined with the curv2 statement"); a one-pass walk over
+`freeform_directives` resolves every curv2 polyline up-front so a
+`trim` declared in one block can reference a `curv2` first defined
+in any earlier block.
 Round 188: 2D trimming-curve (`curv2`) tessellation — the same
 `with_curve_tessellation(samples)` knob now also evaluates every
 `curv2` directive (the parameter-space curve referenced by
@@ -387,10 +419,11 @@ replays the original `cstype` / `curv2` / `parm` / `end` block
 unchanged from `Scene3D::extras["obj:freeform_directives"]`.
 
 The `.mod` binary form remains out of scope; multi-patch Bezier
-surface decomposition (Bezier carries no `step` stride) and full
-surface clipping against the `trim` / `hole` loops (the loops' `curv2`
-curves now tessellate, but the surface mesh is not yet clipped to
-them) are the remaining gaps.
+surface decomposition (Bezier carries no `step` stride) and sub-cell
+re-meshing of the surface mesh against the `trim` / `hole` loop
+boundaries (round 201 lands a conservative per-triangle clip that
+keeps the boundary jagged at the lattice grain) are the remaining
+gaps.
 
 ## License
 

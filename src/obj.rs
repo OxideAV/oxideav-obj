@@ -1402,6 +1402,387 @@ fn tessellate_curve2(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
     out
 }
 
+/// Evaluate one `curv2` entry under an active `cstype` and block-level
+/// `parm u` / `bmat u` / `step` state. Returns `(u_min, u_max,
+/// polyline_points)` on success, `None` when the block state is
+/// incomplete (no `cstype`, B-spline knot-count mismatch, bad bmatrix
+/// sizing, fewer than two control points, etc.). Shared by
+/// [`flush_curve2_block`] and [`collect_all_curv2_polylines`] so the
+/// surface trim/hole clipping pass (spec §"trim u0 u1 curv2d …",
+/// §"hole u0 u1 curv2d …") sees the same polyline a stand-alone
+/// `obj:curves2` synthetic primitive does.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_curv2_entry(
+    kind: &'static str,
+    active_degree: Option<u32>,
+    parm_u: &[f32],
+    bmat_u: &[f32],
+    step_u: Option<u32>,
+    control_points: &[[f32; 3]],
+    control_weights: &[f32],
+    samples: u32,
+) -> Option<(f32, f32, Vec<[f32; 3]>)> {
+    // `curv2` carries no inline `u0 u1`; the evaluation range comes from
+    // the block's `parm u` knot vector when present (needed for the
+    // B-spline window clip), otherwise the canonical `[0, 1]`. Spec
+    // §"curv2" + §"parm u/v".
+    let (u_min, u_max) = match (parm_u.first(), parm_u.last()) {
+        (Some(&a), Some(&b)) if parm_u.len() >= 2 => (a, b),
+        _ => (0.0, 1.0),
+    };
+
+    let curve_points = match kind {
+        "bezier" | "rat_bezier" => {
+            sample_bezier(control_points, control_weights, kind, u_min, u_max, samples)
+        }
+        "bspline" | "rat_bspline" => {
+            let degree = active_degree?;
+            if parm_u.len() != control_points.len() + degree as usize + 1 {
+                return None;
+            }
+            sample_bspline(
+                control_points,
+                control_weights,
+                kind,
+                degree,
+                parm_u,
+                u_min,
+                u_max,
+                samples,
+            )
+        }
+        "cardinal" => {
+            if active_degree.is_some_and(|d| d != 3) {
+                return None;
+            }
+            if control_points.len() < 4 {
+                return None;
+            }
+            sample_cardinal(control_points, samples)
+        }
+        "taylor" => {
+            let degree = match active_degree {
+                Some(d) => d as usize,
+                None => control_points.len().saturating_sub(1),
+            };
+            if control_points.len() != degree + 1 {
+                return None;
+            }
+            sample_taylor(control_points, u_min, u_max, samples)
+        }
+        "bmatrix" => {
+            let degree = active_degree?;
+            let step = step_u?;
+            let n_plus_1 = (degree as usize).checked_add(1)?;
+            let expected_bmat = n_plus_1.checked_mul(n_plus_1)?;
+            if bmat_u.len() != expected_bmat {
+                return None;
+            }
+            if step == 0 {
+                return None;
+            }
+            if control_points.len() < n_plus_1 {
+                return None;
+            }
+            sample_bmatrix(control_points, bmat_u, degree, step, samples)
+        }
+        _ => return None,
+    };
+    Some((u_min, u_max, curve_points))
+}
+
+/// `(u_min, u_max, polyline)` triple captured for one `curv2` entry —
+/// see [`collect_all_curv2_polylines`]. Aliased to keep clippy's
+/// `type_complexity` lint happy on the `Vec<Option<…>>` table that
+/// indexes one such triple per global curv2 occurrence.
+type Curv2Polyline = (f32, f32, Vec<[f32; 2]>);
+/// `Vec<Option<Curv2Polyline>>` keyed by zero-based global curv2 source
+/// order (so a `curv2d` 1-based reference reads `table[idx - 1]`).
+type Curv2PolylineTable = Vec<Option<Curv2Polyline>>;
+
+/// Walk `doc.freeform_directives` once and return, for every `curv2`
+/// encountered (1-based in source order), the tessellated parameter-space
+/// polyline plus its evaluation `(u_min, u_max)` range. Returns `None` at
+/// the slot when the enclosing `cstype … end` block is too incomplete to
+/// evaluate; the slot indices themselves stay aligned with `curv2 N`
+/// references on `trim` / `hole` / `scrv` statements (spec §"trim u0 u1
+/// curv2d …", §"hole u0 u1 curv2d …").
+///
+/// `samples` is the same per-direction sample knob the user supplied via
+/// [`ObjDecoder::with_curve_tessellation`]; the resolved polylines feed
+/// the surface trim/hole clip pass (the polyline is rasterised at
+/// `samples + 1` (u, v) coordinates per curve segment, then point-in-
+/// polygon tested against each surface-lattice sample).
+fn collect_all_curv2_polylines(doc: &ObjDoc, samples: u32) -> Curv2PolylineTable {
+    let mut out: Curv2PolylineTable = Vec::new();
+    if samples == 0 {
+        return out;
+    }
+
+    let n_vp = doc.vp.len() as i64;
+    let mut active_kind: Option<&'static str> = None;
+    let mut active_degree: Option<u32> = None;
+    let mut parm_u: Vec<f32> = Vec::new();
+    let mut bmat_u: Vec<f32> = Vec::new();
+    let mut step_u: Option<u32> = None;
+    // First pass collects per-block state and indexes of every `curv2`
+    // entry within that block; we evaluate on `end` (or `cstype` / tail)
+    // so the body `parm u` knot vector is fully visible. This mirrors
+    // the two-pass deferral used by `tessellate_curve2`.
+    let mut pending: Vec<(usize, &Vec<String>)> = Vec::new();
+
+    let flush = |out: &mut Curv2PolylineTable,
+                 active_kind: Option<&'static str>,
+                 active_degree: Option<u32>,
+                 parm_u: &[f32],
+                 bmat_u: &[f32],
+                 step_u: Option<u32>,
+                 pending: &[(usize, &Vec<String>)]| {
+        for (idx, entry) in pending {
+            // Make sure the output Vec is long enough to address `idx`
+            // (1-based — slot 0 is unused so `curv2 1` lands at index 0
+            // with a `-1` shift when looked up).
+            while out.len() <= *idx {
+                out.push(None);
+            }
+            let Some(kind) = active_kind else {
+                continue;
+            };
+            if entry.len() < 3 {
+                continue;
+            }
+            let mut control_points: Vec<[f32; 3]> = Vec::new();
+            let mut control_weights: Vec<f32> = Vec::new();
+            let mut bad = false;
+            for tok in &entry[1..] {
+                let Ok(raw) = tok.parse::<i64>() else {
+                    bad = true;
+                    break;
+                };
+                let resolved = if raw < 0 { n_vp + 1 + raw } else { raw };
+                if resolved <= 0 || resolved > n_vp {
+                    bad = true;
+                    break;
+                }
+                let vp = doc.vp[(resolved as usize) - 1];
+                control_points.push([vp[0], vp[1], 0.0]);
+                let w = if vp[2] == 0.0 { 1.0 } else { vp[2] };
+                control_weights.push(w);
+            }
+            if bad || control_points.len() < 2 {
+                continue;
+            }
+            let Some((u_min, u_max, pts)) = evaluate_curv2_entry(
+                kind,
+                active_degree,
+                parm_u,
+                bmat_u,
+                step_u,
+                &control_points,
+                &control_weights,
+                samples,
+            ) else {
+                continue;
+            };
+            // Lift the curve's (x, y, z) samples down to 2D — the z
+            // component is always 0 for a `curv2` (we lifted the 2D `vp`
+            // into a flat 3D control point inside the evaluator), so
+            // dropping it is lossless.
+            let polyline: Vec<[f32; 2]> = pts.iter().map(|p| [p[0], p[1]]).collect();
+            out[*idx] = Some((u_min, u_max, polyline));
+        }
+    };
+
+    // 0-based global `curv2` counter; the spec's `trim u0 u1 curv2d`
+    // numbering is 1-based so we look up at `curv2d - 1`.
+    let mut curv2_counter: usize = 0;
+
+    for entry in &doc.freeform_directives {
+        if entry.is_empty() {
+            continue;
+        }
+        match entry[0].as_str() {
+            "cstype" => {
+                flush(
+                    &mut out,
+                    active_kind,
+                    active_degree,
+                    &parm_u,
+                    &bmat_u,
+                    step_u,
+                    &pending,
+                );
+                pending.clear();
+                parm_u.clear();
+                bmat_u.clear();
+                step_u = None;
+                active_degree = None;
+
+                let mut iter = entry.iter().skip(1);
+                let first = iter.next().map(String::as_str);
+                let second = iter.next().map(String::as_str);
+                active_kind = match (first, second) {
+                    (Some("bezier"), _) => Some("bezier"),
+                    (Some("rat"), Some("bezier")) => Some("rat_bezier"),
+                    (Some("bspline"), _) => Some("bspline"),
+                    (Some("rat"), Some("bspline")) => Some("rat_bspline"),
+                    (Some("cardinal"), _) => Some("cardinal"),
+                    (Some("rat"), Some("cardinal")) => Some("cardinal"),
+                    (Some("taylor"), _) => Some("taylor"),
+                    (Some("rat"), Some("taylor")) => Some("taylor"),
+                    (Some("bmatrix"), _) => Some("bmatrix"),
+                    (Some("rat"), Some("bmatrix")) => Some("bmatrix"),
+                    _ => None,
+                };
+            }
+            "deg" => {
+                if let Some(d) = entry.get(1).and_then(|t| t.parse::<u32>().ok()) {
+                    active_degree = Some(d);
+                }
+            }
+            "parm" if entry.get(1).map(String::as_str) == Some("u") => {
+                parm_u = entry[2..]
+                    .iter()
+                    .filter_map(|t| t.parse::<f32>().ok())
+                    .collect();
+            }
+            "bmat" if entry.get(1).map(String::as_str) == Some("u") => {
+                bmat_u = entry[2..]
+                    .iter()
+                    .filter_map(|t| t.parse::<f32>().ok())
+                    .collect();
+            }
+            "step" => {
+                step_u = entry.get(1).and_then(|t| t.parse::<u32>().ok());
+            }
+            "curv2" => {
+                pending.push((curv2_counter, entry));
+                curv2_counter += 1;
+            }
+            "end" => {
+                flush(
+                    &mut out,
+                    active_kind,
+                    active_degree,
+                    &parm_u,
+                    &bmat_u,
+                    step_u,
+                    &pending,
+                );
+                pending.clear();
+                parm_u.clear();
+                bmat_u.clear();
+                step_u = None;
+                active_kind = None;
+                active_degree = None;
+            }
+            _ => {}
+        }
+    }
+    // Tail flush for blocks missing their closing `end` directive.
+    flush(
+        &mut out,
+        active_kind,
+        active_degree,
+        &parm_u,
+        &bmat_u,
+        step_u,
+        &pending,
+    );
+    // Pad the output so every globally-numbered curv2 has a slot, even
+    // when the trailing ones evaluated to `None`.
+    while out.len() < curv2_counter {
+        out.push(None);
+    }
+    out
+}
+
+/// Slice a tessellated `curv2` polyline to the parameter sub-range
+/// `[u0, u1]` (spec §"trim u0 u1 curv2d" / §"hole u0 u1 curv2d") and
+/// append the resulting (u, v) sample sequence onto `loop_out`. The
+/// polyline was sampled uniformly over the curve's own `(u_min, u_max)`
+/// range, so we map `[u0, u1]` linearly into that range and pick out
+/// the matching slice. Reverses the slice when `u0 > u1` so the loop
+/// orientation can be expressed by either ordering.
+///
+/// To avoid duplicate vertices at segment boundaries on a multi-curve
+/// loop, the first vertex of the second-and-later segment is skipped
+/// when `loop_out` is non-empty.
+fn append_curv2_segment(
+    loop_out: &mut Vec<[f32; 2]>,
+    polyline: &[[f32; 2]],
+    curve_u_min: f32,
+    curve_u_max: f32,
+    u0: f32,
+    u1: f32,
+) {
+    if polyline.len() < 2 {
+        return;
+    }
+    let n = polyline.len();
+    let span = curve_u_max - curve_u_min;
+    let to_idx = |u: f32| -> usize {
+        if span.abs() < f32::EPSILON {
+            0
+        } else {
+            let t = ((u - curve_u_min) / span).clamp(0.0, 1.0);
+            (t * (n - 1) as f32).round() as usize
+        }
+    };
+    let i0 = to_idx(u0);
+    let i1 = to_idx(u1);
+    let forward = i0 <= i1;
+    let (lo, hi) = if forward { (i0, i1) } else { (i1, i0) };
+    if hi <= lo {
+        return;
+    }
+    let segment: Vec<[f32; 2]> = if forward {
+        polyline[lo..=hi].to_vec()
+    } else {
+        polyline[lo..=hi].iter().rev().copied().collect()
+    };
+    let start = if loop_out.is_empty() { 0 } else { 1 };
+    for p in &segment[start..] {
+        loop_out.push(*p);
+    }
+}
+
+/// Standard ray-casting point-in-polygon test (Jordan curve theorem).
+/// The polygon is treated as closed — the implicit edge from the last
+/// vertex back to the first is included so a `curv2` loop that ends on
+/// its starting parameter vertex (the typical spec pattern, e.g.
+/// `curv2 1 2 3 4 1`) is handled correctly. Vertices on the boundary
+/// can resolve either way depending on the epsilon noise of the
+/// rasterised polyline; this is fine for the surface-clip use case
+/// since we keep triangles only when **all three** vertices pass, so a
+/// single ambiguous boundary point can at most lose one cell.
+fn point_in_polygon(point: [f32; 2], polygon: &[[f32; 2]]) -> bool {
+    let n = polygon.len();
+    if n < 3 {
+        return false;
+    }
+    let [px, py] = point;
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let [xi, yi] = polygon[i];
+        let [xj, yj] = polygon[j];
+        let intersect = (yi > py) != (yj > py) && {
+            let denom = yj - yi;
+            if denom.abs() < f32::EPSILON {
+                false
+            } else {
+                px < (xj - xi) * (py - yi) / denom + xi
+            }
+        };
+        if intersect {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
 /// Evaluate every `curv2` entry queued for the current `cstype … end`
 /// block (helper for [`tessellate_curve2`]). A block whose state is
 /// incomplete (missing `cstype`, missing knot vector for B-spline,
@@ -1459,85 +1840,17 @@ fn flush_curve2_block(
             continue;
         }
 
-        // `curv2` carries no inline `u0 u1`; the evaluation range comes
-        // from the block's `parm u` knot vector when present (needed for
-        // the B-spline window clip), otherwise the canonical `[0, 1]`.
-        let (u_min, u_max) = match (parm_u.first(), parm_u.last()) {
-            (Some(&a), Some(&b)) if parm_u.len() >= 2 => (a, b),
-            _ => (0.0, 1.0),
-        };
-
-        let curve_points = match kind {
-            "bezier" | "rat_bezier" => sample_bezier(
-                &control_points,
-                &control_weights,
-                kind,
-                u_min,
-                u_max,
-                samples,
-            ),
-            "bspline" | "rat_bspline" => {
-                let Some(degree) = active_degree else {
-                    continue;
-                };
-                if parm_u.len() != control_points.len() + degree as usize + 1 {
-                    continue;
-                }
-                sample_bspline(
-                    &control_points,
-                    &control_weights,
-                    kind,
-                    degree,
-                    parm_u,
-                    u_min,
-                    u_max,
-                    samples,
-                )
-            }
-            "cardinal" => {
-                if active_degree.is_some_and(|d| d != 3) {
-                    continue;
-                }
-                if control_points.len() < 4 {
-                    continue;
-                }
-                sample_cardinal(&control_points, samples)
-            }
-            "taylor" => {
-                let degree = match active_degree {
-                    Some(d) => d as usize,
-                    None => control_points.len().saturating_sub(1),
-                };
-                if control_points.len() != degree + 1 {
-                    continue;
-                }
-                sample_taylor(&control_points, u_min, u_max, samples)
-            }
-            "bmatrix" => {
-                let Some(degree) = active_degree else {
-                    continue;
-                };
-                let Some(step) = step_u else {
-                    continue;
-                };
-                let Some(n_plus_1) = (degree as usize).checked_add(1) else {
-                    continue;
-                };
-                let Some(expected_bmat) = n_plus_1.checked_mul(n_plus_1) else {
-                    continue;
-                };
-                if bmat_u.len() != expected_bmat {
-                    continue;
-                }
-                if step == 0 {
-                    continue;
-                }
-                if control_points.len() < n_plus_1 {
-                    continue;
-                }
-                sample_bmatrix(&control_points, bmat_u, degree, step, samples)
-            }
-            _ => continue,
+        let Some((u_min, u_max, curve_points)) = evaluate_curv2_entry(
+            kind,
+            active_degree,
+            parm_u,
+            bmat_u,
+            step_u,
+            &control_points,
+            &control_weights,
+            samples,
+        ) else {
+            continue;
         };
         if curve_points.len() < 2 {
             continue;
@@ -1667,6 +1980,14 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
         return out;
     }
 
+    // Pre-resolve every `curv2` directive in the document into a 2D
+    // parameter-space polyline keyed by 1-based source order — spec
+    // §"trim u0 u1 curv2d" / §"hole u0 u1 curv2d" reference these by
+    // global index so the per-surface trim/hole clip pass needs them all
+    // available regardless of which `cstype … end` block originally
+    // declared them.
+    let curv2_polylines = collect_all_curv2_polylines(doc, samples);
+
     // Block state, accumulated between `cstype` … `end`. Like the curve
     // tessellator, a `surf` header is syntactically ahead of the `parm u`
     // / `parm v` body statements that supply the B-spline knot vectors,
@@ -1692,6 +2013,47 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
     let mut step_u: Option<u32> = None;
     let mut step_v: Option<u32> = None;
     let mut pending_surfs: Vec<&Vec<String>> = Vec::new();
+    // Trim / hole loops accumulated for the current surface block —
+    // each is a closed (u, v) polygon assembled from one or more
+    // `(u0, u1, curv2d)` segments. The spec (§"trim", §"hole" /
+    // "Trimming Loops") says: "To cut one or more holes in a region,
+    // use a trim statement followed by one or more hole statements.
+    // To introduce another trimmed region in the same surface, use
+    // another trim statement followed by one or more hole statements."
+    // We therefore keep trims and holes in their source order so the
+    // clip pass can pair holes with their enclosing trim region.
+    let mut pending_trims: Vec<Vec<[f32; 2]>> = Vec::new();
+    let mut pending_holes: Vec<Vec<[f32; 2]>> = Vec::new();
+
+    let resolve_loop = |entry: &Vec<String>| -> Option<Vec<[f32; 2]>> {
+        // `trim u0 u1 curv2d u0 u1 curv2d …` — one or more (u0, u1,
+        // curv2d) triples after the keyword. Build the closed loop by
+        // concatenating each segment in source order.
+        let toks = &entry[1..];
+        if toks.len() < 3 || toks.len() % 3 != 0 {
+            return None;
+        }
+        let mut polygon: Vec<[f32; 2]> = Vec::new();
+        for chunk in toks.chunks(3) {
+            let u0 = chunk[0].parse::<f32>().ok()?;
+            let u1 = chunk[1].parse::<f32>().ok()?;
+            let idx = chunk[2].parse::<i64>().ok()?;
+            // 1-based, positive only (the spec doesn't define a
+            // negative `curv2d` here — those references would predate
+            // the curve being defined and are rejected).
+            if idx <= 0 {
+                return None;
+            }
+            let slot = idx as usize - 1;
+            let entry = curv2_polylines.get(slot).and_then(|e| e.as_ref())?;
+            let (curve_u_min, curve_u_max, polyline) = entry;
+            append_curv2_segment(&mut polygon, polyline, *curve_u_min, *curve_u_max, u0, u1);
+        }
+        if polygon.len() < 3 {
+            return None;
+        }
+        Some(polygon)
+    };
 
     #[allow(clippy::too_many_arguments)]
     let flush = |out: &mut Vec<Primitive>,
@@ -1704,14 +2066,16 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                  bmat_v: &[f32],
                  step_u: Option<u32>,
                  step_v: Option<u32>,
-                 surfs: &[&Vec<String>]| {
+                 surfs: &[&Vec<String>],
+                 trims: &[Vec<[f32; 2]>],
+                 holes: &[Vec<[f32; 2]>]| {
         let Some(kind) = kind else {
             return;
         };
         for entry in surfs {
             if let Some(prim) = flush_surface(
                 doc, kind, deg_u, deg_v, parm_u, parm_v, bmat_u, bmat_v, step_u, step_v, entry,
-                samples,
+                samples, trims, holes,
             ) {
                 out.push(prim);
             }
@@ -1736,8 +2100,12 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     step_u,
                     step_v,
                     &pending_surfs,
+                    &pending_trims,
+                    &pending_holes,
                 );
                 pending_surfs.clear();
+                pending_trims.clear();
+                pending_holes.clear();
                 deg_u = None;
                 deg_v = None;
                 parm_u.clear();
@@ -1833,6 +2201,24 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                 step_v = entry.get(2).and_then(|t| t.parse::<u32>().ok());
             }
             "surf" => pending_surfs.push(entry),
+            // Spec §"trim u0 u1 curv2d u0 u1 curv2d …": outer trimming
+            // loop assembled from one or more curv2 segments. Resolved
+            // here to a closed (u, v) polygon so the eventual
+            // `flush_surface` call can point-in-polygon test each
+            // surface-lattice vertex against it.
+            "trim" => {
+                if let Some(loop_uv) = resolve_loop(entry) {
+                    pending_trims.push(loop_uv);
+                }
+            }
+            // Spec §"hole u0 u1 curv2d u0 u1 curv2d …": inner trimming
+            // loop ("hole"). Same shape as `trim`, but each surface
+            // vertex inside any hole loop is excluded.
+            "hole" => {
+                if let Some(loop_uv) = resolve_loop(entry) {
+                    pending_holes.push(loop_uv);
+                }
+            }
             "end" => {
                 flush(
                     &mut out,
@@ -1846,8 +2232,12 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     step_u,
                     step_v,
                     &pending_surfs,
+                    &pending_trims,
+                    &pending_holes,
                 );
                 pending_surfs.clear();
+                pending_trims.clear();
+                pending_holes.clear();
                 active_kind = None;
                 deg_u = None;
                 deg_v = None;
@@ -1874,6 +2264,8 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
         step_u,
         step_v,
         &pending_surfs,
+        &pending_trims,
+        &pending_holes,
     );
     out
 }
@@ -1897,6 +2289,8 @@ fn flush_surface(
     step_v: Option<u32>,
     entry: &[String],
     samples: u32,
+    trims: &[Vec<[f32; 2]>],
+    holes: &[Vec<[f32; 2]>],
 ) -> Option<Primitive> {
     // `surf s0 s1 t0 t1 v1/vt1/vn1 …` — minimum is the keyword + 4
     // range scalars + at least one control vertex.
@@ -2072,9 +2466,44 @@ fn flush_surface(
         return None;
     }
 
+    // Per-lattice-vertex parameter-space coordinates, only built when
+    // there is at least one trim or hole loop to test against. Each
+    // sample lives at `(s0 + u_frac · (s1 − s0), t0 + v_frac · (t1 − t0))`
+    // — the same uniform sampling the per-`cstype` evaluators above use.
+    // Vertex `(su, sv)` is kept iff it lies inside any trim loop (or
+    // there are no trim loops, in which case "inside the parameter
+    // rectangle" is assumed — spec §"Trimming Loops": "If no trim or
+    // hole statements are specified, then the surface is trimmed at
+    // its parameter range") AND outside every hole loop.
+    let stride = samples as usize + 1;
+    let trimming = !trims.is_empty() || !holes.is_empty();
+    let kept: Vec<bool> = if trimming {
+        let mut k = Vec::with_capacity(stride * stride);
+        let span_s = s1 - s0;
+        let span_t = t1 - t0;
+        for sv in 0..stride {
+            for su in 0..stride {
+                let u_frac = su as f32 / samples as f32;
+                let v_frac = sv as f32 / samples as f32;
+                let u = s0 + u_frac * span_s;
+                let v = t0 + v_frac * span_t;
+                let in_trim = trims.is_empty()
+                    || trims
+                        .iter()
+                        .any(|loop_uv| point_in_polygon([u, v], loop_uv));
+                let in_hole = holes
+                    .iter()
+                    .any(|loop_uv| point_in_polygon([u, v], loop_uv));
+                k.push(in_trim && !in_hole);
+            }
+        }
+        k
+    } else {
+        Vec::new()
+    };
+
     // Build a triangle grid over the (samples + 1) × (samples + 1)
     // sample lattice. Vertex (su, sv) lives at index sv * stride + su.
-    let stride = samples as usize + 1;
     let mut indices: Vec<u32> = Vec::with_capacity((samples as usize) * (samples as usize) * 6);
     for sv in 0..samples as usize {
         for su in 0..samples as usize {
@@ -2082,15 +2511,26 @@ fn flush_surface(
             let i10 = (sv * stride + su + 1) as u32;
             let i01 = ((sv + 1) * stride + su) as u32;
             let i11 = ((sv + 1) * stride + su + 1) as u32;
+            // Conservative clip: drop any triangle whose all three
+            // vertices aren't all kept. This preserves the lattice
+            // resolution near the loop boundary at the cost of a small
+            // jagged edge — sub-cell clipping (which would require
+            // re-meshing the boundary cells against the polygon
+            // boundary) is deferred.
+            let keep = |i: u32| !trimming || kept[i as usize];
             // Two CCW triangles per cell (spec §"surf" note: the front
             // of the surface is the side where u increases to the right
             // and v increases upward).
-            indices.push(i00);
-            indices.push(i10);
-            indices.push(i11);
-            indices.push(i00);
-            indices.push(i11);
-            indices.push(i01);
+            if keep(i00) && keep(i10) && keep(i11) {
+                indices.push(i00);
+                indices.push(i10);
+                indices.push(i11);
+            }
+            if keep(i00) && keep(i11) && keep(i01) {
+                indices.push(i00);
+                indices.push(i11);
+                indices.push(i01);
+            }
         }
     }
 
@@ -2140,6 +2580,24 @@ fn flush_surface(
         "obj:surface_samples".to_string(),
         serde_json::Value::Number(serde_json::Number::from(samples as u64)),
     );
+    if trimming {
+        // Spec §"Trimming Loops" — record how many outer/inner loops
+        // contributed to the clip so downstream consumers (or
+        // round-trip verifiers) can tell the synthetic mesh apart from
+        // an un-clipped one.
+        prim.extras.insert(
+            "obj:surface_trimmed".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        prim.extras.insert(
+            "obj:surface_trim_loops".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(trims.len() as u64)),
+        );
+        prim.extras.insert(
+            "obj:surface_hole_loops".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(holes.len() as u64)),
+        );
+    }
 
     Some(prim)
 }
