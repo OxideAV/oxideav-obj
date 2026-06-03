@@ -457,15 +457,39 @@ primitives carry the shared `obj:tessellated_curve` sentinel plus an
 triples in source order; the encoder filters them out and replays
 the original `cstype` / `surf` / `scrv` / `end` block unchanged
 from `Scene3D::extras["obj:freeform_directives"]`.
+Round 218: multi-patch Bezier `surf` surface decomposition — the same
+`with_curve_tessellation(samples)` knob now also evaluates `surf`
+elements under a `cstype bezier` (or `cstype rat bezier`) header
+whose control mesh spans more than one Bezier patch per parametric
+direction. Spec §"Bezier" gives the per-direction control count as
+`K = degu × (parm_u_count − 1)` (inverting "the number of global
+parameter values given with the parm statement must be K/n + 1"),
+and spec §"Surface vertex data — Control points" lays the global
+control mesh out "as if the surface were a single large patch" with
+adjacent patches sharing their boundary row / column. Each lattice
+sample maps to a global parameter `(u_g, v_g) ∈ [0, patches_u] ×
+[0, patches_v]`; its integer part selects the patch, fractional part
+is the local Bezier parameter `t ∈ [0, 1]` for tensor-product de
+Casteljau on the active `(degu + 1) × (degv + 1)` sub-window. The
+single-patch case (`parm` length 2 per direction, the common form)
+collapses to the legacy single-`sample_bezier_surface` path. The
+rational form blends the per-vertex `w` weights through the same
+sub-window and projects via the weighted denominator. Synthetic
+primitives gain a new `obj:surface_patches = [patches_u, patches_v]`
+provenance extra when either count exceeds 1, so downstream
+consumers can recognise the patch seams inside the otherwise-
+uniform triangle lattice; single-patch surfaces still omit the
+marker. Multi-patch grids whose control count doesn't satisfy the
+spec equality `K = degu × patches_u` stay captured-only, matching
+the existing single-patch mismatch behaviour.
 
-The `.mod` binary form remains out of scope; multi-patch Bezier
-surface decomposition (Bezier carries no `step` stride),
-surface-aware triangulation against `scrv` polylines (the special
-curve must appear as triangle edges per spec §"Special curve"), and
-sub-cell re-meshing of the surface mesh against the `trim` / `hole`
-loop boundaries (round 201 lands a conservative per-triangle clip
-that keeps the boundary jagged at the lattice grain) are the
-remaining gaps.
+The `.mod` binary form remains out of scope; surface-aware
+triangulation against `scrv` polylines (the special curve must
+appear as triangle edges per spec §"Special curve") and sub-cell
+re-meshing of the surface mesh against the `trim` / `hole` loop
+boundaries (round 201 lands a conservative per-triangle clip that
+keeps the boundary jagged at the lattice grain) are the remaining
+gaps.
 
 ## License
 

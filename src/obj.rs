@@ -2534,14 +2534,44 @@ fn flush_surface(
             return None;
         };
         (cols, rows)
-    } else {
-        // Bezier / Taylor: `(degu + 1) × (degv + 1)` control points
-        // per single patch. `checked_add` guards against attacker-
-        // supplied huge degree values (e.g. `deg 111111`) whose `+1`
-        // would still fit in `usize` but whose product blows past
-        // available memory in the `Vec::with_capacity(expected)`
+    } else if taylor {
+        // Taylor: `(degu + 1) × (degv + 1)` polynomial coefficients per
+        // single patch (spec §"Taylor"). `checked_add` guards against
+        // attacker-supplied huge degree values (e.g. `deg 111111`)
+        // whose `+1` would still fit in `usize` but whose product
+        // blows past available memory in the `Vec::with_capacity`
         // below.
         (du.checked_add(1)?, dv.checked_add(1)?)
+    } else {
+        // Bezier / rat_bezier — spec §"Bezier": "the number of global
+        // parameter values given with the parm statement must be
+        // K/n + 1, where K is the number of control points. For
+        // surfaces, this requirement applies independently for the u
+        // and v parametric directions." Inverting that:
+        // `K = degu × (parm_u_count − 1)`, with adjacent patches
+        // sharing their boundary control points (spec §"Surface
+        // vertex data — Control points": "For surfaces made up of
+        // many patches, …, the control points are ordered as if the
+        // surface were a single large patch"), so the total
+        // per-direction grid extent is `K + 1 = degu × patches_u + 1`
+        // where `patches_u = parm_u_count − 1`. The single-patch case
+        // (`parm u v0 v1`) collapses to the canonical
+        // `(degu + 1) × (degv + 1)`. When the `parm` directive is
+        // missing entirely (some loaders elide it for the default
+        // single-patch case), fall back to the single-patch grid.
+        let patches_u = if parm_u.len() >= 2 {
+            parm_u.len() - 1
+        } else {
+            1
+        };
+        let patches_v = if parm_v.len() >= 2 {
+            parm_v.len() - 1
+        } else {
+            1
+        };
+        let cols = du.checked_mul(patches_u)?.checked_add(1)?;
+        let rows = dv.checked_mul(patches_v)?.checked_add(1)?;
+        (cols, rows)
     };
     // Cap the expected control-grid size: a single `surf` line carries
     // `entry.len() - 5` control-vertex tokens, so any `expected` that
@@ -2604,7 +2634,16 @@ fn flush_surface(
             &grid, bmat_u, bmat_v, du as u32, dv as u32, su, sv, cols, rows, samples,
         )
     } else {
-        sample_bezier_surface(&grid, &weights, kind, cols, rows, samples)
+        // Bezier: walk the `patches_u × patches_v` patch grid (each
+        // patch is `(du + 1) × (dv + 1)` control points, with adjacent
+        // patches sharing their boundary column / row). Single-patch
+        // inputs (the common case) route through the same loop with a
+        // 1×1 patch grid, matching the legacy behaviour.
+        let patches_u = cols.saturating_sub(1).checked_div(du).unwrap_or(1).max(1);
+        let patches_v = rows.saturating_sub(1).checked_div(dv).unwrap_or(1).max(1);
+        sample_bezier_surface_multipatch(
+            &grid, &weights, kind, cols, rows, du, dv, patches_u, patches_v, samples,
+        )
     };
     if positions.is_empty() {
         return None;
@@ -2724,6 +2763,26 @@ fn flush_surface(
         "obj:surface_samples".to_string(),
         serde_json::Value::Number(serde_json::Number::from(samples as u64)),
     );
+    // Spec §"Bezier" multi-patch decomposition — when the synthesised
+    // grid contains more than one patch per direction, surface the
+    // per-direction patch count so downstream consumers can recognise
+    // the boundary structure inside the otherwise-uniform triangle
+    // lattice. Other `cstype` paths already encode their segment count
+    // through their own provenance (B-spline knot vector, basis-matrix
+    // step), so the marker is Bezier-specific.
+    if matches!(kind, "bezier" | "rat_bezier") && du > 0 && dv > 0 {
+        let patches_u = (cols.saturating_sub(1)) / du;
+        let patches_v = (rows.saturating_sub(1)) / dv;
+        if patches_u > 1 || patches_v > 1 {
+            prim.extras.insert(
+                "obj:surface_patches".to_string(),
+                serde_json::Value::Array(vec![
+                    serde_json::Value::from(patches_u as u64),
+                    serde_json::Value::from(patches_v as u64),
+                ]),
+            );
+        }
+    }
     if trimming {
         // Spec §"Trimming Loops" — record how many outer/inner loops
         // contributed to the clip so downstream consumers (or
@@ -2811,6 +2870,145 @@ fn sample_bezier_surface(
             }
             // Outer pass: de Casteljau in v over the collapsed points.
             let pt = de_casteljau_4d(&col_pts, v);
+            let [x, y, z, w] = pt;
+            if rational && w.abs() > f32::EPSILON {
+                out.push([x / w, y / w, z / w]);
+            } else {
+                out.push([x, y, z]);
+            }
+        }
+    }
+    out
+}
+
+/// Evaluate a multi-patch Bezier (or rational-Bezier) surface at a
+/// `(samples + 1) × (samples + 1)` lattice over the global parameter
+/// rectangle.
+///
+/// Spec §"Bezier" gives the per-direction control count as
+/// `K = degu × patches_u` (with `parm_u_count = K/degu + 1 = patches_u + 1`),
+/// and §"Surface vertex data — Control points" arranges the global
+/// control mesh "as if the surface were a single large patch" with
+/// adjacent patches sharing their boundary control row / column. The
+/// total per-direction grid extent is therefore `cols = degu × patches_u + 1`
+/// (and `rows = degv × patches_v + 1`), with patch `(pu, pv)` owning the
+/// `(degu + 1) × (degv + 1)` sub-window starting at
+/// `(pu × degu, pv × degv)`.
+///
+/// Each global lattice sample `(su, sv)` maps to a global parameter
+/// `(u_g, v_g) ∈ [0, patches_u] × [0, patches_v]`; its integer part
+/// selects the patch, fractional part is the local Bezier parameter
+/// `t ∈ [0, 1]` for tensor-product de Casteljau (delegated to
+/// [`sample_bezier_surface`] on a freshly-windowed sub-grid). The single-
+/// patch case (`patches_u = patches_v = 1`) collapses to the legacy
+/// behaviour: one lattice over the whole grid, one de Casteljau pass per
+/// sample.
+///
+/// Output vertices are ordered row-major in the sample lattice: sample
+/// `(su, sv)` lands at index `sv × (samples + 1) + su`.
+#[allow(clippy::too_many_arguments)]
+fn sample_bezier_surface_multipatch(
+    grid: &[[f32; 3]],
+    weights: &[f32],
+    kind: &str,
+    cols: usize,
+    rows: usize,
+    deg_u: usize,
+    deg_v: usize,
+    patches_u: usize,
+    patches_v: usize,
+    samples: u32,
+) -> Vec<[f32; 3]> {
+    if samples == 0
+        || cols == 0
+        || rows == 0
+        || deg_u == 0
+        || deg_v == 0
+        || patches_u == 0
+        || patches_v == 0
+        || grid.len() != cols * rows
+        || weights.len() != grid.len()
+    {
+        return Vec::new();
+    }
+    // Single-patch fast path: identical to the original
+    // `sample_bezier_surface` traversal.
+    if patches_u == 1 && patches_v == 1 {
+        return sample_bezier_surface(grid, weights, kind, cols, rows, samples);
+    }
+    let rational = kind == "rat_bezier";
+    let homo: Vec<[f32; 4]> = grid
+        .iter()
+        .zip(weights.iter())
+        .map(|(p, w)| {
+            let weight = if rational { *w } else { 1.0 };
+            [p[0] * weight, p[1] * weight, p[2] * weight, weight]
+        })
+        .collect();
+
+    let n = samples as usize + 1;
+    let patch_cols = deg_u + 1;
+    let patch_rows = deg_v + 1;
+    let mut out: Vec<[f32; 3]> = Vec::with_capacity(n * n);
+
+    // Pre-allocated scratch buffers reused per sample.
+    let mut sub_window: Vec<[f32; 4]> = Vec::with_capacity(patch_cols * patch_rows);
+    let mut col_pts: Vec<[f32; 4]> = Vec::with_capacity(patch_rows);
+
+    for sv in 0..n {
+        // Global v ∈ [0, patches_v]: integer part = v-patch index,
+        // fractional part = local Bezier parameter t_v ∈ [0, 1].
+        let v_global = if n == 1 {
+            0.0
+        } else {
+            sv as f32 * (patches_v as f32) / (n - 1) as f32
+        };
+        let mut pv = v_global.floor() as isize;
+        if pv < 0 {
+            pv = 0;
+        }
+        if pv as usize >= patches_v {
+            pv = patches_v as isize - 1;
+        }
+        let pv = pv as usize;
+        let t_v = (v_global - pv as f32).clamp(0.0, 1.0);
+
+        for su in 0..n {
+            let u_global = if n == 1 {
+                0.0
+            } else {
+                su as f32 * (patches_u as f32) / (n - 1) as f32
+            };
+            let mut pu = u_global.floor() as isize;
+            if pu < 0 {
+                pu = 0;
+            }
+            if pu as usize >= patches_u {
+                pu = patches_u as isize - 1;
+            }
+            let pu = pu as usize;
+            let t_u = (u_global - pu as f32).clamp(0.0, 1.0);
+
+            // Copy the active patch's `(deg_u + 1) × (deg_v + 1)`
+            // homogeneous sub-grid. Spec §"Surface vertex data —
+            // Control points": the active patch starts at
+            // `(pu · deg_u, pv · deg_v)` and ends at
+            // `(pu · deg_u + deg_u, pv · deg_v + deg_v)` inclusive,
+            // sharing its boundary with neighbouring patches.
+            sub_window.clear();
+            let base_u = pu * deg_u;
+            let base_v = pv * deg_v;
+            for j in 0..patch_rows {
+                let row_start = (base_v + j) * cols + base_u;
+                sub_window.extend_from_slice(&homo[row_start..row_start + patch_cols]);
+            }
+
+            col_pts.clear();
+            for r in 0..patch_rows {
+                let row = &sub_window[r * patch_cols..(r + 1) * patch_cols];
+                col_pts.push(de_casteljau_4d(row, t_u));
+            }
+            let pt = de_casteljau_4d(&col_pts, t_v);
             let [x, y, z, w] = pt;
             if rational && w.abs() > f32::EPSILON {
                 out.push([x / w, y / w, z / w]);

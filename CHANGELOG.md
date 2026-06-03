@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 218: multi-patch Bezier `surf` surface decomposition. Under
+  `ObjDecoder::with_curve_tessellation(samples: u32)`, every
+  `cstype bezier` / `cstype rat bezier` `surf` whose control mesh
+  spans more than one Bezier patch per parametric direction is now
+  decomposed into per-patch tensor-product de Casteljau evaluations
+  on the active `(degu + 1) × (degv + 1)` sub-window of a shared-
+  boundary global control mesh (spec §"Bezier" `K/n + 1 = parm_count`
+  inverse formula plus §"Surface vertex data — Control points":
+  "the control points are ordered as if the surface were a single
+  large patch"). Each global lattice sample maps to
+  `(u_global, v_global) ∈ [0, patches_u] × [0, patches_v]`; the
+  integer part selects the active patch, the fractional part is the
+  local `t ∈ [0, 1]` Bezier parameter. The rational form blends the
+  per-vertex `w` weights through the sub-window and projects via the
+  weighted denominator. Single-patch surfaces (the common case)
+  still route through the legacy single-de-Casteljau path. Synthetic
+  primitives gain a new `obj:surface_patches = [patches_u, patches_v]`
+  provenance extra when either count exceeds 1; single-patch
+  surfaces omit the marker. Multi-patch grids whose control count
+  doesn't satisfy the spec equality `K = degu × patches_u` per
+  direction stay captured-only.
+
 - Round 212: MTL illumination model property decomposition. For every
   in-spec `illum` directive (models 0–10 per Wavefront MTL spec
   §"illum illum_#" summary table and the §"Illumination models" p.5-30
