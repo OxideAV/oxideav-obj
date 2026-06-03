@@ -139,16 +139,30 @@ struct ObjDoc {
     meshes: Vec<MeshAccum>,
     /// Verbatim sequence of free-form-geometry directives (`cstype`,
     /// `deg`, `curv`, `surf`, `parm`, `trim`, `hole`, `scrv`, `sp`,
-    /// `end`, `bzp`, plus the older `bsp`). Each entry is the keyword
-    /// followed by its whitespace-separated arguments. Round-trip
-    /// preservation: the encoder replays the sequence verbatim after
-    /// the polygonal section so consumers can carry free-form data
+    /// `end`, `bzp`, the older `bsp`, plus the curve / surface
+    /// approximation-technique directives `ctech` / `stech`). Each entry
+    /// is the keyword followed by its whitespace-separated arguments.
+    /// Round-trip preservation: the encoder replays the sequence verbatim
+    /// after the polygonal section so consumers can carry free-form data
     /// through us without semantic loss. Body statements (`parm`,
     /// `trim`, `hole`, `scrv`, `sp`, `end`) are accepted in document
     /// order; the spec mandates they appear between an element start
     /// (`curv` / `surf`) and `end`, but we don't enforce that — a
     /// lenient loader pattern matches what tools in the wild emit.
     freeform_directives: Vec<Vec<String>>,
+    /// Shadow-casting object filename from a `shadow_obj filename`
+    /// directive (spec §"shadow_obj filename"). Top-level state: the
+    /// spec states "Only one shadow object can be stored in a file. If
+    /// more than one shadow object is specified, the last one specified
+    /// will be used." `None` if no directive appeared. Round-trip path:
+    /// surfaced through `Scene3D::extras["obj:shadow_obj"]` and re-emitted
+    /// before the polygonal section.
+    shadow_obj: Option<String>,
+    /// Ray-tracing reflection object filename from a `trace_obj filename`
+    /// directive (spec §"trace_obj filename"). Mirrors `shadow_obj` —
+    /// last-wins semantics per spec, surfaced through
+    /// `Scene3D::extras["obj:trace_obj"]`.
+    trace_obj: Option<String>,
 }
 
 /// Glue line-continuation (`\\` + newline) before line splitting and
@@ -329,7 +343,7 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 doc.vp.push([u, v, w]);
             }
             "cstype" | "deg" | "curv" | "curv2" | "surf" | "parm" | "trim" | "hole" | "scrv"
-            | "sp" | "end" | "bzp" | "bsp" | "bmat" | "step" => {
+            | "sp" | "end" | "bzp" | "bsp" | "bmat" | "step" | "ctech" | "stech" => {
                 // Free-form geometry directives. Captured verbatim as
                 // a `(keyword, args)` sequence on the document so the
                 // encoder can replay them after the polygonal section.
@@ -340,13 +354,43 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 // §"Specifying free-form curves/surfaces" /
                 // §"Free-form curve/surface body statements" /
                 // §"Superseded statements (bzp / bsp)" /
-                // §"bmat u/v matrix" + §"step stepu stepv".
+                // §"bmat u/v matrix" + §"step stepu stepv" /
+                // §"ctech technique resolution" (cparm / cspace / curv
+                // forms) + §"stech technique resolution" (cparma /
+                // cparmb / cspace / curv forms) — both classified as
+                // free-form geometry statements by the spec and
+                // captured verbatim in source order alongside the
+                // structural directives so the round-trip preserves
+                // the per-block approximation hints.
                 let mut entry: Vec<String> = Vec::new();
                 entry.push(keyword.to_string());
                 for tok in tokens {
                     entry.push(tok.to_string());
                 }
                 doc.freeform_directives.push(entry);
+            }
+            "shadow_obj" => {
+                // Spec §"shadow_obj filename": top-level last-wins
+                // shadow-caster filename. The spec note ("If more than
+                // one shadow object is specified, the last one
+                // specified will be used.") makes the multi-line
+                // collapse behaviour mandatory; we honour it directly
+                // rather than carrying the discarded earlier entries.
+                let v: String = tokens.collect::<Vec<_>>().join(" ");
+                if !v.is_empty() {
+                    doc.shadow_obj = Some(v);
+                }
+            }
+            "trace_obj" => {
+                // Spec §"trace_obj filename": top-level last-wins ray-
+                // tracing reflection-target filename. Same last-wins
+                // semantics as `shadow_obj`; reuses the same join +
+                // last-write-wins pattern so quoted spaces (if any) in
+                // the filename survive the tokenisation.
+                let v: String = tokens.collect::<Vec<_>>().join(" ");
+                if !v.is_empty() {
+                    doc.trace_obj = Some(v);
+                }
             }
             "f" => {
                 let n_pos = doc.positions.len() as i64;
@@ -775,6 +819,22 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         scene.extras.insert(
             "obj:freeform_directives".to_string(),
             serde_json::to_value(&doc.freeform_directives).unwrap(),
+        );
+    }
+
+    // Spec §"shadow_obj filename" / §"trace_obj filename": top-level
+    // last-wins state. Surfaced as plain strings so the encoder can
+    // replay them in the preamble (before the polygonal section).
+    if let Some(name) = &doc.shadow_obj {
+        scene.extras.insert(
+            "obj:shadow_obj".to_string(),
+            serde_json::Value::String(name.clone()),
+        );
+    }
+    if let Some(name) = &doc.trace_obj {
+        scene.extras.insert(
+            "obj:trace_obj".to_string(),
+            serde_json::Value::String(name.clone()),
         );
     }
 
@@ -4731,6 +4791,24 @@ pub fn serialize_obj_with_options(
                     writeln!(out, "mtllib {s}").unwrap();
                 }
             }
+        }
+    }
+
+    // Spec §"shadow_obj filename" / §"trace_obj filename": top-level
+    // directives that nominate companion files for shadow casting and
+    // ray-traced reflections. The spec is silent on placement but the
+    // worked examples in §"Examples" (cases 2 and 3) put them between
+    // `mtllib` and the vertex pool, so we mirror that. `Scene3D::extras`
+    // carries plain strings populated by the decoder; absent keys leave
+    // the preamble unchanged.
+    if let Some(serde_json::Value::String(name)) = scene.extras.get("obj:shadow_obj") {
+        if !name.is_empty() {
+            writeln!(out, "shadow_obj {name}").unwrap();
+        }
+    }
+    if let Some(serde_json::Value::String(name)) = scene.extras.get("obj:trace_obj") {
+        if !name.is_empty() {
+            writeln!(out, "trace_obj {name}").unwrap();
         }
     }
 

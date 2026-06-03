@@ -483,6 +483,30 @@ marker. Multi-patch grids whose control count doesn't satisfy the
 spec equality `K = degu × patches_u` stay captured-only, matching
 the existing single-patch mismatch behaviour.
 
+Round 223: approximation-technique directives + companion-object
+references — four previously-dropped spec-defined directives now
+round-trip. `ctech technique resolution` (spec §"ctech technique
+resolution", three forms `cparm res` / `cspace maxlength` /
+`curv maxdist maxangle`) and `stech technique resolution` (spec
+§"stech technique resolution", four forms `cparma ures vres` /
+`cparmb uvres` / `cspace maxlength` / `curv maxdist maxangle`) are
+captured into the same `Scene3D::extras["obj:freeform_directives"]`
+verbatim-replay channel as the existing free-form curve/surface
+attributes; the encoder emits them inside the original `cstype` /
+`deg` / `parm` / `end` block they were sourced from, preserving
+source order. `shadow_obj filename` (spec §"shadow_obj filename") and
+`trace_obj filename` (spec §"trace_obj filename") surface as plain
+strings on `Scene3D::extras["obj:shadow_obj"]` /
+`Scene3D::extras["obj:trace_obj"]` with per-spec last-wins collapse
+("Only one shadow object can be stored in a file. If more than one
+shadow object is specified, the last one specified will be used.")
+and re-emit in the preamble right after the `mtllib` block, matching
+the placement in the spec §"Examples" cases 2 and 3. Empty filenames
+on either companion directive are dropped at parse time. No semantic
+interpretation of the technique parameters — the tessellator's
+`with_curve_tessellation(samples)` knob still controls sample counts
+independently.
+
 The `.mod` binary form remains out of scope; surface-aware
 triangulation against `scrv` polylines (the special curve must
 appear as triangle edges per spec §"Special curve") and sub-cell

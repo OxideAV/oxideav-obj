@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 223: approximation-technique directives and companion-object
+  references. Four spec-defined directives that were previously dropped
+  on read now round-trip cleanly:
+  * `ctech technique resolution` (spec §"ctech technique resolution")
+    — three forms `cparm res` (constant parametric subdivision),
+    `cspace maxlength` (constant spatial subdivision), and
+    `curv maxdist maxangle` (curvature-dependent subdivision). All
+    three ride the existing
+    `Scene3D::extras["obj:freeform_directives"]` verbatim-capture
+    channel alongside the other free-form curve/surface attributes.
+  * `stech technique resolution` (spec §"stech technique resolution")
+    — four forms `cparma ures vres`, `cparmb uvres`,
+    `cspace maxlength`, and `curv maxdist maxangle`. Captured into
+    the same free-form directive sequence.
+  * `shadow_obj filename` (spec §"shadow_obj filename") — top-level
+    last-wins shadow-caster companion file ("Only one shadow object
+    can be stored in a file. If more than one shadow object is
+    specified, the last one specified will be used."). Surfaces as
+    a plain string on `Scene3D::extras["obj:shadow_obj"]`.
+  * `trace_obj filename` (spec §"trace_obj filename") — top-level
+    last-wins ray-tracing reflection-target companion file (same
+    last-wins semantics as `shadow_obj`). Surfaces as a plain string
+    on `Scene3D::extras["obj:trace_obj"]`.
+
+  The encoder replays the captured `ctech` / `stech` lines verbatim
+  after the polygonal section (next to the existing `cstype` / `deg`
+  / `parm` / `end` block they accompany), and writes the surviving
+  `shadow_obj` / `trace_obj` lines in the file preamble right after
+  the `mtllib` references (matching the placement in the worked
+  examples under spec §"Examples", cases 2 and 3). Empty filenames
+  on either companion directive are dropped at parse time, mirroring
+  the lenient-loader behaviour already applied to `mg` / `s` / `g`.
+  Captured-then-replayed only — no semantic interpretation of the
+  technique parameters, so the tessellator's existing
+  `with_curve_tessellation(samples)` knob continues to control sample
+  counts independently. New test suite `approximation_and_companions`
+  covers all three `ctech` forms, all four `stech` forms,
+  `shadow_obj` / `trace_obj` round-trip and placement, multi-line
+  last-wins collapse, empty-filename rejection, and a directive
+  declared outside any `cstype` block.
+
 - Round 218: multi-patch Bezier `surf` surface decomposition. Under
   `ObjDecoder::with_curve_tessellation(samples: u32)`, every
   `cstype bezier` / `cstype rat bezier` `surf` whose control mesh
