@@ -83,6 +83,18 @@ The companion **MTL** parser/serialiser handles:
   variant is detected and re-emitted via
   `Material::extras["mtl:d_halo_factor"]`.
 - Index of refraction (`Ni`) and illumination model (`illum`) → extras.
+  The raw `illum` integer lands in `Material::extras["mtl:illum"]`
+  unchanged; for in-spec models 0–10, the parser additionally surfaces
+  the spec's per-model "Properties that are turned on in the Property
+  Editor" summary table (Wavefront MTL spec §"illum illum_#") as a
+  decomposed object in `Material::extras["mtl:illum_props"]` with the
+  nine stable flag keys `color` / `ambient` / `highlight` /
+  `reflection` / `ray_trace` / `transparency_glass` /
+  `transparency_refraction` / `fresnel` /
+  `casts_shadow_on_invisible`. Out-of-spec integers (negative or
+  `> 10`) keep the raw integer but omit `mtl:illum_props`. The
+  decomposition is parse-time-only; the encoder still emits exactly
+  one `illum N` line per material.
 - Transmission filter — three mutually-exclusive forms per spec:
   `Tf r g b` (with `g`/`b` defaulting to `r`),
   `Tf spectral file.rfl factor` → `Material::extras["mtl:Tf:spectral"]`,

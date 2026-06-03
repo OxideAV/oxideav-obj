@@ -396,6 +396,18 @@ fn apply_directive(
                 .map_err(|e| Error::invalid(format!("illum: bad integer ({e})")))?;
             mat.extras
                 .insert("mtl:illum".to_string(), serde_json::json!(v));
+            // Surface the spec's per-model property breakdown alongside
+            // the raw integer so consumers can branch on shading flags
+            // without re-deriving the table. Spec §"illum illum_#"
+            // (Wavefront Advanced Visualizer manual p.5-30, summary
+            // table) enumerates which lighting terms each model turns
+            // on; we mirror that table verbatim into `mtl:illum_props`.
+            // For values outside 0..=10 (out-of-spec) we still record
+            // the integer but emit a null props object so downstream
+            // can tell "unknown model" from "model 0 with no flags".
+            if let Some(props) = illum_property_map(v) {
+                mat.extras.insert("mtl:illum_props".to_string(), props);
+            }
         }
         "Pr" => {
             let v: f32 = tokens
@@ -700,6 +712,89 @@ fn parse_map_with_options(
     filename
 }
 
+/// Decompose an `illum` integer into the spec's property table.
+///
+/// The Wavefront MTL spec §"illum illum_#" summarises each model
+/// (0..=10) as a small set of shading-property flags ("Color on /
+/// Ambient on / Highlight on / Reflection on / Ray trace on /
+/// Transparency: Glass on / Transparency: Refraction on /
+/// Reflection: Fresnel on / Casts shadows onto invisible surfaces").
+/// This routine mirrors that table verbatim so consumers can
+/// introspect a material's shading intent without re-deriving it.
+///
+/// The returned [`serde_json::Value`] is always an object with **all**
+/// boolean flag keys present, set `true` or `false` per the spec
+/// table, so callers can safely `.get(key).and_then(as_bool)` without
+/// distinguishing "key missing" from "explicitly false". Values
+/// outside `0..=10` return `None` (the raw integer still lands in
+/// `mtl:illum`).
+///
+/// Flag keys (stable, lowercase, underscore-separated):
+///
+/// * `color` — true for models 0–9 (model 10 is a shadowmatte, no
+///   colour). Per spec, every non-shadowmatte model emits Kd-driven
+///   colour.
+/// * `ambient` — true for models 1–9 (model 0 is "Color on and
+///   Ambient *off*"; model 10 has no shading at all).
+/// * `highlight` — true for models with a specular term (2–9).
+/// * `reflection` — true when the model includes a reflection term
+///   (3, 4, 5, 6, 7, 8, 9).
+/// * `ray_trace` — true when the spec table says "Ray trace on"
+///   (3, 4, 5, 6, 7); models 8 and 9 explicitly say "Ray trace off".
+/// * `transparency_glass` — true for models 4 and 9 ("Transparency:
+///   Glass on" per spec).
+/// * `transparency_refraction` — true for models 6 and 7
+///   ("Transparency: Refraction on" per spec).
+/// * `fresnel` — true for models 5 and 7 ("Reflection: Fresnel on");
+///   explicitly false for 6 ("Reflection: Fresnel off"). Other
+///   models leave Fresnel unmentioned and the flag is false.
+/// * `casts_shadow_on_invisible` — true only for model 10
+///   ("Casts shadows onto invisible surfaces").
+fn illum_property_map(n: i32) -> Option<serde_json::Value> {
+    if !(0..=10).contains(&n) {
+        return None;
+    }
+    // Spec table from p.5-30, mirrored verbatim per row:
+    //   0   Color on and Ambient off
+    //   1   Color on and Ambient on
+    //   2   Highlight on
+    //   3   Reflection on and Ray trace on
+    //   4   Transparency: Glass on; Reflection: Ray trace on
+    //   5   Reflection: Fresnel on and Ray trace on
+    //   6   Transparency: Refraction on; Reflection: Fresnel off, Ray trace on
+    //   7   Transparency: Refraction on; Reflection: Fresnel on, Ray trace on
+    //   8   Reflection on and Ray trace off
+    //   9   Transparency: Glass on; Reflection: Ray trace off
+    //   10  Casts shadows onto invisible surfaces
+    //
+    // Model 2's spec row ("Highlight on") doesn't restate "Color on /
+    // Ambient on" because those carry over from model 1; models 3..=9
+    // similarly inherit the diffuse+ambient base by virtue of starting
+    // from model 2's equation. We surface that inheritance explicitly:
+    // every non-shadowmatte (0..=9) gets `color = true`, and every
+    // shaded non-flat model (1..=9) gets `ambient = true`.
+    let color = (0..=9).contains(&n);
+    let ambient = (1..=9).contains(&n);
+    let highlight = (2..=9).contains(&n);
+    let reflection = matches!(n, 3..=9);
+    let ray_trace = matches!(n, 3..=7);
+    let transparency_glass = matches!(n, 4 | 9);
+    let transparency_refraction = matches!(n, 6 | 7);
+    let fresnel = matches!(n, 5 | 7);
+    let casts_shadow_on_invisible = n == 10;
+    Some(serde_json::json!({
+        "color": color,
+        "ambient": ambient,
+        "highlight": highlight,
+        "reflection": reflection,
+        "ray_trace": ray_trace,
+        "transparency_glass": transparency_glass,
+        "transparency_refraction": transparency_refraction,
+        "fresnel": fresnel,
+        "casts_shadow_on_invisible": casts_shadow_on_invisible,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Serialisation
 // ---------------------------------------------------------------------------
@@ -933,6 +1028,7 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
                 | "mtl:Ns"
                 | "mtl:Ni"
                 | "mtl:illum"
+                | "mtl:illum_props"
                 | "mtl:Pc"
                 | "mtl:Ps"
                 | "mtl:Tf"

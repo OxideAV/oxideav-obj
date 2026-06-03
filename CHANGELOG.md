@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 212: MTL illumination model property decomposition. For every
+  in-spec `illum` directive (models 0–10 per Wavefront MTL spec
+  §"illum illum_#" summary table and the §"Illumination models" p.5-30
+  long-form equations), the parser now surfaces the spec's "Properties
+  that are turned on in the Property Editor" table alongside the raw
+  integer, so consumers can branch on shading flags without
+  re-deriving the table. The decomposition lands at
+  `Material::extras["mtl:illum_props"]` as a JSON object with nine
+  stable boolean keys: `color` (true for models 0–9, spec §"Color
+  on …" entries), `ambient` (true for 1–9, spec §"Ambient on"),
+  `highlight` (true for 2–9, spec §"Highlight on" carried through
+  models 3+ which inherit Blinn-Phong via the §"Illumination models"
+  formulas), `reflection` (true for 3–9, spec §"Reflection on"),
+  `ray_trace` (true for 3–7; spec §"Ray trace off" explicitly turns
+  it off for 8 and 9), `transparency_glass` (true for 4 and 9, spec
+  §"Transparency: Glass on"), `transparency_refraction` (true for 6
+  and 7, spec §"Transparency: Refraction on"), `fresnel` (true for 5
+  and 7, spec §"Reflection: Fresnel on"; explicitly false for 6 per
+  spec §"Reflection: Fresnel off"), and `casts_shadow_on_invisible`
+  (true only for model 10 per spec §"Casts shadows onto invisible
+  surfaces"). Out-of-spec `illum` integers (negative or `> 10`) still
+  land in `mtl:illum` so the round-trip stays lossless, but
+  `mtl:illum_props` is omitted (no spec row to mirror). The
+  decomposition is parse-time-only — the encoder filters
+  `mtl:illum_props` from the directive emit pass so re-serialising a
+  parsed material still produces exactly one `illum N` line, matching
+  the original byte sequence.
+
 - Round 206: special-curve (`scrv`) tessellation. Under
   `ObjDecoder::with_curve_tessellation(samples: u32)`, every `scrv`
   directive inside a `cstype … end` block (spec §"Special curve",
