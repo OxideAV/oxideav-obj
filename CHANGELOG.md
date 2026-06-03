@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 229: connectivity (`con`) + general-statement (`call` / `csh`)
+  round-trip. Three previously-dropped spec-defined directives now
+  survive a decode → encode cycle verbatim:
+  * `con surf_1 q0_1 q1_1 curv2d_1 surf_2 q0_2 q1_2 curv2d_2` (spec
+    §"Connectivity between free-form surfaces", §"con surf_1 q0_1
+    q1_1 curv2d_1 surf_2 q0_2 q1_2 curv2d_2") — a top-level free-form
+    geometry statement that ties two previously-declared `surf`
+    blocks together along a shared trimming-curve segment for edge
+    merging. Captured into the existing
+    `Scene3D::extras["obj:freeform_directives"]` verbatim-replay
+    channel; the encoder emits it in source order alongside the
+    other free-form geometry directives (the worked example in spec
+    §"Connectivity between free-form surfaces" §"Example 1" places
+    `con` after the last referenced surface's `end`, which the
+    captured-sequence ordering preserves).
+  * `call filename.ext arg1 arg2 …` (spec §"General statement",
+    §"call filename.ext arg1 arg2 …") — inline include of a sibling
+    `.obj` / `.mod` file with positional argument substitution.
+    Captured-only; the parser does NOT recursively resolve the
+    referenced file (would require IO + nested-call depth tracking
+    outside the clean-room parser's scope). Consumers can re-resolve
+    against the captured filename + arg vector themselves.
+  * `csh command` / `csh -command` (spec §"General statement",
+    §"csh command") — shell-execute a UNIX command, with a leading
+    `-` flagging "ignore error on non-zero exit". Captured-only; the
+    parser deliberately does NOT execute the captured command
+    (sandbox-escape trapdoor for any consumer that round-trips
+    untrusted OBJ input). The leading-dash failure-tolerant variant
+    is preserved verbatim through the round-trip so the semantic
+    distinction doesn't get silently inverted.
+
+  Both general statements land on a new
+  `Scene3D::extras["obj:general_directives"]` side-channel array of
+  `[keyword, arg1, arg2, …]` entries in document order; the encoder
+  replays them at the top of the preamble (right after the `mtllib`
+  and `shadow_obj` / `trace_obj` companion-file block). Source-line
+  position relative to the polygonal section is NOT preserved by
+  design — the spec is silent on placement ("The call statement can
+  be inserted into .obj files using a text editor"). Empty inputs
+  (no `call` / `csh` lines) leave the extras unchanged.
+
+  Test coverage in the new `connectivity_and_general` suite (12
+  tests): all eight `con` positional arguments captured, source-order
+  preservation across the polygonal / free-form boundary,
+  negative-index `con` survival, `call` with and without positional
+  args, `csh` with and without the leading-dash failure-tolerant
+  flag, observable-side-effect probe confirming the parser does NOT
+  exec the captured shell command, combined-mixed-input round-trip
+  through the trait surface, absent-key omission for sources with no
+  general statements, and bare-keyword `csh` line acceptance.
+
 - Round 223: approximation-technique directives and companion-object
   references. Four spec-defined directives that were previously dropped
   on read now round-trip cleanly:

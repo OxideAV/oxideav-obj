@@ -485,7 +485,36 @@ the existing single-patch mismatch behaviour.
 
 Round 223: approximation-technique directives + companion-object
 references — four previously-dropped spec-defined directives now
-round-trip. `ctech technique resolution` (spec §"ctech technique
+round-trip.
+
+Round 229: connectivity (`con`) + general-statement (`call` / `csh`)
+round-trip — three more previously-dropped spec-defined directives now
+survive a decode → encode cycle verbatim.
+`con surf_1 q0_1 q1_1 curv2d_1 surf_2 q0_2 q1_2 curv2d_2` (spec
+§"Connectivity between free-form surfaces", §"con surf_1 q0_1 q1_1
+curv2d_1 surf_2 q0_2 q1_2 curv2d_2") is a top-level free-form geometry
+statement that ties two previously-declared `surf` blocks together
+along a shared trimming-curve segment for edge merging; captured into
+the existing `Scene3D::extras["obj:freeform_directives"]` verbatim-
+replay channel alongside the other free-form geometry directives so
+its source-order position relative to the `surf` blocks it references
+is preserved. `call filename.ext arg1 arg2 …` (spec §"General
+statement", §"call filename.ext arg1 arg2 …") is the inline include
+of a sibling `.obj` / `.mod` file with positional argument substitution
+and `csh command` / `csh -command` (spec §"General statement", §"csh
+command") is the shell-execute directive (leading `-` flagging "ignore
+error on non-zero exit"). Both general statements are captured-only
+into a new `Scene3D::extras["obj:general_directives"]` side-channel
+array of `[keyword, arg1, …]` entries in document order; the encoder
+replays them at the top of the preamble right after the
+`shadow_obj` / `trace_obj` companion-file block. Source-line position
+relative to the polygonal section is NOT preserved by design (the
+spec is silent on placement — "The call statement can be inserted
+into .obj files using a text editor"). The parser deliberately does
+NOT recursively resolve `call` (would require IO + nested-call depth
+tracking outside the clean-room parser's scope) nor execute `csh`
+(sandbox-escape trapdoor for any consumer that round-trips untrusted
+OBJ input); consumers walk the captured directive sequence themselves. `ctech technique resolution` (spec §"ctech technique
 resolution", three forms `cparm res` / `cspace maxlength` /
 `curv maxdist maxangle`) and `stech technique resolution` (spec
 §"stech technique resolution", four forms `cparma ures vres` /

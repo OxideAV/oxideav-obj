@@ -163,6 +163,26 @@ struct ObjDoc {
     /// last-wins semantics per spec, surfaced through
     /// `Scene3D::extras["obj:trace_obj"]`.
     trace_obj: Option<String>,
+    /// Verbatim sequence of "general statement" directives — spec
+    /// §"General statement" lists `call filename.ext arg1 arg2 …`
+    /// (inline file inclusion of a sibling `.obj` / `.mod` file) and
+    /// `csh command` / `csh -command` (shell-execute, with the leading
+    /// `-` flagging "ignore error on non-zero exit"). Both are
+    /// captured verbatim for round-trip but NOT semantically
+    /// interpreted — `call` does not pull the referenced file into the
+    /// scene (would require IO and conflict with the clean-room
+    /// boundary; consumers can re-resolve manually), and `csh` does
+    /// not execute the requested command (would be a sandbox-escape
+    /// trapdoor in any consumer that round-trips untrusted OBJ inputs).
+    /// Surfaces through `Scene3D::extras["obj:general_directives"]` as
+    /// an array of `[keyword, arg1, arg2, …]` arrays in document order.
+    /// The encoder replays them in the preamble (right after `mtllib`
+    /// and the `shadow_obj` / `trace_obj` companion-file block) since
+    /// the spec is silent on placement ("The call statement can be
+    /// inserted into .obj files using a text editor"); source-line
+    /// position relative to the polygonal section is NOT preserved by
+    /// design.
+    general_directives: Vec<Vec<String>>,
 }
 
 /// Glue line-continuation (`\\` + newline) before line splitting and
@@ -343,7 +363,7 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 doc.vp.push([u, v, w]);
             }
             "cstype" | "deg" | "curv" | "curv2" | "surf" | "parm" | "trim" | "hole" | "scrv"
-            | "sp" | "end" | "bzp" | "bsp" | "bmat" | "step" | "ctech" | "stech" => {
+            | "sp" | "end" | "bzp" | "bsp" | "bmat" | "step" | "ctech" | "stech" | "con" => {
                 // Free-form geometry directives. Captured verbatim as
                 // a `(keyword, args)` sequence on the document so the
                 // encoder can replay them after the polygonal section.
@@ -362,6 +382,24 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 // captured verbatim in source order alongside the
                 // structural directives so the round-trip preserves
                 // the per-block approximation hints.
+                //
+                // `con surf_1 q0_1 q1_1 curv2d_1 surf_2 q0_2 q1_2
+                // curv2d_2` (spec §"Connectivity between free-form
+                // surfaces", §"con surf_1 q0_1 q1_1 curv2d_1 surf_2
+                // q0_2 q1_2 curv2d_2") is a top-level free-form
+                // geometry statement that ties two previously-declared
+                // `surf` blocks together along a shared trimming-curve
+                // segment for edge merging. It sits OUTSIDE any
+                // `cstype … end` block (the worked example in spec
+                // §"Connectivity between free-form surfaces"
+                // §"Example 1" places it after the last surface's
+                // `end`), so capturing it into the same verbatim
+                // sequence keeps source order intact across the
+                // polygonal section / free-form section boundary.
+                // No semantic merging is performed — consumers that
+                // care about connectivity walk the captured directive
+                // sequence themselves; the round-trip is byte-faithful
+                // for the args.
                 let mut entry: Vec<String> = Vec::new();
                 entry.push(keyword.to_string());
                 for tok in tokens {
@@ -391,6 +429,38 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 if !v.is_empty() {
                     doc.trace_obj = Some(v);
                 }
+            }
+            "call" | "csh" => {
+                // Spec §"General statement" — `call filename.ext arg1
+                // arg2 …` (inline include of a sibling `.obj` / `.mod`
+                // file with positional argument substitution) and
+                // `csh command` / `csh -command` (shell-execute a UNIX
+                // command, with a leading `-` flagging "ignore error
+                // on non-zero exit"). Both are spec-defined but
+                // semantically expensive / unsafe to interpret here:
+                //
+                //   * `call` would require IO + recursive parser
+                //     re-entry + nested-call depth tracking; consumers
+                //     can re-resolve the included files themselves
+                //     against the captured filename.
+                //   * `csh` is a sandbox-escape trapdoor for any
+                //     consumer that round-trips untrusted OBJ input,
+                //     so the spec-mandated "executes the requested
+                //     UNIX command" behaviour is deliberately NOT
+                //     implemented — consumers can inspect the captured
+                //     command text and decide for themselves.
+                //
+                // Capture verbatim into `general_directives`. Empty
+                // arg lists land as `[keyword]` only (a bare `csh`
+                // line with no command, while ill-formed, still
+                // survives the round-trip rather than getting dropped
+                // — mirrors the lenient-loader pattern used elsewhere).
+                let mut entry: Vec<String> = Vec::new();
+                entry.push(keyword.to_string());
+                for tok in tokens {
+                    entry.push(tok.to_string());
+                }
+                doc.general_directives.push(entry);
             }
             "f" => {
                 let n_pos = doc.positions.len() as i64;
@@ -835,6 +905,19 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         scene.extras.insert(
             "obj:trace_obj".to_string(),
             serde_json::Value::String(name.clone()),
+        );
+    }
+
+    // Spec §"General statement" — `call` and `csh` directives are
+    // captured verbatim into a separate side-channel keyed by
+    // `obj:general_directives`. The encoder replays them in the
+    // preamble right after the companion-file block. Source position
+    // relative to the polygonal section is NOT preserved by design
+    // (see the docstring on `ObjDoc::general_directives`).
+    if !doc.general_directives.is_empty() {
+        scene.extras.insert(
+            "obj:general_directives".to_string(),
+            serde_json::to_value(&doc.general_directives).unwrap(),
         );
     }
 
@@ -4809,6 +4892,25 @@ pub fn serialize_obj_with_options(
     if let Some(serde_json::Value::String(name)) = scene.extras.get("obj:trace_obj") {
         if !name.is_empty() {
             writeln!(out, "trace_obj {name}").unwrap();
+        }
+    }
+
+    // Spec §"General statement" — replay any captured `call` /
+    // `csh` lines in document order. Source position relative to the
+    // polygonal section isn't preserved (see
+    // `ObjDoc::general_directives` docstring), so we emit them once,
+    // at the top of the preamble right after the companion-file
+    // block. Empty arrays / non-string tokens are skipped lenient-loader
+    // style; absent key leaves the preamble unchanged.
+    if let Some(serde_json::Value::Array(generals)) = scene.extras.get("obj:general_directives") {
+        for entry in generals {
+            if let serde_json::Value::Array(toks) = entry {
+                let parts: Vec<&str> = toks.iter().filter_map(|v| v.as_str()).collect();
+                if parts.is_empty() {
+                    continue;
+                }
+                writeln!(out, "{}", parts.join(" ")).unwrap();
+            }
         }
     }
 
