@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 236: MTL `Ka` / `Kd` / `Ks` `spectral` and `xyz` alternative
+  forms. Spec §"Ka r g b" / §"Kd r g b" / §"Ks r g b" each list the
+  same three mutually-exclusive forms `K* r g b` / `K* spectral
+  file.rfl factor` / `K* xyz x y z` (mirroring the `Tf` triplet);
+  rounds 1..5 only handled the RGB form so a real-world MTL using a
+  spectral or CIEXYZ colour spec was a parse error. The spectral form
+  now lands on `Material::extras["mtl:K{a,d,s}:spectral"]` as a
+  `{file, factor}` object (factor defaults to 1.0 per spec) and the
+  xyz form on `Material::extras["mtl:K{a,d,s}:xyz"]` as an `[x, y, z]`
+  array (y/z default to x per spec). RGB single-value broadcast
+  (`Ka 0.4` → `[0.4, 0.4, 0.4]` per spec "If only r is specified, then
+  g, and b are assumed to be equal to r") is now honoured for all
+  three statements (previously the parser required exactly 3 floats).
+  The encoder picks the first present sibling key per material
+  (precedence: `spectral` → `xyz` → RGB) so a decode → encode cycle
+  reproduces the operator-written form. For `Kd` specifically, the
+  alt forms suppress the canonical `Kd r g b` emit driven by
+  `base_color` (since the forms are mutually exclusive per spec); the
+  underlying `base_color` field stays at its default so glTF
+  consumers still see a sensible neutral. `Tf` was refactored to
+  share the new `parse_color_statement` helper without changing its
+  observable behaviour.
+
 - Round 229: connectivity (`con`) + general-statement (`call` / `csh`)
   round-trip. Three previously-dropped spec-defined directives now
   survive a decode → encode cycle verbatim:

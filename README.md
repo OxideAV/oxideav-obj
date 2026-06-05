@@ -78,6 +78,15 @@ The companion **MTL** parser/serialiser handles:
 - Phong colours (`Ka` / `Kd` / `Ks` / `Ke`) → glTF `base_color`
   (from `Kd`) + `emissive_factor` (from `Ke`); `Ka` / `Ks` and the
   `Ns` exponent are stashed in `Material::extras` for round-trip.
+  Each of `Ka` / `Kd` / `Ks` accepts the three mutually-exclusive
+  forms per spec — plain RGB (`r g b`, with g/b defaulting to r),
+  `spectral file.rfl [factor]` (factor defaults to 1.0), and
+  `xyz x [y z]` CIEXYZ (y/z defaulting to x). The spectral and
+  xyz variants ride on sibling extras keys
+  (`mtl:K{a,d,s}:spectral` / `mtl:K{a,d,s}:xyz`) so a re-emit
+  reproduces the operator's chosen form; the `Kd spectral` /
+  `Kd xyz` variants additionally suppress the canonical
+  `Kd r g b` emit driven by `base_color`.
 - Transparency (`d` dissolve / `Tr = 1 - d`) → `AlphaMode::Blend`
   + `base_color.a`. The `d -halo factor` orientation-dependent
   variant is detected and re-emitted via
@@ -486,6 +495,26 @@ the existing single-patch mismatch behaviour.
 Round 223: approximation-technique directives + companion-object
 references — four previously-dropped spec-defined directives now
 round-trip.
+
+Round 236: MTL `Ka` / `Kd` / `Ks` `spectral` and `xyz` alternative
+forms — the three Phong-colour statements now accept the same triplet
+of mutually-exclusive forms `Tf` already did (plain RGB, `spectral
+file.rfl [factor]`, and `xyz x [y z]`), matching the spec listings at
+§"Ka r g b", §"Kd r g b", §"Ks r g b". The spectral form lands on
+`Material::extras["mtl:K{a,d,s}:spectral"]` as a `{file, factor}`
+object (`factor` defaults to 1.0 per spec, and the encoder omits the
+explicit `1.0` token in that case); the xyz form lands on
+`Material::extras["mtl:K{a,d,s}:xyz"]` as an `[x, y, z]` array (y and
+z default to x per spec). The plain RGB form additionally honours
+the spec's single-value broadcast ("If only r is specified, then g,
+and b are assumed to be equal to r") for all three statements — the
+previous parser required exactly three floats. The encoder picks the
+first present sibling key per material in precedence order
+`spectral` → `xyz` → RGB; `Kd spectral` / `Kd xyz` additionally
+suppress the canonical `Kd r g b` line driven by `base_color` so the
+forms remain mutually exclusive on round-trip. `Tf` was refactored
+to share the same `parse_color_statement` helper without changing
+its observable behaviour.
 
 Round 229: connectivity (`con`) + general-statement (`call` / `csh`)
 round-trip — three more previously-dropped spec-defined directives now

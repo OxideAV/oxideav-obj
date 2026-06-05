@@ -195,6 +195,86 @@ fn parse_floats<'a, I: Iterator<Item = &'a str>>(tokens: I, keyword: &str) -> Re
         .map_err(|e| Error::invalid(format!("MTL {keyword}: bad float ({e})")))
 }
 
+/// One of the three mutually-exclusive forms a `K*` colour statement
+/// (or `Tf`) can take per Wavefront MTL spec §"Ka r g b" / §"Kd r g b"
+/// / §"Ks r g b" / §"Tf r g b":
+///
+/// * Plain RGB triple (g/b default to r when omitted).
+/// * `spectral file.rfl factor` (factor defaults to 1.0).
+/// * `xyz x y z` CIEXYZ tristimulus (y/z default to x when omitted).
+///
+/// Used to keep the four colour-statement parsers consistent.
+#[derive(Debug, Clone)]
+enum ColorStatement {
+    Rgb { r: f32, g: f32, b: f32 },
+    Spectral { file: String, factor: f32 },
+    Xyz { x: f32, y: f32, z: f32 },
+}
+
+/// Discriminate and parse a `K* … ` / `Tf …` argument list. The first
+/// token decides the shape:
+///
+/// * Numeric → RGB form (spec §"…r g b": g and b default to r when
+///   omitted; we eagerly broadcast so the canonical 3-tuple is what
+///   lands in `extras`).
+/// * `spectral` → `spectral file.rfl [factor]` (spec §"… spectral
+///   file.rfl factor": factor defaults to 1.0 when omitted).
+/// * `xyz` → `xyz x [y z]` (spec §"… xyz x y z": y and z default to x
+///   when omitted).
+///
+/// `keyword` names the originating directive for error messages.
+fn parse_color_statement(toks: &[&str], keyword: &str) -> Result<ColorStatement> {
+    if toks.is_empty() {
+        return Err(Error::invalid(format!(
+            "{keyword}: needs at least 1 argument"
+        )));
+    }
+    match toks[0] {
+        "spectral" => {
+            if toks.len() < 2 {
+                return Err(Error::invalid(format!(
+                    "{keyword} spectral: missing file.rfl"
+                )));
+            }
+            let file = toks[1].to_string();
+            let factor: f32 = if let Some(f) = toks.get(2) {
+                f.parse()
+                    .map_err(|e| Error::invalid(format!("{keyword} spectral: bad factor ({e})")))?
+            } else {
+                1.0
+            };
+            Ok(ColorStatement::Spectral { file, factor })
+        }
+        "xyz" => {
+            let v: Vec<f32> = toks[1..]
+                .iter()
+                .map(|s| s.parse::<f32>())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::invalid(format!("{keyword} xyz: bad float ({e})")))?;
+            if v.is_empty() {
+                return Err(Error::invalid(format!(
+                    "{keyword} xyz: needs at least 1 float"
+                )));
+            }
+            let x = v[0];
+            let y = v.get(1).copied().unwrap_or(x);
+            let z = v.get(2).copied().unwrap_or(x);
+            Ok(ColorStatement::Xyz { x, y, z })
+        }
+        _ => {
+            let v: Vec<f32> = toks
+                .iter()
+                .map(|s| s.parse::<f32>())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::invalid(format!("{keyword}: bad float ({e})")))?;
+            let r = v[0];
+            let g = v.get(1).copied().unwrap_or(r);
+            let b = v.get(2).copied().unwrap_or(r);
+            Ok(ColorStatement::Rgb { r, g, b })
+        }
+    }
+}
+
 fn apply_directive(
     keyword: &str,
     tokens: &mut std::str::SplitWhitespace<'_>,
@@ -203,40 +283,78 @@ fn apply_directive(
     let mat = &mut pm.material;
     match keyword {
         "Ka" => {
-            let v = parse_floats(tokens.by_ref(), keyword)?;
-            if v.len() < 3 {
-                return Err(Error::invalid(format!(
-                    "Ka: needs 3 floats, got {}",
-                    v.len()
-                )));
+            // Ambient reflectivity. Spec §"Ka r g b" lists three
+            // mutually-exclusive forms (RGB / spectral / xyz); the alt
+            // forms ride on sibling extras keys (`mtl:Ka:spectral` /
+            // `mtl:Ka:xyz`) so an MTL emit reproduces the operator's
+            // chosen spelling.
+            let toks: Vec<&str> = tokens.collect();
+            match parse_color_statement(&toks, "Ka")? {
+                ColorStatement::Rgb { r, g, b } => {
+                    mat.extras
+                        .insert("mtl:Ka".to_string(), serde_json::json!([r, g, b]));
+                }
+                ColorStatement::Spectral { file, factor } => {
+                    mat.extras.insert(
+                        "mtl:Ka:spectral".to_string(),
+                        serde_json::json!({ "file": file, "factor": factor }),
+                    );
+                }
+                ColorStatement::Xyz { x, y, z } => {
+                    mat.extras
+                        .insert("mtl:Ka:xyz".to_string(), serde_json::json!([x, y, z]));
+                }
             }
-            mat.extras
-                .insert("mtl:Ka".to_string(), serde_json::json!([v[0], v[1], v[2]]));
         }
         "Kd" => {
-            let v = parse_floats(tokens.by_ref(), keyword)?;
-            if v.len() < 3 {
-                return Err(Error::invalid(format!(
-                    "Kd: needs 3 floats, got {}",
-                    v.len()
-                )));
+            // Diffuse reflectivity. Spec §"Kd r g b" — RGB form sets
+            // `base_color[0..3]` (canonical glTF base colour); the
+            // mutually-exclusive `Kd spectral` / `Kd xyz` forms ride
+            // on sibling extras (`mtl:Kd:spectral` / `mtl:Kd:xyz`)
+            // and leave `base_color` untouched so the encoder
+            // suppresses the canonical `Kd r g b` emit.
+            let toks: Vec<&str> = tokens.collect();
+            match parse_color_statement(&toks, "Kd")? {
+                ColorStatement::Rgb { r, g, b } => {
+                    // Preserve the alpha channel that may have been set
+                    // by an earlier `d` line so the assignment ordering
+                    // matches the file (`d` typically follows `Kd`,
+                    // but defensive).
+                    let alpha = mat.base_color[3];
+                    mat.base_color = [r, g, b, alpha];
+                }
+                ColorStatement::Spectral { file, factor } => {
+                    mat.extras.insert(
+                        "mtl:Kd:spectral".to_string(),
+                        serde_json::json!({ "file": file, "factor": factor }),
+                    );
+                }
+                ColorStatement::Xyz { x, y, z } => {
+                    mat.extras
+                        .insert("mtl:Kd:xyz".to_string(), serde_json::json!([x, y, z]));
+                }
             }
-            // Preserve the alpha channel that may have been set by an
-            // earlier `d` line so the assignment ordering matches the
-            // file (`d` typically follows `Kd`, but defensive).
-            let alpha = mat.base_color[3];
-            mat.base_color = [v[0], v[1], v[2], alpha];
         }
         "Ks" => {
-            let v = parse_floats(tokens.by_ref(), keyword)?;
-            if v.len() < 3 {
-                return Err(Error::invalid(format!(
-                    "Ks: needs 3 floats, got {}",
-                    v.len()
-                )));
+            // Specular reflectivity. Spec §"Ks r g b" — same three
+            // mutually-exclusive forms as `Ka` / `Kd`.
+            let toks: Vec<&str> = tokens.collect();
+            match parse_color_statement(&toks, "Ks")? {
+                ColorStatement::Rgb { r, g, b } => {
+                    mat.extras
+                        .insert("mtl:Ks".to_string(), serde_json::json!([r, g, b]));
+                }
+                ColorStatement::Spectral { file, factor } => {
+                    mat.extras.insert(
+                        "mtl:Ks:spectral".to_string(),
+                        serde_json::json!({ "file": file, "factor": factor }),
+                    );
+                }
+                ColorStatement::Xyz { x, y, z } => {
+                    mat.extras
+                        .insert("mtl:Ks:xyz".to_string(), serde_json::json!([x, y, z]));
+                }
             }
-            mat.extras
-                .insert("mtl:Ks".to_string(), serde_json::json!([v[0], v[1], v[2]]));
         }
         "Ke" => {
             let v = parse_floats(tokens.by_ref(), keyword)?;
@@ -249,8 +367,8 @@ fn apply_directive(
             mat.emissive_factor = [v[0], v[1], v[2]];
         }
         "Tf" => {
-            // Transmission filter. Spec §"Tf r g b" lists three mutually
-            // exclusive forms:
+            // Transmission filter. Spec §"Tf r g b" lists the same
+            // three mutually-exclusive forms as `Ka` / `Kd` / `Ks`:
             //
             //   Tf r g b               — RGB triple (g/b default to r)
             //   Tf spectral file.rfl factor    — spectral .rfl curve
@@ -258,64 +376,26 @@ fn apply_directive(
             //
             // The RGB form lands in `extras["mtl:Tf"]` as an
             // `[r,g,b]` array (the round-1 behaviour); the alt forms
-            // land under sibling keys so a re-emit reproduces the
-            // operator's chosen spelling. PBR transmission is its
-            // own KHR extension on the glTF side, so we don't model
-            // any of the variants as a first-class `Material` field.
-            //
-            // The first token discriminates: `spectral` / `xyz` /
-            // anything-else (treated as a numeric `r`).
+            // land under sibling keys (`mtl:Tf:spectral` /
+            // `mtl:Tf:xyz`) so a re-emit reproduces the operator's
+            // chosen spelling. PBR transmission is its own KHR
+            // extension on the glTF side, so we don't model any of
+            // the variants as a first-class `Material` field.
             let toks: Vec<&str> = tokens.collect();
-            if toks.is_empty() {
-                return Err(Error::invalid("Tf: needs at least 1 argument"));
-            }
-            match toks[0] {
-                "spectral" => {
-                    if toks.len() < 2 {
-                        return Err(Error::invalid("Tf spectral: missing file.rfl"));
-                    }
-                    let file = toks[1].to_string();
-                    let factor: f32 = if let Some(f) = toks.get(2) {
-                        f.parse()
-                            .map_err(|e| Error::invalid(format!("Tf spectral: bad factor ({e})")))?
-                    } else {
-                        1.0
-                    };
+            match parse_color_statement(&toks, "Tf")? {
+                ColorStatement::Rgb { r, g, b } => {
+                    mat.extras
+                        .insert("mtl:Tf".to_string(), serde_json::json!([r, g, b]));
+                }
+                ColorStatement::Spectral { file, factor } => {
                     mat.extras.insert(
                         "mtl:Tf:spectral".to_string(),
                         serde_json::json!({ "file": file, "factor": factor }),
                     );
                 }
-                "xyz" => {
-                    let v: Vec<f32> = toks[1..]
-                        .iter()
-                        .map(|s| s.parse::<f32>())
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(|e| Error::invalid(format!("Tf xyz: bad float ({e})")))?;
-                    if v.is_empty() {
-                        return Err(Error::invalid("Tf xyz: needs at least 1 float"));
-                    }
-                    let x = v[0];
-                    let y = v.get(1).copied().unwrap_or(x);
-                    let z = v.get(2).copied().unwrap_or(x);
+                ColorStatement::Xyz { x, y, z } => {
                     mat.extras
                         .insert("mtl:Tf:xyz".to_string(), serde_json::json!([x, y, z]));
-                }
-                _ => {
-                    // Plain RGB form. Per MTL spec §"Tf r g b", g and
-                    // b default to r when omitted; we eagerly
-                    // normalise to a 3-tuple so the round-trip emits
-                    // a canonical line.
-                    let v: Vec<f32> = toks
-                        .iter()
-                        .map(|s| s.parse::<f32>())
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(|e| Error::invalid(format!("Tf: bad float ({e})")))?;
-                    let r = v[0];
-                    let g = v.get(1).copied().unwrap_or(r);
-                    let b = v.get(2).copied().unwrap_or(r);
-                    mat.extras
-                        .insert("mtl:Tf".to_string(), serde_json::json!([r, g, b]));
                 }
             }
         }
@@ -815,39 +895,50 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
         let name = mat.name.clone().unwrap_or_else(|| format!("material_{i}"));
         writeln!(out, "newmtl {name}").unwrap();
 
-        if let Some(serde_json::Value::Array(v)) = mat.extras.get("mtl:Ka") {
+        // Ka — one of three mutually-exclusive forms per spec §"Ka r g b" /
+        // §"Ka spectral" / §"Ka xyz". The sibling-key precedence order
+        // mirrors the source ordering in the spec listing.
+        emit_color_statement(&mut out, "Ka", &mat.extras);
+        // Kd — same three forms per spec §"Kd r g b" / §"Kd spectral" /
+        // §"Kd xyz". The canonical RGB form populates `base_color`
+        // directly, so we emit it from there; the alt forms ride on
+        // extras (`mtl:Kd:spectral` / `mtl:Kd:xyz`) and suppress the
+        // canonical line so the round-trip matches the operator-written
+        // spelling.
+        if let Some(serde_json::Value::Object(o)) = mat.extras.get("mtl:Kd:spectral") {
+            let file = o.get("file").and_then(|v| v.as_str()).unwrap_or("");
+            let factor = o.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            if (factor - 1.0).abs() < f32::EPSILON {
+                writeln!(out, "Kd spectral {file}").unwrap();
+            } else {
+                writeln!(out, "Kd spectral {file} {}", fmt_f(factor)).unwrap();
+            }
+        } else if let Some(serde_json::Value::Array(v)) = mat.extras.get("mtl:Kd:xyz") {
             if let [a, b, c] = v.as_slice() {
                 writeln!(
                     out,
-                    "Ka {} {} {}",
+                    "Kd xyz {} {} {}",
                     fmt_f(a.as_f64().unwrap_or(0.0) as f32),
                     fmt_f(b.as_f64().unwrap_or(0.0) as f32),
                     fmt_f(c.as_f64().unwrap_or(0.0) as f32)
                 )
                 .unwrap();
             }
+        } else {
+            // Canonical RGB form: always emit (it's the glTF base
+            // color → MTL Phong diffuse).
+            writeln!(
+                out,
+                "Kd {} {} {}",
+                fmt_f(mat.base_color[0]),
+                fmt_f(mat.base_color[1]),
+                fmt_f(mat.base_color[2])
+            )
+            .unwrap();
         }
-        // Always emit Kd (it's the canonical glTF base color → MTL Phong diffuse).
-        writeln!(
-            out,
-            "Kd {} {} {}",
-            fmt_f(mat.base_color[0]),
-            fmt_f(mat.base_color[1]),
-            fmt_f(mat.base_color[2])
-        )
-        .unwrap();
-        if let Some(serde_json::Value::Array(v)) = mat.extras.get("mtl:Ks") {
-            if let [a, b, c] = v.as_slice() {
-                writeln!(
-                    out,
-                    "Ks {} {} {}",
-                    fmt_f(a.as_f64().unwrap_or(0.0) as f32),
-                    fmt_f(b.as_f64().unwrap_or(0.0) as f32),
-                    fmt_f(c.as_f64().unwrap_or(0.0) as f32)
-                )
-                .unwrap();
-            }
-        }
+        // Ks — same three forms per spec §"Ks r g b" / §"Ks spectral" /
+        // §"Ks xyz".
+        emit_color_statement(&mut out, "Ks", &mat.extras);
         if mat.emissive_factor != [0.0, 0.0, 0.0] {
             writeln!(
                 out,
@@ -1024,7 +1115,13 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
             // Skip the keys we already printed above.
             match k.as_str() {
                 "mtl:Ka"
+                | "mtl:Ka:spectral"
+                | "mtl:Ka:xyz"
+                | "mtl:Kd:spectral"
+                | "mtl:Kd:xyz"
                 | "mtl:Ks"
+                | "mtl:Ks:spectral"
+                | "mtl:Ks:xyz"
                 | "mtl:Ns"
                 | "mtl:Ni"
                 | "mtl:illum"
@@ -1109,6 +1206,57 @@ fn write_tex_ref(
             }
         } else {
             writeln!(out, "{keyword} {uri}").unwrap();
+        }
+    }
+}
+
+/// Emit a `Ka` / `Ks` MTL colour statement, picking whichever of the
+/// three mutually-exclusive forms (RGB / `spectral` / `xyz`) the parser
+/// captured into extras. The sibling-key precedence is `spectral` →
+/// `xyz` → plain `mtl:<keyword>` array (the RGB form). When no key is
+/// present the statement is omitted entirely.
+///
+/// `Kd` is handled inline because its canonical RGB form is mirrored on
+/// `Material::base_color` (the glTF base colour), not on
+/// `extras["mtl:Kd"]`.
+fn emit_color_statement(
+    out: &mut String,
+    keyword: &str,
+    extras: &std::collections::HashMap<String, serde_json::Value>,
+) {
+    use std::fmt::Write;
+    let spectral_key = format!("mtl:{keyword}:spectral");
+    let xyz_key = format!("mtl:{keyword}:xyz");
+    let rgb_key = format!("mtl:{keyword}");
+    if let Some(serde_json::Value::Object(o)) = extras.get(&spectral_key) {
+        let file = o.get("file").and_then(|v| v.as_str()).unwrap_or("");
+        let factor = o.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        if (factor - 1.0).abs() < f32::EPSILON {
+            writeln!(out, "{keyword} spectral {file}").unwrap();
+        } else {
+            writeln!(out, "{keyword} spectral {file} {}", fmt_f(factor)).unwrap();
+        }
+    } else if let Some(serde_json::Value::Array(v)) = extras.get(&xyz_key) {
+        if let [a, b, c] = v.as_slice() {
+            writeln!(
+                out,
+                "{keyword} xyz {} {} {}",
+                fmt_f(a.as_f64().unwrap_or(0.0) as f32),
+                fmt_f(b.as_f64().unwrap_or(0.0) as f32),
+                fmt_f(c.as_f64().unwrap_or(0.0) as f32)
+            )
+            .unwrap();
+        }
+    } else if let Some(serde_json::Value::Array(v)) = extras.get(&rgb_key) {
+        if let [a, b, c] = v.as_slice() {
+            writeln!(
+                out,
+                "{keyword} {} {} {}",
+                fmt_f(a.as_f64().unwrap_or(0.0) as f32),
+                fmt_f(b.as_f64().unwrap_or(0.0) as f32),
+                fmt_f(c.as_f64().unwrap_or(0.0) as f32)
+            )
+            .unwrap();
         }
     }
 }
