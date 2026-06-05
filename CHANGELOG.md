@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 240: typed decomposition of `map_*` option flags per MTL spec
+  §"Options for texture map statements". Parallel to the existing raw
+  `Material::extras["mtl:<map>:options"]` string array (which still
+  drives encoder round-trip), the parser now surfaces
+  `Material::extras["mtl:<map>:options_typed"]` as a `serde_json::Value`
+  object whose keys are decomposed primitive values: `blendu` / `blendv`
+  / `clamp` / `cc` (`bool`, derived from the spec's `on` / `off`
+  arguments), `bm` / `boost` / `texres` (`f64`), `mm` (`[base, gain]`
+  `f64` pair), `o` / `s` / `t` (`[u, v, w]` `f64` triple), `imfchan`
+  (`String` over `r | g | b | m | l | z` per §"-imfchan"), and `type`
+  (`String` over the `sphere | cube_top | cube_bottom | cube_front |
+  cube_back | cube_left | cube_right` alphabet per §"refl -type"). Each
+  key is present only when the source line carried the matching flag;
+  malformed argument values (e.g. `-clamp maybe`, `-imfchan q`) drop
+  silently from the typed view but stay verbatim on the raw `:options`
+  array so encoder output keeps its byte-for-byte source-order
+  guarantee. The typed key is consumed at parse time only — the
+  encoder explicitly filters `:options_typed` out of its passthrough
+  loop so it never appears in serialised MTL. Mirrors the
+  `mtl:illum_props` decomposition pattern from round 212. Nested
+  options inside `mtl:refl:sphere` and `mtl:refl:cube[<face>]` entries
+  also gain a sibling `options_typed` field so per-face reflection
+  metadata is uniformly structured. The raw `:options` array remains
+  the canonical source of truth — consumers who need exact source
+  text should keep reading it; consumers who want named accessors can
+  now read `:options_typed` without parsing strings.
+
 - Round 236: MTL `Ka` / `Kd` / `Ks` `spectral` and `xyz` alternative
   forms. Spec §"Ka r g b" / §"Kd r g b" / §"Ks r g b" each list the
   same three mutually-exclusive forms `K* r g b` / `K* spectral

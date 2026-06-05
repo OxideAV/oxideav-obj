@@ -125,7 +125,14 @@ The companion **MTL** parser/serialiser handles:
   option chunks (`-blendu`, `-bm`, `-mm`, `-clamp`, `-imfchan`, `-o`,
   `-s`, `-t`, `-texres`) are parsed out of the filename and surfaced
   via `Material::extras["mtl:<map_name>:options"]`; the encoder
-  splices them back inline.
+  splices them back inline. A parallel typed view rides on
+  `Material::extras["mtl:<map_name>:options_typed"]` with stable
+  primitive-valued keys per flag (`bool` for the `on`/`off` flags,
+  `f64` for `bm` / `boost` / `texres`, `[base, gain]` for `mm`,
+  `[u, v, w]` for `o` / `s` / `t`, `String` for `imfchan` and `type`)
+  so consumers can read each option without re-parsing the raw token
+  array. The typed key is parse-time-only; encoder output is still
+  driven by the raw `:options` array.
 - Wavefront-PBR extension (`Pr` roughness, `Pm` metallic, `Pc`
   clearcoat, `Ps` sheen, `map_Pr` / `map_Pm`) → `Material::roughness`
   / `Material::metallic` / `metallic_roughness_texture`.
@@ -495,6 +502,27 @@ the existing single-patch mismatch behaviour.
 Round 223: approximation-technique directives + companion-object
 references — four previously-dropped spec-defined directives now
 round-trip.
+
+Round 240: typed decomposition of `map_*` option flags per MTL spec
+§"Options for texture map statements". Parallel to the existing raw
+`mtl:<map>:options` string array (which still drives encoder round-
+trip), a typed view lands on `mtl:<map>:options_typed` whose stable
+lowercase keys carry primitive values: `blendu` / `blendv` / `clamp`
+/ `cc` decode to `bool` (`on` → `true`, `off` → `false`); `bm` /
+`boost` / `texres` decode to `f64`; `mm` decodes to a two-element
+`[base, gain]` array; `o` / `s` / `t` decode to a three-element
+`[u, v, w]` array; `imfchan` and `type` decode to a `String` over
+their spec-defined alphabets (`r | g | b | m | l | z` and `sphere |
+cube_top | … | cube_right`). Each key appears only when the source
+line carried the matching flag; values that don't match the spec's
+expected shape (e.g. `-clamp maybe`, `-imfchan q`) drop silently from
+the typed view but stay verbatim on the raw `:options` array, so
+encoder output keeps its byte-for-byte source-order guarantee. The
+typed key is parse-time-only — the encoder filters `:options_typed`
+out of its passthrough loop so it never appears in serialised MTL.
+Nested options inside `mtl:refl:sphere` and per-face entries under
+`mtl:refl:cube[<face>]` also gain a sibling `options_typed` field,
+so per-face reflection metadata is uniformly structured.
 
 Round 236: MTL `Ka` / `Kd` / `Ks` `spectral` and `xyz` alternative
 forms — the three Phong-colour statements now accept the same triplet

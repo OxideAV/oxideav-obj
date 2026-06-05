@@ -633,6 +633,9 @@ fn apply_directive(
                         serde_json::Value::String(filename.clone()),
                     );
                     if !opts.is_empty() {
+                        if let Some(typed) = decompose_map_options(&opts) {
+                            entry.insert("options_typed".to_string(), typed);
+                        }
                         entry.insert(
                             "options".to_string(),
                             serde_json::Value::Array(
@@ -659,6 +662,9 @@ fn apply_directive(
                         serde_json::Value::String(filename.clone()),
                     );
                     if !opts.is_empty() {
+                        if let Some(typed) = decompose_map_options(&opts) {
+                            entry.insert("options_typed".to_string(), typed);
+                        }
                         entry.insert(
                             "options".to_string(),
                             serde_json::Value::Array(
@@ -678,6 +684,10 @@ fn apply_directive(
                     // kind — preserve via the original single-string
                     // slot used in r3.
                     if !opts.is_empty() {
+                        if let Some(typed) = decompose_map_options(&opts) {
+                            mat.extras
+                                .insert(format!("mtl:{keyword}:options_typed"), typed);
+                        }
                         mat.extras.insert(
                             format!("mtl:{keyword}:options"),
                             serde_json::Value::Array(
@@ -777,6 +787,11 @@ fn flag_arg_count(flag: &str) -> usize {
 /// Parse a `map_*`-style keyword: split into (options, filename),
 /// stash the options in `extras["mtl:<keyword>:options"]`, and return
 /// the bare filename for caller-side TextureRef wiring.
+///
+/// In addition to the verbatim `:options` array (which drives encoder
+/// round-trip), a decomposed typed view of each recognised flag lands
+/// on `extras["mtl:<keyword>:options_typed"]`. See
+/// [`decompose_map_options`] for the schema.
 fn parse_map_with_options(
     keyword: &str,
     tokens: &mut std::str::SplitWhitespace<'_>,
@@ -784,12 +799,195 @@ fn parse_map_with_options(
 ) -> String {
     let (opts, filename) = map_options_and_filename(tokens);
     if !opts.is_empty() {
+        if let Some(typed) = decompose_map_options(&opts) {
+            extras.insert(format!("mtl:{keyword}:options_typed"), typed);
+        }
         extras.insert(
             format!("mtl:{keyword}:options"),
             serde_json::Value::Array(opts.into_iter().map(serde_json::Value::String).collect()),
         );
     }
     filename
+}
+
+/// Decompose a parsed `:options` array into a typed object per spec
+/// §"Options for texture map statements".
+///
+/// The spec defines twelve flags that may appear before a `map_*` /
+/// `bump` / `disp` / `decal` / `refl` filename. Each parsed `-flag
+/// args` chunk lands under a stable lowercase key with a per-flag
+/// value shape; flags the parser didn't recognise are silently skipped
+/// so unknown chunks don't pollute the typed view (they still ride on
+/// the raw `:options` array, which drives the encoder).
+///
+/// Key / value schema (each present only when the flag appeared):
+///
+/// * `blendu`, `blendv`, `clamp`, `cc` — `bool`. The spec writes these
+///   as `on` / `off`; the typed value is `true` for `on` and `false`
+///   for `off`. Any other argument value drops the flag from the typed
+///   view (the raw array still preserves it).
+/// * `bm`, `boost`, `texres` — `f64`. The spec writes these as a
+///   single positive (`boost`, `texres`) or signed (`bm`) float; the
+///   typed value is the parsed number.
+/// * `imfchan` — `String` over the spec alphabet `r | g | b | m | l |
+///   z` (§"-imfchan"). Anything else drops the flag.
+/// * `type` — `String` over the spec alphabet `sphere | cube_top |
+///   cube_bottom | cube_front | cube_back | cube_left | cube_right`
+///   (§"refl -type"); other values drop the flag.
+/// * `mm` — `[base, gain]` as a two-element `[f64; 2]` array (spec
+///   §"-mm base gain"). Both arguments are required.
+/// * `o`, `s`, `t` — `[u, v, w]` as a three-element `[f64; 3]` array
+///   (spec §"-o u v w" / §"-s u v w" / §"-t u v w"). The spec marks
+///   `v` and `w` optional (defaulting to 0 for `-o` / `-t` and 1 for
+///   `-s`); the typed view fills the omitted slots accordingly so the
+///   array shape stays stable.
+///
+/// Returns `None` when none of the recognised flags appeared, so
+/// callers can skip the `options_typed` key entirely for option lists
+/// composed of only unknown flags. The raw `:options` array still
+/// drives encoder output; this typed view is parse-time-only and is
+/// not consulted by the encoder (so the encoder still round-trips the
+/// exact source-order tokens).
+fn decompose_map_options(opts: &[String]) -> Option<serde_json::Value> {
+    let mut obj = serde_json::Map::new();
+    for chunk in opts {
+        let mut it = chunk.split_whitespace();
+        let flag = it.next()?;
+        let args: Vec<&str> = it.collect();
+        match flag {
+            // Boolean on|off flags
+            "-blendu" | "-blendv" | "-clamp" | "-cc" => {
+                if args.len() != 1 {
+                    continue;
+                }
+                let v = match args[0] {
+                    "on" => true,
+                    "off" => false,
+                    _ => continue,
+                };
+                let key = &flag[1..];
+                obj.insert(key.to_string(), serde_json::Value::Bool(v));
+            }
+            // Single-float flags
+            "-bm" | "-boost" | "-texres" => {
+                if args.len() != 1 {
+                    continue;
+                }
+                let Ok(v) = args[0].parse::<f64>() else {
+                    continue;
+                };
+                let key = &flag[1..];
+                obj.insert(
+                    key.to_string(),
+                    serde_json::Number::from_f64(v)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+            // -imfchan: single-letter channel selector per spec alphabet
+            "-imfchan" => {
+                if args.len() != 1 {
+                    continue;
+                }
+                let v = args[0];
+                if !matches!(v, "r" | "g" | "b" | "m" | "l" | "z") {
+                    continue;
+                }
+                obj.insert(
+                    "imfchan".to_string(),
+                    serde_json::Value::String(v.to_string()),
+                );
+            }
+            // -type: keyword selector used by `refl` per spec §"refl -type"
+            "-type" => {
+                if args.len() != 1 {
+                    continue;
+                }
+                let v = args[0];
+                if !matches!(
+                    v,
+                    "sphere"
+                        | "cube_top"
+                        | "cube_bottom"
+                        | "cube_front"
+                        | "cube_back"
+                        | "cube_left"
+                        | "cube_right"
+                ) {
+                    continue;
+                }
+                obj.insert("type".to_string(), serde_json::Value::String(v.to_string()));
+            }
+            // -mm base gain: exactly two floats
+            "-mm" => {
+                if args.len() != 2 {
+                    continue;
+                }
+                let Ok(base) = args[0].parse::<f64>() else {
+                    continue;
+                };
+                let Ok(gain) = args[1].parse::<f64>() else {
+                    continue;
+                };
+                obj.insert(
+                    "mm".to_string(),
+                    serde_json::Value::Array(vec![
+                        serde_json::Number::from_f64(base)
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null),
+                        serde_json::Number::from_f64(gain)
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null),
+                    ]),
+                );
+            }
+            // -o / -s / -t: 1..=3 floats, defaults fill the spec-defined slots
+            "-o" | "-s" | "-t" => {
+                if args.is_empty() || args.len() > 3 {
+                    continue;
+                }
+                let mut parsed: Vec<f64> = Vec::with_capacity(args.len());
+                let mut ok = true;
+                for a in &args {
+                    match a.parse::<f64>() {
+                        Ok(n) => parsed.push(n),
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                // Spec defaults per §"-o u v w" / §"-s u v w" / §"-t u v w":
+                //   -o: default (0, 0, 0)
+                //   -s: default (1, 1, 1)
+                //   -t: default (0, 0, 0)
+                let default = if flag == "-s" { 1.0 } else { 0.0 };
+                while parsed.len() < 3 {
+                    parsed.push(default);
+                }
+                let arr: Vec<serde_json::Value> = parsed
+                    .into_iter()
+                    .map(|v| {
+                        serde_json::Number::from_f64(v)
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect();
+                let key = &flag[1..];
+                obj.insert(key.to_string(), serde_json::Value::Array(arr));
+            }
+            // Unknown flag — leave to the raw :options array.
+            _ => {}
+        }
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(obj))
+    }
 }
 
 /// Decompose an `illum` integer into the spec's property table.
@@ -1141,7 +1339,9 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
             // `mtl:<map>:options` chunks are spliced inline by
             // write_tex_ref / the bare-`disp`-etc pass-through; skip
             // them here so they don't double-emit as a standalone line.
-            if k.ends_with(":options") {
+            // `mtl:<map>:options_typed` is the parse-time-only
+            // decomposed view of the same data — never emitted.
+            if k.ends_with(":options") || k.ends_with(":options_typed") {
                 continue;
             }
             // Only emit string-valued passthrough keys (textures we didn't model);
