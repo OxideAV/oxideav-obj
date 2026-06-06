@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 243: OBJ rendering-identifier pair `maplib` / `usemap` per spec
+  §"maplib filename1 filename2 ..." and §"usemap map_name/off". Both
+  are siblings to the already-supported material identifiers
+  (`mtllib` / `usemtl`) but cover the texture-map library rather than
+  the material library. `maplib lib1.map lib2.map ...` lines land in
+  `Scene3D::extras["obj:maplibs"]` as a verbatim string array with
+  the same de-duplication policy as `mtllib`; `usemap <name>` /
+  `usemap off` is captured per-primitive in
+  `Primitive::extras["obj:usemap"]`. The state-setter semantics
+  mirror `usemtl`: a mid-stream change opens a fresh primitive that
+  inherits all the other active state (groups, smoothing/merging
+  group, display attributes, the `usemap` binding when `usemtl`
+  switches, the `usemtl` material when `usemap` switches). The
+  encoder replays `maplib` lines after `mtllib` and a `usemap` line
+  per-primitive after `usemtl`, both byte-stable through a decode →
+  encode → decode cycle. Documents that don't carry either directive
+  produce neither extras key and neither encode line — the round-trip
+  contract is "preserve only what the operator wrote".
+
 - Round 240: typed decomposition of `map_*` option flags per MTL spec
   §"Options for texture map statements". Parallel to the existing raw
   `Material::extras["mtl:<map>:options"]` string array (which still

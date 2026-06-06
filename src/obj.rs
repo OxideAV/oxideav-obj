@@ -74,6 +74,15 @@ struct PrimAccum {
     /// Level-of-detail integer (1..100, or 0 / absent for "all").
     /// Spec §"lod level" — state-setting.
     lod: Option<String>,
+    /// Active texture-map name from `usemap <name>` or `usemap off`.
+    /// Spec §"usemap map_name/off" — rendering identifier that names
+    /// the texture map for the following elements. `None` means "no
+    /// `usemap` directive has been seen yet" (the spec default is
+    /// `off`); `Some("off")` is the explicit-off form; `Some(name)`
+    /// is an active map binding. State-setting in the same shape as
+    /// `usemtl`: a change mid-stream splits the primitive so each one
+    /// carries one consistent binding.
+    usemap: Option<String>,
 }
 
 /// One open mesh — accumulates primitives while a single `o <name>`
@@ -131,6 +140,16 @@ struct ObjDoc {
     vp: Vec<[f32; 3]>,
     /// Material library file names referenced by `mtllib`.
     mtllibs: Vec<String>,
+    /// Texture-map library file names referenced by `maplib`. Spec
+    /// §"maplib filename1 filename2 ..." — sibling to `mtllib` but for
+    /// texture-map definitions consumed by `usemap`. Captured verbatim
+    /// in document order, with later duplicates suppressed (matching
+    /// the `mtllib` de-duplication policy). Surfaced through
+    /// `Scene3D::extras["obj:maplibs"]` and replayed by the encoder.
+    /// No external IO is performed — the spec mandates that `maplib`
+    /// references resolve at render time, not at decode time, so we
+    /// treat the listed filenames as opaque round-trip metadata.
+    maplibs: Vec<String>,
     /// All material definitions resolved from `mtllib` references
     /// supplied via [`ObjDoc::with_resolved_mtllibs`]. Round 1 ships
     /// no IO so we accept these via an external resolver hook on the
@@ -529,6 +548,7 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                     let c_interp = prim.c_interp.clone();
                     let d_interp = prim.d_interp.clone();
                     let lod = prim.lod.clone();
+                    let usemap = prim.usemap.clone();
                     mesh.primitives.push(PrimAccum {
                         material: mat,
                         groups,
@@ -538,6 +558,7 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                         c_interp,
                         d_interp,
                         lod,
+                        usemap,
                         elements: vec![Element::Point(verts)],
                     });
                 } else {
@@ -581,6 +602,7 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                     let mut c_interp = last.c_interp.clone();
                     let mut d_interp = last.d_interp.clone();
                     let mut lod = last.lod.clone();
+                    let usemap = last.usemap.clone();
                     match keyword {
                         "bevel" => bevel = Some(v),
                         "c_interp" => c_interp = Some(v),
@@ -597,6 +619,7 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                         c_interp,
                         d_interp,
                         lod,
+                        usemap,
                         elements: Vec::new(),
                     });
                 }
@@ -631,6 +654,7 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                     let c_interp = last.c_interp.clone();
                     let d_interp = last.d_interp.clone();
                     let lod = last.lod.clone();
+                    let usemap = last.usemap.clone();
                     mesh.primitives.push(PrimAccum {
                         material: mat,
                         smoothing_group: smoothing,
@@ -640,6 +664,7 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                         c_interp,
                         d_interp,
                         lod,
+                        usemap,
                         elements: Vec::new(),
                     });
                 }
@@ -702,6 +727,7 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                     let c_interp = last.c_interp.clone();
                     let d_interp = last.d_interp.clone();
                     let lod = last.lod.clone();
+                    let usemap = last.usemap.clone();
                     mesh.primitives.push(PrimAccum {
                         material: mat,
                         smoothing_group: Some(v),
@@ -711,6 +737,7 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                         c_interp,
                         d_interp,
                         lod,
+                        usemap,
                         elements: Vec::new(),
                     });
                 }
@@ -723,10 +750,73 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                     // First usemtl in this primitive — adopt directly.
                     last.material = if name.is_empty() { None } else { Some(name) };
                 } else {
-                    // Subsequent usemtl — start a new primitive.
+                    // Subsequent usemtl — start a new primitive that
+                    // inherits the sibling state-setters (groups,
+                    // smoothing/merging/display attrs, plus the active
+                    // `usemap` binding which is independent of
+                    // `usemtl` per spec §"usemap map_name/off").
+                    let groups = last.groups.clone();
+                    let smoothing = last.smoothing_group.clone();
+                    let merging = last.merging_group.clone();
+                    let bevel = last.bevel.clone();
+                    let c_interp = last.c_interp.clone();
+                    let d_interp = last.d_interp.clone();
+                    let lod = last.lod.clone();
+                    let usemap = last.usemap.clone();
                     mesh.primitives.push(PrimAccum {
                         material: if name.is_empty() { None } else { Some(name) },
-                        ..PrimAccum::default()
+                        groups,
+                        smoothing_group: smoothing,
+                        merging_group: merging,
+                        bevel,
+                        c_interp,
+                        d_interp,
+                        lod,
+                        usemap,
+                        elements: Vec::new(),
+                    });
+                }
+            }
+            "usemap" => {
+                // Rendering identifier — `usemap <name>` or `usemap off`.
+                // Spec §"usemap map_name/off": state-setting; applies to
+                // the elements that follow until the next `usemap`. The
+                // bind operates independently of `usemtl` (one chooses a
+                // material, the other a texture-map definition), so a
+                // change splits the primitive into a fresh one that
+                // inherits everything but the map binding. An empty
+                // line is treated as no-op rather than an explicit
+                // turn-off (the spec spells out `off` as the keyword,
+                // never an empty token list).
+                let v: String = tokens.collect::<Vec<_>>().join(" ");
+                if v.is_empty() {
+                    continue;
+                }
+                let mesh = doc.meshes.last_mut().unwrap();
+                let last = mesh.current_or_new();
+                if last.elements.is_empty() {
+                    // No elements bound to this primitive yet — overwrite.
+                    last.usemap = Some(v);
+                } else if last.usemap.as_deref() != Some(v.as_str()) {
+                    let mat = last.material.clone();
+                    let groups = last.groups.clone();
+                    let smoothing = last.smoothing_group.clone();
+                    let merging = last.merging_group.clone();
+                    let bevel = last.bevel.clone();
+                    let c_interp = last.c_interp.clone();
+                    let d_interp = last.d_interp.clone();
+                    let lod = last.lod.clone();
+                    mesh.primitives.push(PrimAccum {
+                        material: mat,
+                        smoothing_group: smoothing,
+                        merging_group: merging,
+                        groups,
+                        bevel,
+                        c_interp,
+                        d_interp,
+                        lod,
+                        usemap: Some(v),
+                        elements: Vec::new(),
                     });
                 }
             }
@@ -735,6 +825,19 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 for tok in tokens {
                     if !doc.mtllibs.iter().any(|m| m == tok) {
                         doc.mtllibs.push(tok.to_string());
+                    }
+                }
+            }
+            "maplib" => {
+                // Rendering identifier — `maplib filename1 filename2 ...`.
+                // Spec §"maplib filename1 filename2 ...": parallel to
+                // `mtllib` but for the texture-map library that
+                // `usemap` references. Each line can list several
+                // files; later duplicates are suppressed (same policy
+                // as `mtllib`).
+                for tok in tokens {
+                    if !doc.maplibs.iter().any(|m| m == tok) {
+                        doc.maplibs.push(tok.to_string());
                     }
                 }
             }
@@ -832,6 +935,16 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         scene.extras.insert(
             "obj:mtllibs".to_string(),
             serde_json::to_value(&doc.mtllibs).unwrap(),
+        );
+    }
+
+    // Spec §"maplib filename1 filename2 ..." — sibling to `mtllib` but
+    // for texture-map definitions consumed by `usemap`. Surfaced on
+    // the scene so a re-encode replays the original library list.
+    if !doc.maplibs.is_empty() {
+        scene.extras.insert(
+            "obj:maplibs".to_string(),
+            serde_json::to_value(&doc.maplibs).unwrap(),
         );
     }
 
@@ -4607,6 +4720,12 @@ fn build_primitive(
         prim.extras
             .insert("obj:lod".to_string(), serde_json::Value::String(s.clone()));
     }
+    if let Some(s) = &prim_acc.usemap {
+        prim.extras.insert(
+            "obj:usemap".to_string(),
+            serde_json::Value::String(s.clone()),
+        );
+    }
     if !prim_acc.groups.is_empty() {
         prim.extras.insert(
             "obj:groups".to_string(),
@@ -4873,6 +4992,17 @@ pub fn serialize_obj_with_options(
                 if let Some(s) = entry.as_str() {
                     writeln!(out, "mtllib {s}").unwrap();
                 }
+            }
+        }
+    }
+    // Spec §"maplib filename1 filename2 ..." — texture-map library
+    // declarations. Emit each name on its own line (the spec accepts
+    // a multi-name line but a one-per-line emit keeps re-encoded diffs
+    // grep-friendly and matches the per-line `mtllib` emit above).
+    if let Some(serde_json::Value::Array(list)) = scene.extras.get("obj:maplibs") {
+        for entry in list {
+            if let Some(s) = entry.as_str() {
+                writeln!(out, "maplib {s}").unwrap();
             }
         }
     }
@@ -5280,6 +5410,16 @@ pub fn serialize_obj_with_options(
                 });
             if let Some(name) = &mtl_name {
                 writeln!(out, "usemtl {name}").unwrap();
+            }
+
+            // Spec §"usemap map_name/off" — texture-map rendering
+            // identifier. Emit verbatim from the round-trip extras
+            // slot populated by the decoder. The literal string is
+            // preserved (so `usemap off` re-emits as `usemap off`,
+            // and `usemap MyTex` re-emits as `usemap MyTex`); the
+            // same per-primitive emit pattern as `usemtl` above.
+            if let Some(name) = prim.extras.get("obj:usemap").and_then(|v| v.as_str()) {
+                writeln!(out, "usemap {name}").unwrap();
             }
 
             let prim_globals = &global_indices[mi][pi];

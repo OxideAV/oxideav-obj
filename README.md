@@ -59,6 +59,14 @@ modern loaders actually load):
 - `mtllib <file.mtl> [<file2.mtl> …]` and `usemtl <name>` — each
   `usemtl` switch starts a fresh `Primitive` so a multi-material OBJ
   becomes a `Mesh` with N primitives, each with its own `MaterialId`.
+- `maplib <lib1.map> [<lib2.map> …]` and `usemap <name>` / `usemap off`
+  — the texture-map sibling of `mtllib` / `usemtl` per spec
+  §"maplib" / §"usemap". Library names ride on
+  `Scene3D::extras["obj:maplibs"]`; the per-primitive binding lands in
+  `Primitive::extras["obj:usemap"]`. A mid-stream `usemap` switch
+  opens a fresh primitive (same state-setter shape as `usemtl` / `s`
+  / `mg`); a `usemtl` switch inherits the active `usemap` binding
+  (the two operate independently per spec).
 - Free-form geometry (`vp` parameter-space vertices, `cstype`,
   `deg`, `curv`, `curv2`, `surf`, `parm`, `trim`, `hole`, `scrv`,
   `sp`, `end`, plus superseded `bzp` / `bsp` patches) — captured
@@ -502,6 +510,27 @@ the existing single-patch mismatch behaviour.
 Round 223: approximation-technique directives + companion-object
 references — four previously-dropped spec-defined directives now
 round-trip.
+
+Round 243: OBJ rendering-identifier pair `maplib` / `usemap` per spec
+§"maplib filename1 filename2 ..." and §"usemap map_name/off". Both
+are siblings to the already-supported material identifiers (`mtllib` /
+`usemtl`) but cover the texture-map library rather than the material
+library. `maplib lib1.map lib2.map ...` lines land on
+`Scene3D::extras["obj:maplibs"]` as a verbatim string array (same
+de-duplication policy as `mtllib` — a name that appears twice on the
+same line or repeats on a later `maplib` line is suppressed). The
+per-primitive binding from `usemap <name>` or `usemap off` lands on
+`Primitive::extras["obj:usemap"]`. State-setter semantics mirror
+`usemtl`: a mid-stream `usemap` switch opens a fresh primitive that
+inherits the active groups, smoothing / merging group, display
+attributes, and `usemtl` material. A `usemtl` switch likewise
+inherits the active `usemap` binding (the two operate independently
+per spec — one selects a material, the other a texture-map
+definition). The encoder replays `maplib` after `mtllib` (one
+line per unique name to keep diffs grep-friendly) and `usemap` after
+`usemtl` (one line per primitive carrying the binding). Documents
+that don't carry either directive produce neither extras key and
+neither encode line.
 
 Round 240: typed decomposition of `map_*` option flags per MTL spec
 §"Options for texture map statements". Parallel to the existing raw
