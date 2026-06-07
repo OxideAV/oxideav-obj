@@ -511,6 +511,27 @@ Round 223: approximation-technique directives + companion-object
 references — four previously-dropped spec-defined directives now
 round-trip.
 
+Round 251: typed decomposition of the `con` connectivity statement
+per spec §"Connectivity between free-form surfaces" / §"con surf_1
+q0_1 q1_1 curv2d_1 surf_2 q0_2 q1_2 curv2d_2". Parallel to the
+verbatim `obj:freeform_directives` channel (which still carries every
+`con` line for round-trip), a parse-time-only typed view now lands
+on `Scene3D::extras["obj:connectivity"]` as an array of objects with
+the eight stable, lowercase, underscore-separated keys `surf_1` /
+`q0_1` / `q1_1` / `curv2d_1` / `surf_2` / `q0_2` / `q1_2` /
+`curv2d_2`. Integer slots (`surf_*`, `curv2d_*`) land as `i64`;
+parameter slots (`q0_*`, `q1_*`) land as `f64`. The encoder is still
+driven by the verbatim channel so the typed view exists purely to
+spare consumers a second pass over the eight positional tokens. Lines
+that don't carry exactly eight arguments, or whose integer / float
+slots fail to parse, drop from the typed view without failing the
+parse (the verbatim channel still replays them byte-faithful).
+Negative indices in the `surf_*` / `curv2d_*` slots are echoed as-is —
+the typed view doesn't resolve them against the surface / curv2
+streams because surfaces aren't numbered in the captured directive
+sequence; consumers that want negative-from-end semantics walk the
+typed value through their own resolver.
+
 Round 246: typed decomposition of the `sp` (special-point) body
 statement per spec §"Special point", §"sp vp1 vp …". The verbatim
 free-form-directives channel still carries every `sp` line for round-

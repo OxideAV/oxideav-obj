@@ -881,6 +881,17 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         Vec::new()
     };
 
+    // Spec §"Connectivity between free-form surfaces", §"con surf_1 q0_1
+    // q1_1 curv2d_1 surf_2 q0_2 q1_2 curv2d_2" typed view: precomputed
+    // for the same borrow-stranding reason as `sp_typed` above. Parse-
+    // time-only — the encoder still drives `con` line emission off
+    // `obj:freeform_directives`.
+    let con_typed = if !doc.freeform_directives.is_empty() {
+        collect_connectivity(&doc)
+    } else {
+        Vec::new()
+    };
+
     // Materials first so primitives can point at their MaterialId.
     // Insertion order is preserved (HashMap iteration order is
     // unspecified, so sort by name to keep round-trip deterministic).
@@ -1023,6 +1034,19 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         scene.extras.insert(
             "obj:special_points".to_string(),
             serde_json::Value::Array(sp_typed),
+        );
+    }
+    if !con_typed.is_empty() {
+        // Spec §"Connectivity between free-form surfaces" / §"con
+        // surf_1 q0_1 q1_1 curv2d_1 surf_2 q0_2 q1_2 curv2d_2" typed
+        // view from the precomputed pass above. Skipped when no `con`
+        // line parsed cleanly (missing keyword, wrong argument count,
+        // or any one of the eight slots failed to parse as the
+        // appropriate i64/f64). The encoder still drives `con`
+        // emission off `obj:freeform_directives`.
+        scene.extras.insert(
+            "obj:connectivity".to_string(),
+            serde_json::Value::Array(con_typed),
         );
     }
 
@@ -2557,6 +2581,105 @@ impl SpecialPointKind {
             SpecialPointKind::Surf => "surf",
         }
     }
+}
+
+/// Walk `doc.freeform_directives` for every `con` connectivity statement
+/// and return a typed decomposition suitable for surfacing on
+/// `Scene3D::extras["obj:connectivity"]`.
+///
+/// Spec §"Connectivity between free-form surfaces" / §"con surf_1 q0_1
+/// q1_1 curv2d_1 surf_2 q0_2 q1_2 curv2d_2": the keyword is followed by
+/// exactly eight positional arguments — two `(surf, q0, q1, curv2d)`
+/// quadruples — that tie two previously-declared `surf` blocks together
+/// along a shared trimming-curve segment for edge merging.
+///
+/// The returned [`serde_json::Value`] is always an array of objects;
+/// each object carries the eight stable, lowercase, underscore-separated
+/// keys:
+///
+/// * `surf_1` — `i64`, the 1-based index of the first surface (negative
+///   values, supported elsewhere in the free-form vocabulary, are kept
+///   as-is; the typed view does NOT resolve them against the surface
+///   stream because surfaces aren't numbered in the captured directive
+///   sequence).
+/// * `q0_1` — `f64`, starting parameter on `curv2d_1`.
+/// * `q1_1` — `f64`, ending parameter on `curv2d_1`.
+/// * `curv2d_1` — `i64`, the 1-based index of the trimming curve on the
+///   first surface.
+/// * `surf_2` — `i64`, the second surface's index.
+/// * `q0_2` — `f64`, starting parameter on `curv2d_2`.
+/// * `q1_2` — `f64`, ending parameter on `curv2d_2`.
+/// * `curv2d_2` — `i64`, the second surface's trimming-curve index.
+///
+/// A `con` line that doesn't carry exactly eight arguments, or whose
+/// integer slots fail to parse as `i64` / float slots fail to parse as
+/// `f64`, is dropped from the typed view without failing the parse
+/// (the original line still rides on `obj:freeform_directives` for
+/// verbatim round-trip). This matches the existing `sp` typed-view
+/// policy: parse-time-only, lossy on malformed input, the verbatim
+/// channel stays the source of truth for the encoder.
+fn collect_connectivity(doc: &ObjDoc) -> Vec<serde_json::Value> {
+    let mut typed: Vec<serde_json::Value> = Vec::new();
+    for entry in &doc.freeform_directives {
+        let Some(keyword) = entry.first().map(String::as_str) else {
+            continue;
+        };
+        if keyword != "con" {
+            continue;
+        }
+        // Spec §"con surf_1 q0_1 q1_1 curv2d_1 surf_2 q0_2 q1_2
+        // curv2d_2": keyword + exactly eight positional args.
+        if entry.len() != 9 {
+            continue;
+        }
+        let Ok(surf_1) = entry[1].parse::<i64>() else {
+            continue;
+        };
+        let Ok(q0_1) = entry[2].parse::<f64>() else {
+            continue;
+        };
+        let Ok(q1_1) = entry[3].parse::<f64>() else {
+            continue;
+        };
+        let Ok(curv2d_1) = entry[4].parse::<i64>() else {
+            continue;
+        };
+        let Ok(surf_2) = entry[5].parse::<i64>() else {
+            continue;
+        };
+        let Ok(q0_2) = entry[6].parse::<f64>() else {
+            continue;
+        };
+        let Ok(q1_2) = entry[7].parse::<f64>() else {
+            continue;
+        };
+        let Ok(curv2d_2) = entry[8].parse::<i64>() else {
+            continue;
+        };
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "surf_1".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(surf_1)),
+        );
+        obj.insert("q0_1".to_string(), serde_json::Value::from(q0_1));
+        obj.insert("q1_1".to_string(), serde_json::Value::from(q1_1));
+        obj.insert(
+            "curv2d_1".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(curv2d_1)),
+        );
+        obj.insert(
+            "surf_2".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(surf_2)),
+        );
+        obj.insert("q0_2".to_string(), serde_json::Value::from(q0_2));
+        obj.insert("q1_2".to_string(), serde_json::Value::from(q1_2));
+        obj.insert(
+            "curv2d_2".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(curv2d_2)),
+        );
+        typed.push(serde_json::Value::Object(obj));
+    }
+    typed
 }
 
 /// Tessellate every `surf` element that sits under a supported `cstype`

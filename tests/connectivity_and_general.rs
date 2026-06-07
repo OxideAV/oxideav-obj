@@ -463,3 +463,163 @@ fn empty_csh_line_with_no_command_text_is_dropped() {
     let text = std::str::from_utf8(&bytes).unwrap();
     assert!(text.lines().any(|l| l == "csh"));
 }
+
+// ---------------------------------------------------------------------------
+// `con` typed accessor — round 251
+// ---------------------------------------------------------------------------
+//
+// Parallel to the verbatim `obj:freeform_directives` channel, a
+// parse-time-only decomposition lands on
+// `Scene3D::extras["obj:connectivity"]` as an array of objects with the
+// eight stable keys `surf_1` / `q0_1` / `q1_1` / `curv2d_1` / `surf_2` /
+// `q0_2` / `q1_2` / `curv2d_2` per spec §"Connectivity between free-form
+// surfaces" / §"con surf_1 q0_1 q1_1 curv2d_1 surf_2 q0_2 q1_2
+// curv2d_2". The encoder is still driven by the verbatim channel; the
+// typed view exists purely so consumers don't have to re-parse the eight
+// positional tokens themselves.
+
+#[test]
+fn con_typed_view_decomposes_eight_arguments() {
+    let scene = obj::parse_obj(CON_OBJ_EXAMPLE_1).unwrap();
+    let con_typed = scene
+        .extras
+        .get("obj:connectivity")
+        .expect("typed con view present");
+    let arr = con_typed.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "one con line typed");
+
+    let entry = arr[0].as_object().unwrap();
+    // Integer slots — spec §"con" defines them as 1-based indices into
+    // the surface stream and the curv2 trimming-curve stream.
+    assert_eq!(entry["surf_1"].as_i64(), Some(1));
+    assert_eq!(entry["curv2d_1"].as_i64(), Some(1));
+    assert_eq!(entry["surf_2"].as_i64(), Some(2));
+    assert_eq!(entry["curv2d_2"].as_i64(), Some(1));
+    // Float slots — q0 / q1 are parameter values along the referenced
+    // curv2d.
+    assert!((entry["q0_1"].as_f64().unwrap() - 2.0).abs() < 1e-6);
+    assert!((entry["q1_1"].as_f64().unwrap() - 2.0).abs() < 1e-6);
+    assert!((entry["q0_2"].as_f64().unwrap() - 4.0).abs() < 1e-6);
+    assert!((entry["q1_2"].as_f64().unwrap() - 3.0).abs() < 1e-6);
+
+    // All eight keys present, nothing extra.
+    assert_eq!(entry.len(), 8, "exactly eight keys");
+    for key in [
+        "surf_1", "q0_1", "q1_1", "curv2d_1", "surf_2", "q0_2", "q1_2", "curv2d_2",
+    ] {
+        assert!(entry.contains_key(key), "missing typed key: {key}");
+    }
+}
+
+#[test]
+fn con_typed_view_survives_round_trip_unchanged() {
+    let scene = obj::parse_obj(CON_OBJ_EXAMPLE_1).unwrap();
+    let typed_before = scene.extras.get("obj:connectivity").cloned().unwrap();
+
+    let bytes = obj::serialize_obj(&scene, None).unwrap();
+    let scene2 = ObjDecoder::new().decode(&bytes).unwrap();
+    let typed_after = scene2.extras.get("obj:connectivity").cloned().unwrap();
+
+    assert_eq!(
+        typed_before, typed_after,
+        "typed con view differs across decode → encode → decode cycle"
+    );
+}
+
+#[test]
+fn con_typed_view_handles_multiple_lines() {
+    // Two `con` statements at the tail of the free-form section. The
+    // typed array preserves source order.
+    let src = "\
+v 0 0 0
+v 1 0 0
+v 0 1 0
+v 1 1 0
+con 1 0.0 1.0 2 3 0.5 1.5 4
+con 2 1.0 2.0 5 1 2.5 3.5 6
+";
+    let scene = obj::parse_obj(src).unwrap();
+    let arr = scene
+        .extras
+        .get("obj:connectivity")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(arr.len(), 2);
+
+    let first = arr[0].as_object().unwrap();
+    let second = arr[1].as_object().unwrap();
+    assert_eq!(first["surf_1"].as_i64(), Some(1));
+    assert_eq!(first["curv2d_2"].as_i64(), Some(4));
+    assert_eq!(second["surf_1"].as_i64(), Some(2));
+    assert_eq!(second["curv2d_2"].as_i64(), Some(6));
+}
+
+#[test]
+fn con_typed_view_preserves_negative_indices_verbatim() {
+    // Spec §"con" doesn't call out negative-index resolution; the typed
+    // view captures whatever the operator wrote (i64 directly), without
+    // normalising against any surface / curv2 stream. This keeps the
+    // typed view a faithful echo of the source — consumers that want
+    // negative-from-end semantics for surfaces / curv2s walk the typed
+    // value through their own resolver.
+    let src = "\
+v 0 0 0
+v 1 0 0
+con -2 0.0 1.0 -1 -1 0.0 1.0 -1
+";
+    let scene = obj::parse_obj(src).unwrap();
+    let arr = scene
+        .extras
+        .get("obj:connectivity")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(arr.len(), 1);
+    let entry = arr[0].as_object().unwrap();
+    assert_eq!(entry["surf_1"].as_i64(), Some(-2));
+    assert_eq!(entry["curv2d_1"].as_i64(), Some(-1));
+    assert_eq!(entry["surf_2"].as_i64(), Some(-1));
+    assert_eq!(entry["curv2d_2"].as_i64(), Some(-1));
+}
+
+#[test]
+fn con_typed_view_drops_malformed_lines_without_failing_parse() {
+    // Spec §"con" requires exactly eight positional arguments. Lines
+    // with fewer / more args, or with non-numeric tokens in any of the
+    // eight slots, drop from the typed view but still land verbatim on
+    // `obj:freeform_directives` so the encoder can replay them. Mirrors
+    // the lossy-on-malformed policy of the existing `sp` typed view.
+    let src = "\
+v 0 0 0
+con 1 0.0 1.0
+con 1 a b 2 3 0.5 1.5 4
+con 1 0.0 1.0 2 3 0.5 1.5 4
+";
+    let scene = obj::parse_obj(src).unwrap();
+    let typed = scene
+        .extras
+        .get("obj:connectivity")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(typed.len(), 1, "only the well-formed line survives");
+
+    // The verbatim channel still carries all three lines so the encoder
+    // re-emits each one byte-faithful.
+    let bytes = obj::serialize_obj(&scene, None).unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.contains("con 1 0.0 1.0\n"));
+    assert!(text.contains("con 1 a b 2 3 0.5 1.5 4"));
+    assert!(text.contains("con 1 0.0 1.0 2 3 0.5 1.5 4"));
+}
+
+#[test]
+fn con_typed_view_absent_when_no_con_lines() {
+    // No `con` directive → no `obj:connectivity` key. Consumers can
+    // safely `.get()` and skip without distinguishing "no con" from
+    // "all con lines malformed and dropped".
+    let src = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+    let scene = obj::parse_obj(src).unwrap();
+    assert!(!scene.extras.contains_key("obj:connectivity"));
+}
