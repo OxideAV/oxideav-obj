@@ -870,6 +870,17 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
     scene.up_axis = Axis::PosY;
     scene.unit = Unit::Metres;
 
+    // Spec §"Special point", §"sp vp1 vp …" typed view: precomputed
+    // here so the doc move into the `doc.meshes` for-loop below doesn't
+    // strand the borrow. Parse-time-only — the encoder still drives
+    // `sp` line emission off `obj:freeform_directives`.
+    let sp_typed = if !doc.freeform_directives.is_empty() {
+        let (typed, _) = collect_special_points(&doc);
+        typed
+    } else {
+        Vec::new()
+    };
+
     // Materials first so primitives can point at their MaterialId.
     // Insertion order is preserved (HashMap iteration order is
     // unspecified, so sort by name to keep round-trip deterministic).
@@ -1002,6 +1013,16 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         scene.extras.insert(
             "obj:freeform_directives".to_string(),
             serde_json::to_value(&doc.freeform_directives).unwrap(),
+        );
+    }
+    if !sp_typed.is_empty() {
+        // Spec §"Special point", §"sp vp1 vp …" typed view from the
+        // precomputed pass above. Skipped when no `sp` resolves cleanly
+        // (empty pool, all references out of range, or none of the
+        // directives carry an `sp`).
+        scene.extras.insert(
+            "obj:special_points".to_string(),
+            serde_json::Value::Array(sp_typed),
         );
     }
 
@@ -2306,6 +2327,236 @@ fn tessellate_scrv(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
     }
 
     out
+}
+
+/// Walk every `cstype` … `end` block once and lift every `sp` (special
+/// point) body statement that appears inside it into a typed
+/// parameter-space record. Spec §"Special point", §"sp vp1 vp …".
+///
+/// A special point is an `sp` body statement (spec §"Free-form
+/// curve/surface body statements") that lists one or more 1-based
+/// references into the `vp` parameter-vertex pool. The kind of element
+/// the body sits under decides how many of each `vp`'s components are
+/// meaningful:
+///   * Inside a `curv` (3D space curve) block — the parameter vertices
+///     are 1D (`vp u`), so only the `u` component of each referenced
+///     `vp` is meaningful (spec: "For space curves and trimming curves,
+///     the parameter vertices must be 1D").
+///   * Inside a `curv2` (2D parameter-space trimming curve) block — also
+///     1D per spec, but the `vp` line that the curv2 references in turn
+///     supplies the surface-space `(u, v)` coordinate of the trimming
+///     curve's control point. The spec treats a special point on a
+///     trimming curve as "essentially the same as a special point on
+///     the surface it trims" — both `u` and `v` are meaningful (spec
+///     §"Special point").
+///   * Inside a `surf` block — the parameter vertices are 2D (spec:
+///     "For surfaces, the parameter vertices must be 2D"), so both `u`
+///     and `v` from each referenced `vp` are meaningful.
+///
+/// The element kind is determined by the first `curv` / `curv2` / `surf`
+/// directive seen inside the open `cstype` block. (The spec doesn't
+/// allow mixing element kinds inside one `cstype` block — `end` closes
+/// the block before a fresh `cstype` reopens one.)
+///
+/// Typed view: each `sp` directive's resolved references land on
+/// `Scene3D::extras["obj:special_points"]` as an array of objects with
+/// the stable keys:
+///   * `element_kind` — `"curv"` / `"curv2"` / `"surf"`.
+///   * `vp_index_1based` — the original 1-based reference (after
+///     negative-from-end normalisation).
+///   * `u` — `f64`, always present.
+///   * `v` — `f64` for `curv2` and `surf`; `null` for `curv` (the spec
+///     says space-curve special points are 1D).
+///
+/// Synthetic primitive: per `sp` directive, a [`Topology::Points`]
+/// primitive lands on a synthetic mesh named `"obj:sps"`. Point
+/// positions lift each resolved special point into 3D as
+/// `[u, v_or_0, 0.0]` so consumers can render them alongside the
+/// surrounding tessellated curve / surface lattice without re-walking
+/// the directive stream. Each primitive carries provenance extras:
+///   * `obj:tessellated_curve` — `true` (shared encoder-filter sentinel,
+///     so the encoder's existing `is_tessellated_curve` filter drops the
+///     synthetic primitives from a re-emit).
+///   * `obj:special_point` — `true` (sp marker).
+///   * `obj:special_point_element_kind` — `"curv"` / `"curv2"` / `"surf"`.
+///   * `obj:special_point_vp_refs` — array of the resolved 1-based vp
+///     indices in source order.
+///
+/// `vp` references support the spec's negative-from-end shorthand the
+/// rest of the free-form path uses (§"Special point" example 9: `sp 1`
+/// after a `curv` that itself referenced `-4 -3 -2 -1`); references that
+/// land outside the live `vp` pool are silently dropped from both the
+/// typed view and the synthetic primitive (no fail-loud — the encoder
+/// still replays the original `sp` line verbatim from
+/// `Scene3D::extras["obj:freeform_directives"]`).
+type SpecialPointPrimData = Vec<(SpecialPointKind, Vec<SpecialPointRef>)>;
+type SpecialPointRef = (i64, f32, Option<f32>);
+
+fn collect_special_points(doc: &ObjDoc) -> (Vec<serde_json::Value>, SpecialPointPrimData) {
+    let mut typed: Vec<serde_json::Value> = Vec::new();
+    let mut prim_data: SpecialPointPrimData = Vec::new();
+    let n_vp = doc.vp.len() as i64;
+    if n_vp == 0 {
+        return (typed, prim_data);
+    }
+
+    // Per-block state: the active element kind inside the current
+    // `cstype` … `end` block, set when we see the first `curv` /
+    // `curv2` / `surf` directive after `cstype` and cleared on `end`.
+    let mut active_kind: Option<SpecialPointKind> = None;
+
+    for entry in &doc.freeform_directives {
+        let Some(keyword) = entry.first().map(String::as_str) else {
+            continue;
+        };
+        match keyword {
+            "cstype" => {
+                // Fresh block opens; clear any leftover kind from a
+                // previous block that didn't terminate cleanly.
+                active_kind = None;
+            }
+            "end" => {
+                active_kind = None;
+            }
+            "curv" => {
+                active_kind = Some(SpecialPointKind::Curv);
+            }
+            "curv2" => {
+                active_kind = Some(SpecialPointKind::Curv2);
+            }
+            "surf" => {
+                active_kind = Some(SpecialPointKind::Surf);
+            }
+            "sp" => {
+                let Some(kind) = active_kind else {
+                    // An `sp` line with no enclosing element. The spec
+                    // doesn't define behaviour for that — skip but the
+                    // free-form-directives replay still re-emits it.
+                    continue;
+                };
+                let mut resolved: Vec<SpecialPointRef> = Vec::new();
+                for tok in &entry[1..] {
+                    let Ok(raw) = tok.parse::<i64>() else {
+                        continue;
+                    };
+                    if raw == 0 {
+                        continue;
+                    }
+                    let normalised = if raw > 0 { raw } else { n_vp + raw + 1 };
+                    if normalised <= 0 || normalised > n_vp {
+                        continue;
+                    }
+                    let slot = (normalised - 1) as usize;
+                    let vp = doc.vp[slot];
+                    let u = vp[0];
+                    let v = match kind {
+                        SpecialPointKind::Curv => None,
+                        SpecialPointKind::Curv2 | SpecialPointKind::Surf => Some(vp[1]),
+                    };
+                    let kind_str = kind.as_str();
+                    let mut obj = serde_json::Map::new();
+                    obj.insert(
+                        "element_kind".to_string(),
+                        serde_json::Value::String(kind_str.to_string()),
+                    );
+                    obj.insert(
+                        "vp_index_1based".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(normalised)),
+                    );
+                    obj.insert("u".to_string(), serde_json::Value::from(u as f64));
+                    obj.insert(
+                        "v".to_string(),
+                        match v {
+                            Some(value) => serde_json::Value::from(value as f64),
+                            None => serde_json::Value::Null,
+                        },
+                    );
+                    typed.push(serde_json::Value::Object(obj));
+                    resolved.push((normalised, u, v));
+                }
+                if !resolved.is_empty() {
+                    prim_data.push((kind, resolved));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (typed, prim_data)
+}
+
+/// Synthetic-primitive companion to [`collect_special_points`]. Emits
+/// one [`Topology::Points`] primitive per `sp` directive, with each
+/// resolved special point lifted into 3D as `[u, v_or_0, 0.0]` (spec
+/// §"Special point"). The primitives land on the `"obj:sps"` synthetic
+/// mesh and are filtered out on re-encode via the shared
+/// `obj:tessellated_curve` sentinel.
+fn tessellate_special_points(doc: &ObjDoc) -> Vec<Primitive> {
+    let mut out: Vec<Primitive> = Vec::new();
+    let (_, prim_data) = collect_special_points(doc);
+    for (kind, points) in prim_data {
+        let positions: Vec<[f32; 3]> = points
+            .iter()
+            .map(|(_, u, v)| [*u, v.unwrap_or(0.0), 0.0])
+            .collect();
+        let n = positions.len() as u32;
+        let mut prim = Primitive::new(Topology::Points);
+        prim.positions = positions;
+        prim.indices = if n > u16::MAX as u32 {
+            Some(Indices::U32((0..n).collect()))
+        } else {
+            Some(Indices::U16((0..n).map(|i| i as u16).collect()))
+        };
+        prim.extras.insert(
+            "obj:tessellated_curve".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        prim.extras.insert(
+            "obj:special_point".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        prim.extras.insert(
+            "obj:special_point_element_kind".to_string(),
+            serde_json::Value::String(kind.as_str().to_string()),
+        );
+        let refs: Vec<serde_json::Value> = points
+            .iter()
+            .map(|(idx, _, _)| serde_json::Value::Number(serde_json::Number::from(*idx)))
+            .collect();
+        prim.extras.insert(
+            "obj:special_point_vp_refs".to_string(),
+            serde_json::Value::Array(refs),
+        );
+        out.push(prim);
+    }
+    out
+}
+
+/// Element-kind classifier for the `sp` body statement (spec §"Special
+/// point"). Determines how many of each referenced `vp`'s components are
+/// meaningful when surfaced on the typed view + synthetic primitive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpecialPointKind {
+    /// Inside a `curv` (3D space curve) block — `vp` references are 1D.
+    Curv,
+    /// Inside a `curv2` (2D parameter-space trimming curve) block —
+    /// `vp` references are 1D per the curve spec, but the spec
+    /// describes a trimming-curve special point as "essentially the
+    /// same as a special point on the surface it trims" so we surface
+    /// both `u` and `v`.
+    Curv2,
+    /// Inside a `surf` block — `vp` references are 2D.
+    Surf,
+}
+
+impl SpecialPointKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            SpecialPointKind::Curv => "curv",
+            SpecialPointKind::Curv2 => "curv2",
+            SpecialPointKind::Surf => "surf",
+        }
+    }
 }
 
 /// Tessellate every `surf` element that sits under a supported `cstype`
@@ -4900,6 +5151,21 @@ where
         Vec::new()
     };
 
+    // Special-point (`sp`) synthetic-primitive pass (round 246) — gated
+    // on the same `curve_tessellation_samples` knob the curv / scrv /
+    // surf passes use, but the special-points pass doesn't sample at a
+    // density; it emits exactly one [`Topology::Points`] primitive per
+    // `sp` directive (lifted from the resolved `vp` parameter-vertex
+    // pool, spec §"Special point", §"sp vp1 vp …"). The directives
+    // still ride on `Scene3D::extras["obj:freeform_directives"]` for
+    // verbatim round-trip; the encoder filters the synthetic primitives
+    // out via the shared `obj:tessellated_curve` sentinel.
+    let tessellated_sp = if options.curve_tessellation_samples > 0 {
+        tessellate_special_points(&doc)
+    } else {
+        Vec::new()
+    };
+
     let mut scene = build_scene(doc)?;
 
     if !tessellated.is_empty() {
@@ -4929,6 +5195,14 @@ where
     if !tessellated_scrv.is_empty() {
         let mut mesh = Mesh::new(Some("obj:scrvs".to_string()));
         for prim in tessellated_scrv {
+            mesh.primitives.push(prim);
+        }
+        scene.add_mesh(mesh);
+    }
+
+    if !tessellated_sp.is_empty() {
+        let mut mesh = Mesh::new(Some("obj:sps".to_string()));
+        for prim in tessellated_sp {
             mesh.primitives.push(prim);
         }
         scene.add_mesh(mesh);

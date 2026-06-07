@@ -511,6 +511,37 @@ Round 223: approximation-technique directives + companion-object
 references — four previously-dropped spec-defined directives now
 round-trip.
 
+Round 246: typed decomposition of the `sp` (special-point) body
+statement per spec §"Special point", §"sp vp1 vp …". The verbatim
+free-form-directives channel still carries every `sp` line for round-
+trip, but a parse-time-only typed view now lands on
+`Scene3D::extras["obj:special_points"]` as an array of objects with the
+stable keys `element_kind` / `vp_index_1based` / `u` / `v`, in source
+order. The element kind is decided by the directive that opened the
+enclosing `cstype` … `end` block: `curv` keeps `v = null` (spec: "For
+space curves and trimming curves, the parameter vertices must be 1D");
+`curv2` surfaces both `u` and `v` because the spec describes a
+trimming-curve special point as "essentially the same as a special
+point on the surface it trims"; `surf` carries both components (spec:
+"For surfaces, the parameter vertices must be 2D"). A companion
+synthetic `Topology::Points` primitive lands on a new `"obj:sps"` mesh
+under the same `with_curve_tessellation(samples)` knob the other
+free-form passes use, one primitive per `sp` directive, with positions
+lifted as `[u, v_or_0, 0.0]` plus per-primitive provenance extras
+(`obj:special_point` marker, `obj:special_point_element_kind` string,
+`obj:special_point_vp_refs` array of resolved 1-based vp indices). The
+synthetic primitives carry the shared `obj:tessellated_curve` sentinel
+so the encoder's existing `is_tessellated_curve` filter drops them on
+re-emit; the `sp` line itself replays unchanged from the
+`obj:freeform_directives` array. Negative `vp` references resolve
+relative-from-end per the surrounding free-form pattern; references
+outside the live `vp` pool (including `0`) drop silently from both the
+typed view and the synthetic primitive without failing the parse, since
+the verbatim directive replay handles round-trip independently. `sp`
+lines outside any open `cstype` block are omitted from the typed view
+(no enclosing element kind to resolve against) but still appear in the
+verbatim replay.
+
 Round 243: OBJ rendering-identifier pair `maplib` / `usemap` per spec
 §"maplib filename1 filename2 ..." and §"usemap map_name/off". Both
 are siblings to the already-supported material identifiers (`mtllib` /

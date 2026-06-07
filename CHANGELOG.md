@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 246: typed decomposition of the `sp` (special-point) body
+  statement per spec §"Special point", §"sp vp1 vp …". The verbatim
+  `obj:freeform_directives` channel still carries every `sp` line for
+  round-trip; a parse-time-only typed view now lands on
+  `Scene3D::extras["obj:special_points"]` as an array of objects with
+  the stable keys `element_kind` / `vp_index_1based` / `u` / `v`, in
+  source order. The element kind is decided by the directive that
+  opened the enclosing `cstype` … `end` block (`curv` → `v = null`
+  because space-curve special points are 1D per spec; `curv2` → both
+  `u` and `v`, matching the spec's "essentially the same as a special
+  point on the surface it trims" note; `surf` → both components per
+  the 2D-parameter-vertex requirement). A companion synthetic
+  `Topology::Points` primitive lands on a new `"obj:sps"` mesh under
+  the existing `with_curve_tessellation(samples)` knob, one per `sp`
+  directive, with per-primitive provenance extras
+  (`obj:special_point` marker, `obj:special_point_element_kind`,
+  `obj:special_point_vp_refs`). The shared `obj:tessellated_curve`
+  sentinel keeps the encoder's `is_tessellated_curve` filter from
+  re-emitting the synthetic mesh; the `sp` line itself replays
+  verbatim from the directive array. Negative `vp` references resolve
+  relative-from-end; references outside the live `vp` pool (and `0`)
+  drop silently from both the typed view and the synthetic primitive
+  without failing the parse. `sp` lines outside any open `cstype`
+  block are omitted from the typed view (no enclosing element kind to
+  resolve against) but still appear in the verbatim replay.
+
 - Round 243: OBJ rendering-identifier pair `maplib` / `usemap` per spec
   §"maplib filename1 filename2 ..." and §"usemap map_name/off". Both
   are siblings to the already-supported material identifiers
