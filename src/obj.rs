@@ -892,6 +892,17 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         Vec::new()
     };
 
+    // Spec §"parm u/v" typed view: one object per `parm u …` / `parm v …`
+    // body statement, paired with the enclosing element kind
+    // (`curv` / `curv2` / `surf`) and `cstype` slug. Parse-time-only —
+    // the encoder still drives `parm` line emission off
+    // `obj:freeform_directives`.
+    let parms_typed = if !doc.freeform_directives.is_empty() {
+        collect_parms(&doc)
+    } else {
+        Vec::new()
+    };
+
     // Materials first so primitives can point at their MaterialId.
     // Insertion order is preserved (HashMap iteration order is
     // unspecified, so sort by name to keep round-trip deterministic).
@@ -1047,6 +1058,17 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         scene.extras.insert(
             "obj:connectivity".to_string(),
             serde_json::Value::Array(con_typed),
+        );
+    }
+    if !parms_typed.is_empty() {
+        // Spec §"parm u/v" typed view from the precomputed pass above.
+        // Skipped when no `parm` line resolved cleanly (no enclosing
+        // element kind, unrecognised direction token, or every line
+        // failed to surface any parseable values). The encoder still
+        // drives `parm` emission off `obj:freeform_directives`.
+        scene.extras.insert(
+            "obj:parms".to_string(),
+            serde_json::Value::Array(parms_typed),
         );
     }
 
@@ -2678,6 +2700,147 @@ fn collect_connectivity(doc: &ObjDoc) -> Vec<serde_json::Value> {
             serde_json::Value::Number(serde_json::Number::from(curv2d_2)),
         );
         typed.push(serde_json::Value::Object(obj));
+    }
+    typed
+}
+
+/// Walk `doc.freeform_directives` for every `parm u …` / `parm v …` body
+/// statement and return a typed decomposition suitable for surfacing on
+/// `Scene3D::extras["obj:parms"]`.
+///
+/// Spec §"parm u/v" / §"Free-form curve/surface body statements": a
+/// `parm` line carries the **global parameters** (for Bezier / Cardinal /
+/// Taylor / basis-matrix curves and surfaces) or the **knot vector** (for
+/// B-spline / NURBS curves and surfaces) that fix the evaluation domain
+/// of the surrounding free-form element. Each line writes one parametric
+/// direction at a time: `parm u p1 p2 …` for `u`, `parm v p1 p2 …` for
+/// `v`. A surface block can therefore carry two `parm` lines (one per
+/// direction); curves and trimming curves only ever write `parm u`.
+///
+/// The returned [`serde_json::Value`] is always an array of objects, one
+/// entry per source `parm` directive in source order; each object carries
+/// the four stable, lowercase, underscore-separated keys:
+///
+/// * `direction` — `String`, exactly `"u"` or `"v"`.
+/// * `element_kind` — `String`, the kind of the enclosing free-form
+///   element (`"curv"` / `"curv2"` / `"surf"`) — decided by the most
+///   recent `curv` / `curv2` / `surf` directive inside the current
+///   `cstype … end` block. A `parm` line that sits outside any element
+///   (no `curv` / `curv2` / `surf` seen since the last `cstype`) is
+///   dropped from the typed view.
+/// * `cstype` — `String`, the type slug declared by the enclosing
+///   `cstype` directive — one of `"bezier"` / `"rat_bezier"` /
+///   `"bspline"` / `"rat_bspline"` / `"cardinal"` / `"taylor"` /
+///   `"bmatrix"`. A `parm` line that sits outside any `cstype` block
+///   (i.e. the most-recent `cstype` token wasn't a recognised type)
+///   surfaces `"unknown"` in this slot so consumers can still see the
+///   raw values. Per spec the same domain semantics apply: B-spline
+///   reads the values as the knot vector; Bezier / Cardinal / Taylor
+///   / basis-matrix reads them as global parameters that define the
+///   per-segment break points.
+/// * `values` — array of `f64`, the parsed floating-point values from
+///   the `parm` line (`p1 p2 p3 …`). Tokens that fail to parse as
+///   `f64` are dropped — same lenient policy the rest of the typed
+///   accessors use. The spec requires a minimum of two parameter
+///   values per line; lines that fall short still surface their
+///   surviving values without failing the parse.
+///
+/// The encoder is still driven by the verbatim
+/// `obj:freeform_directives` channel; the typed view exists purely so
+/// consumers don't have to walk the directive sequence themselves to
+/// pair every `parm` with its enclosing element + `cstype` block.
+///
+/// Lines whose `parm` direction token isn't exactly `"u"` or `"v"` (the
+/// only two values the spec defines) are dropped from the typed view
+/// without failing the parse; the verbatim channel still replays them
+/// byte-faithful.
+fn collect_parms(doc: &ObjDoc) -> Vec<serde_json::Value> {
+    let mut typed: Vec<serde_json::Value> = Vec::new();
+    // Per-block state mirrored from the round-11/12/13/14/182 surface
+    // tessellation pass: a `cstype` directive opens a new block, sets
+    // the active type slug, and clears any previously-tracked element
+    // kind; a `curv` / `curv2` / `surf` directive inside the block
+    // pins the element kind for the following body statements; `end`
+    // clears both.
+    let mut active_cstype: Option<&'static str> = None;
+    let mut active_kind: Option<&'static str> = None;
+    for entry in &doc.freeform_directives {
+        let Some(keyword) = entry.first().map(String::as_str) else {
+            continue;
+        };
+        match keyword {
+            "cstype" => {
+                // Re-derive the type slug from `cstype [rat] type` per
+                // spec §"Curve and surface type". Mirrors the matching
+                // table used by `tessellate_surfaces`.
+                let mut iter = entry.iter().skip(1);
+                let first = iter.next().map(String::as_str);
+                let second = iter.next().map(String::as_str);
+                active_cstype = match (first, second) {
+                    (Some("bezier"), _) => Some("bezier"),
+                    (Some("rat"), Some("bezier")) => Some("rat_bezier"),
+                    (Some("bspline"), _) => Some("bspline"),
+                    (Some("rat"), Some("bspline")) => Some("rat_bspline"),
+                    (Some("cardinal"), _) => Some("cardinal"),
+                    (Some("rat"), Some("cardinal")) => Some("cardinal"),
+                    (Some("taylor"), _) => Some("taylor"),
+                    (Some("rat"), Some("taylor")) => Some("taylor"),
+                    (Some("bmatrix"), _) => Some("bmatrix"),
+                    (Some("rat"), Some("bmatrix")) => Some("bmatrix"),
+                    _ => None,
+                };
+                active_kind = None;
+            }
+            "end" => {
+                active_cstype = None;
+                active_kind = None;
+            }
+            "curv" => active_kind = Some("curv"),
+            "curv2" => active_kind = Some("curv2"),
+            "surf" => active_kind = Some("surf"),
+            "parm" => {
+                // Spec §"parm u/v": exactly `parm u …` or `parm v …`.
+                // Anything else (no direction token, or a token that
+                // isn't u/v) drops from the typed view.
+                let Some(direction) = entry.get(1).map(String::as_str) else {
+                    continue;
+                };
+                if direction != "u" && direction != "v" {
+                    continue;
+                }
+                let Some(kind) = active_kind else {
+                    // `parm` outside any element. The spec doesn't
+                    // define this; we drop it from the typed view (the
+                    // verbatim channel still replays the line).
+                    continue;
+                };
+                let values: Vec<f64> = entry[2..]
+                    .iter()
+                    .filter_map(|t| t.parse::<f64>().ok())
+                    .collect();
+                let mut obj = serde_json::Map::new();
+                obj.insert(
+                    "direction".to_string(),
+                    serde_json::Value::String(direction.to_string()),
+                );
+                obj.insert(
+                    "element_kind".to_string(),
+                    serde_json::Value::String(kind.to_string()),
+                );
+                obj.insert(
+                    "cstype".to_string(),
+                    serde_json::Value::String(active_cstype.unwrap_or("unknown").to_string()),
+                );
+                obj.insert(
+                    "values".to_string(),
+                    serde_json::Value::Array(
+                        values.into_iter().map(serde_json::Value::from).collect(),
+                    ),
+                );
+                typed.push(serde_json::Value::Object(obj));
+            }
+            _ => {}
+        }
     }
     typed
 }

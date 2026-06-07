@@ -511,6 +511,36 @@ Round 223: approximation-technique directives + companion-object
 references — four previously-dropped spec-defined directives now
 round-trip.
 
+Round 254: typed decomposition of the `parm u …` / `parm v …` body
+statement per spec §"parm u/v" + §"Free-form curve/surface body
+statements". Parallel to the verbatim `obj:freeform_directives`
+channel (which still carries every `parm` line for round-trip), a
+parse-time-only typed view now lands on
+`Scene3D::extras["obj:parms"]` as an array of objects with the four
+stable, lowercase, underscore-separated keys `direction` /
+`element_kind` / `cstype` / `values`. The `direction` is exactly
+`"u"` or `"v"` per the only two values the spec defines; the
+`element_kind` (`"curv"` / `"curv2"` / `"surf"`) is pinned by the
+most recent `curv` / `curv2` / `surf` directive inside the
+surrounding `cstype … end` block; the `cstype` slug carries the
+recognised type from the enclosing `cstype` header (one of
+`"bezier"` / `"rat_bezier"` / `"bspline"` / `"rat_bspline"` /
+`"cardinal"` / `"taylor"` / `"bmatrix"`), or `"unknown"` when the
+declared type isn't one of those names. `values` is the parsed
+array of `f64` — the global parameters for Bezier / Cardinal /
+Taylor / basis-matrix elements, or the knot vector for B-spline /
+NURBS elements per the spec's twin role for the `parm` keyword. The
+encoder is still driven by the verbatim channel so the typed view
+exists purely to spare consumers from walking the directive
+sequence to pair every `parm` line with its enclosing `cstype` block
++ element kind. Lines whose direction token isn't exactly `"u"` /
+`"v"`, or that sit outside any element (no `curv` / `curv2` / `surf`
+seen since the last `cstype`), drop from the typed view without
+failing the parse (the verbatim channel still replays them
+byte-faithful). Non-numeric value tokens drop from the per-line
+`values` array — mirrors the lenient-on-malformed policy of the
+existing `sp` / `con` typed views.
+
 Round 251: typed decomposition of the `con` connectivity statement
 per spec §"Connectivity between free-form surfaces" / §"con surf_1
 q0_1 q1_1 curv2d_1 surf_2 q0_2 q1_2 curv2d_2". Parallel to the

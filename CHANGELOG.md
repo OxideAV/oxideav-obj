@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 254: typed decomposition of the `parm u …` / `parm v …` body
+  statement per spec §"parm u/v" + §"Free-form curve/surface body
+  statements". Parallel to the verbatim `obj:freeform_directives`
+  channel (which still carries every `parm` line for round-trip), a
+  parse-time-only typed view now lands on
+  `Scene3D::extras["obj:parms"]` as an array of objects with the four
+  stable, lowercase, underscore-separated keys `direction` /
+  `element_kind` / `cstype` / `values`. The direction is exactly `"u"`
+  or `"v"` per spec; the element kind (`"curv"` / `"curv2"` / `"surf"`)
+  is decided by the most recent `curv` / `curv2` / `surf` directive
+  inside the current `cstype … end` block; the cstype slug is the
+  recognised type from the enclosing `cstype` header (one of
+  `"bezier"` / `"rat_bezier"` / `"bspline"` / `"rat_bspline"` /
+  `"cardinal"` / `"taylor"` / `"bmatrix"`), or `"unknown"` when the
+  declared type isn't one of those names. `values` is the parsed
+  array of `f64` — the global parameters for Bezier / Cardinal /
+  Taylor / basis-matrix elements, or the knot vector for B-spline /
+  NURBS elements per the spec's twin role for the `parm` keyword. The
+  encoder is still driven by the verbatim channel — the typed view
+  exists purely so consumers don't have to walk the directive
+  sequence pairing every `parm` line with its enclosing `cstype` block
+  + element kind. Lines whose direction token isn't exactly `"u"` /
+  `"v"`, or that sit outside any element (no `curv` / `curv2` / `surf`
+  seen since the last `cstype`), drop from the typed view without
+  failing the parse (the verbatim channel still replays them
+  byte-faithful). Non-numeric value tokens drop from the per-line
+  `values` array — mirrors the lenient-on-malformed policy of the
+  existing sp / con typed views. New `tests/parm_typed.rs` suite (10
+  tests) covering: two-direction surface block (u + v), Bezier curve
+  global-parameter single-direction line, curv2 inside `cstype rat
+  bezier` (verifying the rat_bezier slug), round-trip stability of
+  the typed view, source-order preservation across multiple
+  `cstype … end` blocks, unknown-direction drop, parm-outside-element
+  drop, absent-key when the file has no `parm` lines, non-numeric
+  token drop within a line, and unknown-cstype slug for unrecognised
+  types.
+
 - Round 251: typed decomposition of the `con` connectivity statement
   per spec §"Connectivity between free-form surfaces" / §"con surf_1
   q0_1 q1_1 curv2d_1 surf_2 q0_2 q1_2 curv2d_2". Parallel to the
