@@ -903,6 +903,20 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         Vec::new()
     };
 
+    // Spec §"ctech technique resolution" / §"stech technique resolution"
+    // typed view: one object per `ctech` / `stech` body statement, paired
+    // with the enclosing element kind (`"curve"` / `"surface"`), the
+    // technique slug (`cparm` / `cspace` / `curv` for curves;
+    // `cparma` / `cparmb` / `cspace` / `curv` for surfaces), the parsed
+    // f64 resolution parameter array, and the `cstype` slug. Parse-time-
+    // only — the encoder still drives `ctech` / `stech` emission off
+    // `obj:freeform_directives`.
+    let approximations_typed = if !doc.freeform_directives.is_empty() {
+        collect_approximation_techniques(&doc)
+    } else {
+        Vec::new()
+    };
+
     // Materials first so primitives can point at their MaterialId.
     // Insertion order is preserved (HashMap iteration order is
     // unspecified, so sort by name to keep round-trip deterministic).
@@ -1069,6 +1083,18 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         scene.extras.insert(
             "obj:parms".to_string(),
             serde_json::Value::Array(parms_typed),
+        );
+    }
+    if !approximations_typed.is_empty() {
+        // Spec §"ctech technique resolution" / §"stech technique
+        // resolution" typed view from the precomputed pass above.
+        // Skipped when no `ctech` / `stech` line resolved cleanly
+        // (unrecognised technique slug, wrong argument count, or any
+        // resolution parameter failed to parse as `f64`). The encoder
+        // still drives line emission off `obj:freeform_directives`.
+        scene.extras.insert(
+            "obj:approximations".to_string(),
+            serde_json::Value::Array(approximations_typed),
         );
     }
 
@@ -2836,6 +2862,177 @@ fn collect_parms(doc: &ObjDoc) -> Vec<serde_json::Value> {
                     serde_json::Value::Array(
                         values.into_iter().map(serde_json::Value::from).collect(),
                     ),
+                );
+                typed.push(serde_json::Value::Object(obj));
+            }
+            _ => {}
+        }
+    }
+    typed
+}
+
+/// Walk `doc.freeform_directives` for every `ctech` curve-approximation
+/// and `stech` surface-approximation directive, returning a typed
+/// decomposition suitable for surfacing on
+/// `Scene3D::extras["obj:approximations"]`.
+///
+/// Spec §"ctech technique resolution" — three mutually-exclusive sub-
+/// forms:
+///   * `ctech cparm res` — constant parametric subdivision. One f64
+///     resolution parameter scaling per-segment subdivision count by
+///     curve degree.
+///   * `ctech cspace maxlength` — constant spatial subdivision. One f64
+///     real-space line-segment length cap.
+///   * `ctech curv maxdist maxangle` — curvature-dependent subdivision.
+///     Two f64 parameters: object-space chord-to-curve distance and
+///     curve-normal-angle bound in degrees.
+///
+/// Spec §"stech technique resolution" — four mutually-exclusive sub-
+/// forms:
+///   * `stech cparma ures vres` — constant parametric subdivision with
+///     separate u/v resolution parameters (two f64).
+///   * `stech cparmb uvres` — constant parametric subdivision with one
+///     unified resolution parameter (one f64).
+///   * `stech cspace maxlength` — constant spatial subdivision (one
+///     f64, same shape as the `ctech` sibling).
+///   * `stech curv maxdist maxangle` — curvature-dependent subdivision
+///     (two f64, same shape as the `ctech` sibling).
+///
+/// The returned [`serde_json::Value`] is always an array of objects, one
+/// entry per source `ctech` / `stech` directive in source order; each
+/// object carries the four stable, lowercase, underscore-separated keys:
+///
+/// * `element_kind` — `String`, exactly `"curve"` for a `ctech` line and
+///   `"surface"` for an `stech` line. Pinned per spec text — `ctech`
+///   "specifies a curve approximation technique", `stech` "specifies a
+///   surface approximation technique".
+/// * `technique` — `String`, the spec-defined sub-form slug, one of
+///   `"cparm"` / `"cspace"` / `"curv"` (curve forms) or `"cparma"` /
+///   `"cparmb"` / `"cspace"` / `"curv"` (surface forms). Unrecognised
+///   technique tokens drop the whole line from the typed view (the
+///   verbatim channel still replays it byte-faithful).
+/// * `parameters` — array of `f64`, the parsed resolution arguments in
+///   source order. Length follows the spec's per-form arity:
+///   `cparm` / `cspace` / `cparmb` are 1; `curv` / `cparma` are 2.
+///   Tokens that fail to parse as `f64` drop the whole line from the
+///   typed view (we don't surface partial parameter arrays — a
+///   resolution argument that doesn't decode would mislead consumers
+///   into rendering against zero / NaN).
+/// * `cstype` — `String`, the type slug declared by the enclosing
+///   `cstype` directive — one of `"bezier"` / `"rat_bezier"` /
+///   `"bspline"` / `"rat_bspline"` / `"cardinal"` / `"taylor"` /
+///   `"bmatrix"`, or `"unknown"` when the declared type isn't one of
+///   those names. Same disambiguation table the `parm` typed view uses.
+///
+/// Per spec the `ctech` / `stech` directives sit inside a `cstype` … `end`
+/// block alongside `curv` / `surf` / `parm`. A line that appears outside
+/// any block (no `cstype` seen since the last `end`) still surfaces with
+/// `cstype = "unknown"` so consumers can see the resolution parameters;
+/// dropping the line entirely would lose data the verbatim channel
+/// still carries.
+///
+/// The encoder is still driven by the verbatim
+/// `obj:freeform_directives` channel; the typed view exists purely so
+/// consumers don't have to re-parse the per-technique positional tokens
+/// to pair every `ctech` / `stech` with its enclosing `cstype` block.
+///
+/// Lines whose argument count doesn't match the spec's per-form arity
+/// (e.g. `ctech curv 0.1` missing the `maxangle` argument) drop from the
+/// typed view without failing the parse. Mirrors the lossy-on-malformed
+/// policy of the existing `sp` / `con` / `parm` typed views.
+fn collect_approximation_techniques(doc: &ObjDoc) -> Vec<serde_json::Value> {
+    let mut typed: Vec<serde_json::Value> = Vec::new();
+    // Track the enclosing `cstype` slug so each line carries its block
+    // context. Mirrors the `collect_parms` state machine.
+    let mut active_cstype: Option<&'static str> = None;
+    for entry in &doc.freeform_directives {
+        let Some(keyword) = entry.first().map(String::as_str) else {
+            continue;
+        };
+        match keyword {
+            "cstype" => {
+                let mut iter = entry.iter().skip(1);
+                let first = iter.next().map(String::as_str);
+                let second = iter.next().map(String::as_str);
+                active_cstype = match (first, second) {
+                    (Some("bezier"), _) => Some("bezier"),
+                    (Some("rat"), Some("bezier")) => Some("rat_bezier"),
+                    (Some("bspline"), _) => Some("bspline"),
+                    (Some("rat"), Some("bspline")) => Some("rat_bspline"),
+                    (Some("cardinal"), _) => Some("cardinal"),
+                    (Some("rat"), Some("cardinal")) => Some("cardinal"),
+                    (Some("taylor"), _) => Some("taylor"),
+                    (Some("rat"), Some("taylor")) => Some("taylor"),
+                    (Some("bmatrix"), _) => Some("bmatrix"),
+                    (Some("rat"), Some("bmatrix")) => Some("bmatrix"),
+                    _ => None,
+                };
+            }
+            "end" => {
+                active_cstype = None;
+            }
+            "ctech" | "stech" => {
+                // Spec §"ctech technique resolution" / §"stech technique
+                // resolution": keyword + technique token + N resolution
+                // parameters.
+                let Some(technique) = entry.get(1).map(String::as_str) else {
+                    continue;
+                };
+                let element_kind = if keyword == "ctech" {
+                    "curve"
+                } else {
+                    "surface"
+                };
+                // Per-form expected argument arity. See doc-comment table
+                // above; unrecognised techniques drop the line.
+                let expected_args: usize = match (keyword, technique) {
+                    ("ctech", "cparm") => 1,
+                    ("ctech", "cspace") => 1,
+                    ("ctech", "curv") => 2,
+                    ("stech", "cparma") => 2,
+                    ("stech", "cparmb") => 1,
+                    ("stech", "cspace") => 1,
+                    ("stech", "curv") => 2,
+                    _ => continue,
+                };
+                // Keyword + technique slug + expected_args parameters.
+                if entry.len() != 2 + expected_args {
+                    continue;
+                }
+                // Parse every resolution parameter; bail (without partial
+                // surfacing) if any token fails — see doc-comment.
+                let mut params: Vec<f64> = Vec::with_capacity(expected_args);
+                let mut ok = true;
+                for raw in &entry[2..] {
+                    match raw.parse::<f64>() {
+                        Ok(v) => params.push(v),
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let mut obj = serde_json::Map::new();
+                obj.insert(
+                    "element_kind".to_string(),
+                    serde_json::Value::String(element_kind.to_string()),
+                );
+                obj.insert(
+                    "technique".to_string(),
+                    serde_json::Value::String(technique.to_string()),
+                );
+                obj.insert(
+                    "parameters".to_string(),
+                    serde_json::Value::Array(
+                        params.into_iter().map(serde_json::Value::from).collect(),
+                    ),
+                );
+                obj.insert(
+                    "cstype".to_string(),
+                    serde_json::Value::String(active_cstype.unwrap_or("unknown").to_string()),
                 );
                 typed.push(serde_json::Value::Object(obj));
             }

@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 266: typed decomposition of the `ctech` / `stech` approximation-
+  technique directives per spec §"ctech technique resolution" + §"stech
+  technique resolution". Parallel to the verbatim
+  `obj:freeform_directives` channel (which still carries every
+  `ctech` / `stech` line for round-trip), a parse-time-only typed view
+  now lands on `Scene3D::extras["obj:approximations"]` as an array of
+  objects with the four stable, lowercase, underscore-separated keys
+  `element_kind` / `technique` / `parameters` / `cstype`. The
+  `element_kind` is exactly `"curve"` for a `ctech` line and
+  `"surface"` for an `stech` line per spec ("specifies a curve
+  approximation technique" / "specifies a surface approximation
+  technique"). The `technique` is the spec-defined sub-form slug
+  (`"cparm"` / `"cspace"` / `"curv"` for curves; `"cparma"` /
+  `"cparmb"` / `"cspace"` / `"curv"` for surfaces); unrecognised
+  technique tokens drop the whole line from the typed view. The
+  `parameters` array carries the parsed `f64` resolution arguments in
+  source order, with per-form arities `cparm`/`cspace`/`cparmb` = 1
+  and `curv`/`cparma` = 2; a parameter token that fails to parse drops
+  the whole line. The `cstype` slug mirrors the existing `parm` typed
+  view's `cstype` slot (one of `"bezier"` / `"rat_bezier"` /
+  `"bspline"` / `"rat_bspline"` / `"cardinal"` / `"taylor"` /
+  `"bmatrix"`, or `"unknown"`). The encoder is still driven by the
+  verbatim channel — the typed view exists purely so consumers don't
+  have to re-parse the per-technique positional tokens. New tests in
+  `tests/approximation_and_companions.rs` cover: per-form
+  decomposition for the three `ctech` and four `stech` sub-shapes;
+  `cstype` slug pinning across two different blocks; lossy-on-
+  malformed policy (wrong arity, non-numeric parameter); unrecognised
+  technique slug rejection; outside-block `cstype = "unknown"`
+  fallback; absent-key behaviour; and decode → encode → decode
+  stability of the typed view.
 - Round 254: typed decomposition of the `parm u …` / `parm v …` body
   statement per spec §"parm u/v" + §"Free-form curve/surface body
   statements". Parallel to the verbatim `obj:freeform_directives`

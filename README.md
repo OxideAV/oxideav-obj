@@ -511,6 +511,34 @@ Round 223: approximation-technique directives + companion-object
 references — four previously-dropped spec-defined directives now
 round-trip.
 
+Round 266: typed decomposition of the `ctech` / `stech` approximation-
+technique directives per spec §"ctech technique resolution" + §"stech
+technique resolution". Parallel to the verbatim `obj:freeform_directives`
+channel (which still carries every `ctech` / `stech` line for
+round-trip), a parse-time-only typed view now lands on
+`Scene3D::extras["obj:approximations"]` as an array of objects with the
+four stable, lowercase, underscore-separated keys `element_kind` /
+`technique` / `parameters` / `cstype`. The `element_kind` is exactly
+`"curve"` for a `ctech` line and `"surface"` for an `stech` line per
+spec ("specifies a curve approximation technique" / "specifies a
+surface approximation technique"). The `technique` is the spec's
+sub-form slug — one of `"cparm"` / `"cspace"` / `"curv"` for curves
+and `"cparma"` / `"cparmb"` / `"cspace"` / `"curv"` for surfaces.
+The `parameters` array is the parsed `f64` resolution arguments in
+source order, with the spec-defined arities `cparm`/`cspace`/`cparmb`
+= 1 and `curv`/`cparma` = 2; a malformed parameter token (or wrong
+argument arity, or an unrecognised technique slug) drops the line from
+the typed view without failing the parse — the verbatim channel still
+replays the line byte-faithful. The `cstype` slug reuses the existing
+`parm` typed view's disambiguation table (one of `"bezier"` /
+`"rat_bezier"` / `"bspline"` / `"rat_bspline"` / `"cardinal"` /
+`"taylor"` / `"bmatrix"`); lines that sit outside any open
+`cstype … end` block still surface in the typed view with
+`cstype = "unknown"` so consumers can read the resolution parameters.
+The encoder is still driven by the verbatim channel so the typed view
+exists purely to spare consumers from re-parsing the per-technique
+positional tokens.
+
 Round 254: typed decomposition of the `parm u …` / `parm v …` body
 statement per spec §"parm u/v" + §"Free-form curve/surface body
 statements". Parallel to the verbatim `obj:freeform_directives`

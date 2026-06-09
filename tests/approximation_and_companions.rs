@@ -348,3 +348,304 @@ fn decoder_encoder_trait_surface_round_trip() {
     let text = std::str::from_utf8(&bytes).unwrap();
     assert!(text.contains("shadow_obj cube.obj"));
 }
+
+// ---------------------------------------------------------------------------
+// `ctech` / `stech` typed accessor — round 266
+// ---------------------------------------------------------------------------
+//
+// Parallel to the verbatim `obj:freeform_directives` channel (which still
+// drives encoder round-trip and is already exercised by the `*_round_trip_*`
+// cases above), a parse-time-only typed decomposition lands on
+// `Scene3D::extras["obj:approximations"]` as an array of objects with the
+// stable keys `element_kind` / `technique` / `parameters` / `cstype`. The
+// per-form arity:
+//
+//   ctech cparm res                — element_kind="curve",   technique="cparm",  parameters=[res]
+//   ctech cspace maxlength         — element_kind="curve",   technique="cspace", parameters=[maxlength]
+//   ctech curv  maxdist maxangle   — element_kind="curve",   technique="curv",   parameters=[maxdist, maxangle]
+//   stech cparma ures vres         — element_kind="surface", technique="cparma", parameters=[ures, vres]
+//   stech cparmb uvres             — element_kind="surface", technique="cparmb", parameters=[uvres]
+//   stech cspace maxlength         — element_kind="surface", technique="cspace", parameters=[maxlength]
+//   stech curv  maxdist maxangle   — element_kind="surface", technique="curv",   parameters=[maxdist, maxangle]
+//
+// Per spec §"ctech technique resolution" / §"stech technique resolution".
+// The encoder is still driven by the verbatim channel; the typed view
+// exists so consumers don't have to re-parse the positional tokens.
+
+#[test]
+fn ctech_typed_view_decomposes_all_three_forms() {
+    let scene = obj::parse_obj(CTECH_OBJ).unwrap();
+    let typed = scene
+        .extras
+        .get("obj:approximations")
+        .expect("ctech typed view present");
+    let arr = typed.as_array().unwrap();
+    assert_eq!(arr.len(), 3, "three ctech lines typed");
+
+    // All three are curves; cstype is bezier per the CTECH_OBJ block.
+    for entry in arr {
+        let obj = entry.as_object().unwrap();
+        assert_eq!(obj["element_kind"].as_str(), Some("curve"));
+        assert_eq!(obj["cstype"].as_str(), Some("bezier"));
+    }
+
+    // First form: cparm res — exactly one f64 parameter.
+    let cparm = arr[0].as_object().unwrap();
+    assert_eq!(cparm["technique"].as_str(), Some("cparm"));
+    let cparm_params = cparm["parameters"].as_array().unwrap();
+    assert_eq!(cparm_params.len(), 1);
+    assert!((cparm_params[0].as_f64().unwrap() - 1.0).abs() < 1e-6);
+
+    // Second form: cspace maxlength — exactly one f64 parameter.
+    let cspace = arr[1].as_object().unwrap();
+    assert_eq!(cspace["technique"].as_str(), Some("cspace"));
+    let cspace_params = cspace["parameters"].as_array().unwrap();
+    assert_eq!(cspace_params.len(), 1);
+    assert!((cspace_params[0].as_f64().unwrap() - 0.5).abs() < 1e-6);
+
+    // Third form: curv maxdist maxangle — exactly two f64 parameters.
+    let curv = arr[2].as_object().unwrap();
+    assert_eq!(curv["technique"].as_str(), Some("curv"));
+    let curv_params = curv["parameters"].as_array().unwrap();
+    assert_eq!(curv_params.len(), 2);
+    assert!((curv_params[0].as_f64().unwrap() - 0.1).abs() < 1e-6);
+    assert!((curv_params[1].as_f64().unwrap() - 5.0).abs() < 1e-6);
+
+    // Exactly four typed keys per entry, nothing extra.
+    for entry in arr {
+        assert_eq!(entry.as_object().unwrap().len(), 4);
+    }
+}
+
+#[test]
+fn stech_typed_view_decomposes_all_four_forms() {
+    let scene = obj::parse_obj(STECH_OBJ).unwrap();
+    let arr = scene
+        .extras
+        .get("obj:approximations")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(arr.len(), 4, "four stech lines typed");
+
+    // All four are surfaces under a bezier cstype block.
+    for entry in arr {
+        let obj = entry.as_object().unwrap();
+        assert_eq!(obj["element_kind"].as_str(), Some("surface"));
+        assert_eq!(obj["cstype"].as_str(), Some("bezier"));
+    }
+
+    // cparma ures vres — two parameters.
+    let cparma = arr[0].as_object().unwrap();
+    assert_eq!(cparma["technique"].as_str(), Some("cparma"));
+    let cparma_params = cparma["parameters"].as_array().unwrap();
+    assert_eq!(cparma_params.len(), 2);
+    assert!((cparma_params[0].as_f64().unwrap() - 1.0).abs() < 1e-6);
+    assert!((cparma_params[1].as_f64().unwrap() - 1.0).abs() < 1e-6);
+
+    // cparmb uvres — one parameter.
+    let cparmb = arr[1].as_object().unwrap();
+    assert_eq!(cparmb["technique"].as_str(), Some("cparmb"));
+    let cparmb_params = cparmb["parameters"].as_array().unwrap();
+    assert_eq!(cparmb_params.len(), 1);
+    assert!((cparmb_params[0].as_f64().unwrap() - 2.0).abs() < 1e-6);
+
+    // cspace maxlength — one parameter (same shape as the curve form).
+    let cspace = arr[2].as_object().unwrap();
+    assert_eq!(cspace["technique"].as_str(), Some("cspace"));
+    assert_eq!(cspace["parameters"].as_array().unwrap().len(), 1);
+
+    // curv maxdist maxangle — two parameters (same shape as the curve
+    // form).
+    let curv = arr[3].as_object().unwrap();
+    assert_eq!(curv["technique"].as_str(), Some("curv"));
+    assert_eq!(curv["parameters"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn approximations_typed_view_survives_round_trip_unchanged() {
+    // The verbatim channel drives encoder output, and the parser re-
+    // populates the typed view from the verbatim channel on re-decode —
+    // so a decode → encode → decode cycle preserves the typed view
+    // exactly, key-for-key and value-for-value.
+    let scene = obj::parse_obj(CTECH_OBJ).unwrap();
+    let typed_before = scene.extras.get("obj:approximations").cloned().unwrap();
+
+    let bytes = obj::serialize_obj(&scene, None).unwrap();
+    let scene2 = ObjDecoder::new().decode(&bytes).unwrap();
+    let typed_after = scene2.extras.get("obj:approximations").cloned().unwrap();
+
+    assert_eq!(
+        typed_before, typed_after,
+        "typed approximations view differs across decode → encode → decode cycle"
+    );
+}
+
+#[test]
+fn approximations_typed_view_pins_cstype_slug_per_block() {
+    // A document with two `cstype` blocks — one bspline curve carrying a
+    // `ctech` line, then a rat bezier surface carrying an `stech` line.
+    // The typed view's `cstype` slot is pinned by the enclosing block.
+    let src = "\
+v 0 0 0
+v 1 0 0
+v 0 1 0
+v 1 1 0
+cstype bspline
+deg 3
+curv 0.0 1.0 1 2 3 4
+parm u 0.0 0.0 0.0 0.0 1.0 1.0 1.0 1.0
+ctech cspace 0.250000
+end
+cstype rat bezier
+deg 1 1
+surf 0.0 1.0 0.0 1.0 1 2 3 4
+parm u 0.0 1.0
+parm v 0.0 1.0
+stech cparma 2.000000 3.000000
+end
+";
+    let scene = obj::parse_obj(src).unwrap();
+    let arr = scene
+        .extras
+        .get("obj:approximations")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(arr.len(), 2);
+
+    let first = arr[0].as_object().unwrap();
+    assert_eq!(first["element_kind"].as_str(), Some("curve"));
+    assert_eq!(first["technique"].as_str(), Some("cspace"));
+    assert_eq!(first["cstype"].as_str(), Some("bspline"));
+
+    let second = arr[1].as_object().unwrap();
+    assert_eq!(second["element_kind"].as_str(), Some("surface"));
+    assert_eq!(second["technique"].as_str(), Some("cparma"));
+    assert_eq!(second["cstype"].as_str(), Some("rat_bezier"));
+}
+
+#[test]
+fn approximations_typed_view_drops_malformed_lines_without_failing_parse() {
+    // Spec §"ctech" / §"stech" — each technique has a fixed argument
+    // arity. Lines with wrong arities (`ctech curv 0.1` missing the
+    // second parameter) or non-numeric parameter tokens
+    // (`stech cparma 1.0 nope`) drop from the typed view but still
+    // land verbatim on `obj:freeform_directives` so the encoder
+    // re-emits them byte-faithful. Mirrors the lossy-on-malformed
+    // policy of the existing `sp` / `con` / `parm` typed views.
+    let src = "\
+v 0 0 0
+v 1 0 0
+v 0 1 0
+v 1 1 0
+cstype bezier
+deg 1 1
+curv 0.0 1.0 1 2
+ctech curv 0.1
+ctech cparm 0.5
+stech cparma 1.0 nope
+stech cspace 0.250000
+end
+";
+    let scene = obj::parse_obj(src).unwrap();
+    let typed = scene
+        .extras
+        .get("obj:approximations")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        typed.len(),
+        2,
+        "only the two well-formed lines survive in the typed view"
+    );
+
+    let kinds: Vec<&str> = typed
+        .iter()
+        .map(|e| e.as_object().unwrap()["technique"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["cparm", "cspace"]);
+
+    // The verbatim channel still carries all four lines so the encoder
+    // re-emits each one byte-faithful.
+    let bytes = obj::serialize_obj(&scene, None).unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.contains("ctech curv 0.1\n"));
+    assert!(text.contains("ctech cparm 0.5"));
+    assert!(text.contains("stech cparma 1.0 nope"));
+    assert!(text.contains("stech cspace 0.250000"));
+}
+
+#[test]
+fn approximations_typed_view_drops_unrecognised_technique_tokens() {
+    // A `ctech notatechnique 0.5` line uses a technique slug that isn't
+    // one of the spec's defined sub-forms (`cparm` / `cspace` / `curv`).
+    // The typed view drops it; the verbatim channel still replays it.
+    let src = "\
+v 0 0 0
+v 1 0 0
+cstype bezier
+deg 1
+curv 0.0 1.0 1 2
+ctech notatechnique 0.5
+ctech cparm 0.5
+end
+";
+    let scene = obj::parse_obj(src).unwrap();
+    let arr = scene
+        .extras
+        .get("obj:approximations")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(arr.len(), 1, "only the recognised cparm line is typed");
+    assert_eq!(
+        arr[0].as_object().unwrap()["technique"].as_str(),
+        Some("cparm")
+    );
+
+    let bytes = obj::serialize_obj(&scene, None).unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.contains("ctech notatechnique 0.5"));
+}
+
+#[test]
+fn approximations_typed_view_surfaces_unknown_cstype_for_outside_block_lines() {
+    // A `ctech` / `stech` line that appears after a closing `end`
+    // (between blocks, or outside any block) still surfaces in the
+    // typed view, but with `cstype = "unknown"` — see the doc comment
+    // on `collect_approximation_techniques`. The verbatim channel still
+    // replays the line.
+    let src = "\
+v 0 0 0
+v 1 0 0
+cstype bezier
+deg 1
+curv 0.0 1.0 1 2
+end
+ctech cparm 0.5
+";
+    let scene = obj::parse_obj(src).unwrap();
+    let arr = scene
+        .extras
+        .get("obj:approximations")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(arr.len(), 1);
+    let entry = arr[0].as_object().unwrap();
+    assert_eq!(entry["element_kind"].as_str(), Some("curve"));
+    assert_eq!(entry["technique"].as_str(), Some("cparm"));
+    assert_eq!(entry["cstype"].as_str(), Some("unknown"));
+}
+
+#[test]
+fn approximations_typed_view_absent_when_no_ctech_or_stech_lines() {
+    // No `ctech` / `stech` directive → no `obj:approximations` key.
+    // Consumers can safely `.get()` and skip without distinguishing
+    // "no lines" from "all lines malformed and dropped".
+    let src = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+    let scene = obj::parse_obj(src).unwrap();
+    assert!(!scene.extras.contains_key("obj:approximations"));
+}
