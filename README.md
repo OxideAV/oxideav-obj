@@ -511,6 +511,30 @@ Round 223: approximation-technique directives + companion-object
 references — four previously-dropped spec-defined directives now
 round-trip.
 
+Round 273: typed decomposition of the `trim` / `hole` / `scrv` loop
+body statements per spec §"Trimming loops and holes" / §"trim u0 u1
+curv2d …" / §"hole u0 u1 curv2d …" and §"Special curve" / §"scrv u0 u1
+curv2d …" — the three loop statements all share the identical
+repeating-triple body shape. Parallel to the verbatim
+`obj:freeform_directives` channel (which still carries every line for
+round-trip), a parse-time-only typed view now lands on
+`Scene3D::extras["obj:trim_loops"]` as an array of objects with the
+four stable, lowercase, underscore-separated keys `loop_kind` /
+`element_kind` / `cstype` / `segments`. The `loop_kind` is exactly
+`"trim"` / `"hole"` / `"scrv"`; the `element_kind` is the directive
+that opened the enclosing `cstype … end` block (`"surf"` for the
+spec-legal host, `"unknown"` outside a surface block); the `cstype`
+slug reuses the `parm` / `ctech` / `stech` disambiguation table
+(`"bezier"` / `"rat_bezier"` / `"bspline"` / `"rat_bspline"` /
+`"cardinal"` / `"taylor"` / `"bmatrix"`, or `"unknown"`). The
+`segments` array decomposes every `(u0, u1, curv2d)` triple in source
+order — `u0` / `u1` as `f64`, `curv2d` as `i64` (negative-from-end
+references per spec §"Examples" case 8 echoed as-is without
+resolution). A line whose argument count isn't a positive multiple of
+three, or any of whose tokens fail to parse, drops from the typed view
+without failing the parse; the verbatim channel stays the encoder's
+source of truth. Mirrors the lossy-on-malformed policy of the existing
+`sp` / `con` / `parm` typed views.
 Round 266: typed decomposition of the `ctech` / `stech` approximation-
 technique directives per spec §"ctech technique resolution" + §"stech
 technique resolution". Parallel to the verbatim `obj:freeform_directives`

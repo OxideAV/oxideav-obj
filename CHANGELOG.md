@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 273: typed decomposition of the `trim` / `hole` / `scrv` loop
+  body statements per spec §"Trimming loops and holes" / §"trim u0 u1
+  curv2d …" / §"hole u0 u1 curv2d …" and §"Special curve" / §"scrv u0
+  u1 curv2d …". All three share the identical repeating-triple body
+  shape (the keyword followed by one or more `(u0, u1, curv2d)`
+  triples). Parallel to the verbatim `obj:freeform_directives` channel
+  (which still carries every `trim` / `hole` / `scrv` line for
+  round-trip), a parse-time-only typed view now lands on
+  `Scene3D::extras["obj:trim_loops"]` as an array of objects with the
+  four stable, lowercase, underscore-separated keys `loop_kind` /
+  `element_kind` / `cstype` / `segments`. The `loop_kind` is exactly
+  `"trim"`, `"hole"`, or `"scrv"`; the `element_kind` is the directive
+  that opened the enclosing `cstype … end` block (`"surf"` for the
+  spec-legal host, `"unknown"` when the loop is seen outside a surface
+  block); the `cstype` slug carries the recognised type from the
+  enclosing `cstype` header (`"bezier"` / `"rat_bezier"` / `"bspline"` /
+  `"rat_bspline"` / `"cardinal"` / `"taylor"` / `"bmatrix"`, or
+  `"unknown"`), reusing the same disambiguation table the `parm` /
+  `ctech` / `stech` typed views use. The `segments` array decomposes
+  every `(u0, u1, curv2d)` triple in source order — `u0` / `u1` land as
+  `f64`, `curv2d` as `i64` (negative-from-end references, which the
+  spec §"Examples" case 8 special-curve example uses, are echoed as-is
+  without resolution). A line whose argument count isn't a positive
+  multiple of three, or any of whose tokens fail to parse, drops from
+  the typed view without failing the parse (the verbatim channel stays
+  the source of truth for the encoder). Mirrors the lossy-on-malformed
+  policy of the existing `sp` / `con` / `parm` typed views.
 - Round 266: typed decomposition of the `ctech` / `stech` approximation-
   technique directives per spec §"ctech technique resolution" + §"stech
   technique resolution". Parallel to the verbatim

@@ -917,6 +917,18 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         Vec::new()
     };
 
+    // Spec §"Trimming loops and holes" / §"Special curve" typed view:
+    // one object per `trim` / `hole` / `scrv` body statement, paired
+    // with the enclosing element kind + `cstype` slug and decomposed
+    // into its `(u0, u1, curv2d)` segment triples. Parse-time-only —
+    // the encoder still drives `trim` / `hole` / `scrv` emission off
+    // `obj:freeform_directives`.
+    let trim_loops_typed = if !doc.freeform_directives.is_empty() {
+        collect_trim_loops(&doc)
+    } else {
+        Vec::new()
+    };
+
     // Materials first so primitives can point at their MaterialId.
     // Insertion order is preserved (HashMap iteration order is
     // unspecified, so sort by name to keep round-trip deterministic).
@@ -1095,6 +1107,18 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         scene.extras.insert(
             "obj:approximations".to_string(),
             serde_json::Value::Array(approximations_typed),
+        );
+    }
+    if !trim_loops_typed.is_empty() {
+        // Spec §"Trimming loops and holes" / §"Special curve" typed
+        // view from the precomputed pass above. Skipped when no
+        // `trim` / `hole` / `scrv` line resolved cleanly (argument
+        // count not a positive multiple of three, or any segment's
+        // `u0` / `u1` / `curv2d` token failed to parse). The encoder
+        // still drives line emission off `obj:freeform_directives`.
+        scene.extras.insert(
+            "obj:trim_loops".to_string(),
+            serde_json::Value::Array(trim_loops_typed),
         );
     }
 
@@ -2726,6 +2750,145 @@ fn collect_connectivity(doc: &ObjDoc) -> Vec<serde_json::Value> {
             serde_json::Value::Number(serde_json::Number::from(curv2d_2)),
         );
         typed.push(serde_json::Value::Object(obj));
+    }
+    typed
+}
+
+/// Walk `doc.freeform_directives` for every `trim` / `hole` / `scrv`
+/// loop statement and return a typed decomposition suitable for
+/// surfacing on `Scene3D::extras["obj:trim_loops"]`.
+///
+/// Spec §"Trimming loops and holes" / §"trim u0 u1 curv2d u0 u1 curv2d
+/// …" / §"hole u0 u1 curv2d u0 u1 curv2d …" / §"Special curve" /
+/// §"scrv u0 u1 curv2d u0 u1 curv2d …": all three share the identical
+/// repeating-triple body shape — the keyword is followed by one or more
+/// `(u0, u1, curv2d)` triples, each naming a previously-defined `curv2`
+/// parameter-space curve plus the `[u0, u1]` sub-range of that curve to
+/// walk. `trim` assembles an outer trimming loop, `hole` an inner
+/// (hole) loop, and `scrv` a special curve guaranteed to appear as
+/// triangle edges in the surface's final triangulation.
+///
+/// The returned objects each carry three stable, lowercase,
+/// underscore-separated keys:
+///
+/// * `loop_kind` — exactly `"trim"`, `"hole"`, or `"scrv"` (the
+///   keyword the line opened with).
+/// * `element_kind` — the directive that opened the enclosing
+///   `cstype … end` block (`"surf"` is the only spec-legal host, since
+///   trimming loops trim a surface; a loop seen inside a `curv` /
+///   `curv2` block, or outside any block, surfaces `"unknown"` so the
+///   consumer can still read the segments).
+/// * `cstype` — the recognised type slug from the enclosing `cstype`
+///   header (one of `"bezier"` / `"rat_bezier"` / `"bspline"` /
+///   `"rat_bspline"` / `"cardinal"` / `"taylor"` / `"bmatrix"`), or
+///   `"unknown"` when the declared type isn't one of those names or no
+///   `cstype` block is open. Same disambiguation table the `parm` /
+///   `ctech` / `stech` typed views use.
+/// * `segments` — an array of `{u0, u1, curv2d}` objects in source
+///   order. `u0` / `u1` are `f64` (the start / end parameter on the
+///   referenced curve); `curv2d` is `i64` (the 1-based index of the
+///   `curv2` trimming curve — negative-from-end references, which the
+///   spec §"Examples" case 8 special-curve example uses, are echoed
+///   as-is so the consumer's own resolver can apply relative-from-end
+///   semantics).
+///
+/// A line whose argument count isn't a positive multiple of three, or
+/// any of whose `u0` / `u1` tokens fail to parse as `f64` or `curv2d`
+/// token fails to parse as `i64`, is dropped from the typed view
+/// without failing the parse — the original line still rides on
+/// `obj:freeform_directives` for verbatim round-trip. Mirrors the
+/// lossy-on-malformed policy of the existing `sp` / `con` / `parm`
+/// typed views; the verbatim channel stays the source of truth for the
+/// encoder.
+fn collect_trim_loops(doc: &ObjDoc) -> Vec<serde_json::Value> {
+    let mut typed: Vec<serde_json::Value> = Vec::new();
+    // Per-block state mirrored from `collect_parms`: a `cstype` opens a
+    // block and pins the type slug, a `curv` / `curv2` / `surf` pins the
+    // element kind, and `end` clears both.
+    let mut active_cstype: Option<&'static str> = None;
+    let mut active_kind: Option<&'static str> = None;
+    for entry in &doc.freeform_directives {
+        let Some(keyword) = entry.first().map(String::as_str) else {
+            continue;
+        };
+        match keyword {
+            "cstype" => {
+                let mut iter = entry.iter().skip(1);
+                let first = iter.next().map(String::as_str);
+                let second = iter.next().map(String::as_str);
+                active_cstype = match (first, second) {
+                    (Some("bezier"), _) => Some("bezier"),
+                    (Some("rat"), Some("bezier")) => Some("rat_bezier"),
+                    (Some("bspline"), _) => Some("bspline"),
+                    (Some("rat"), Some("bspline")) => Some("rat_bspline"),
+                    (Some("cardinal"), _) => Some("cardinal"),
+                    (Some("rat"), Some("cardinal")) => Some("cardinal"),
+                    (Some("taylor"), _) => Some("taylor"),
+                    (Some("rat"), Some("taylor")) => Some("taylor"),
+                    (Some("bmatrix"), _) => Some("bmatrix"),
+                    (Some("rat"), Some("bmatrix")) => Some("bmatrix"),
+                    _ => None,
+                };
+                active_kind = None;
+            }
+            "end" => {
+                active_cstype = None;
+                active_kind = None;
+            }
+            "curv" => active_kind = Some("curv"),
+            "curv2" => active_kind = Some("curv2"),
+            "surf" => active_kind = Some("surf"),
+            "trim" | "hole" | "scrv" => {
+                // Spec §"trim/hole/scrv u0 u1 curv2d …": keyword + one or
+                // more `(u0, u1, curv2d)` triples.
+                let toks = &entry[1..];
+                if toks.is_empty() || toks.len() % 3 != 0 {
+                    continue;
+                }
+                let mut segments: Vec<serde_json::Value> = Vec::new();
+                let mut ok = true;
+                for chunk in toks.chunks(3) {
+                    let (Ok(u0), Ok(u1), Ok(curv2d)) = (
+                        chunk[0].parse::<f64>(),
+                        chunk[1].parse::<f64>(),
+                        chunk[2].parse::<i64>(),
+                    ) else {
+                        ok = false;
+                        break;
+                    };
+                    let mut seg = serde_json::Map::new();
+                    seg.insert("u0".to_string(), serde_json::Value::from(u0));
+                    seg.insert("u1".to_string(), serde_json::Value::from(u1));
+                    seg.insert(
+                        "curv2d".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(curv2d)),
+                    );
+                    segments.push(serde_json::Value::Object(seg));
+                }
+                if !ok {
+                    // A single malformed triple drops the whole line from
+                    // the typed view; the verbatim channel still replays
+                    // it byte-faithful.
+                    continue;
+                }
+                let mut obj = serde_json::Map::new();
+                obj.insert(
+                    "loop_kind".to_string(),
+                    serde_json::Value::String(keyword.to_string()),
+                );
+                obj.insert(
+                    "element_kind".to_string(),
+                    serde_json::Value::String(active_kind.unwrap_or("unknown").to_string()),
+                );
+                obj.insert(
+                    "cstype".to_string(),
+                    serde_json::Value::String(active_cstype.unwrap_or("unknown").to_string()),
+                );
+                obj.insert("segments".to_string(), serde_json::Value::Array(segments));
+                typed.push(serde_json::Value::Object(obj));
+            }
+            _ => {}
+        }
     }
     typed
 }
