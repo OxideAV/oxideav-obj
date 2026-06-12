@@ -756,13 +756,49 @@ interpretation of the technique parameters — the tessellator's
 `with_curve_tessellation(samples)` knob still controls sample counts
 independently.
 
+Round 282: sub-cell trim/hole boundary re-meshing — the round-201
+conservative clip dropped any lattice triangle whose three corners
+didn't all classify inside the trimmed region, leaving the trim edge
+jagged at the lattice grain. Straddling boundary triangles (1 or 2
+corners kept) are now clipped against the in/out classification
+function (inside ≥ 1 trim loop — or no trim loops, per spec
+§"Trimming loops and holes" "If the first trim statement in the
+sequence is omitted, the enclosing outer trimming loop is taken to be
+the parameter range of the surface" — AND outside every hole loop)
+instead of dropped wholesale: each crossing lattice edge is bisected
+in parameter space until the inside/outside frontier is pinned
+(24 rounds ≈ 2⁻²⁴ of the edge length), the synthesised boundary
+vertex — 3D position interpolated linearly along the lattice edge,
+i.e. the same piecewise-linear approximation the triangle lattice
+itself carries — is appended after the `(samples + 1)²` lattice
+block, and the kept sub-polygon (corner triangle for 1-kept, quad
+split into two triangles for 2-kept) is emitted with the original
+CCW winding. Crossings are cached per undirected lattice edge so
+adjacent straddling cells share their boundary vertex and the
+re-meshed rim stays watertight; sub-triangles whose parameter-space
+area collapses below 10⁻⁶ of a lattice cell (loops grazing a lattice
+line exactly) are suppressed rather than emitted as degenerate
+slivers, and boundary vertices left unreferenced by that suppression
+are garbage-collected from the vertex pool. On an axis-aligned square
+loop sitting between lattice lines the kept area now matches the
+analytic trimmed area to within the chord-across-corner error (~0.4 %
+observed at 8 samples) where the conservative whole-cell staircase
+missed ≈ 60 % of the loop on the same fixture. New per-primitive
+provenance `obj:surface_trim_boundary_vertices` counts the
+synthesised vertices (0 when every straddling cell collapsed to
+suppressed slivers). Verbatim round-trip is untouched — the encoder
+still filters synthetic surfaces via the shared
+`obj:tessellated_curve` sentinel and replays the original `trim` /
+`hole` block from `Scene3D::extras["obj:freeform_directives"]`.
+
 The `.mod` binary form remains out of scope; surface-aware
 triangulation against `scrv` polylines (the special curve must
-appear as triangle edges per spec §"Special curve") and sub-cell
-re-meshing of the surface mesh against the `trim` / `hole` loop
-boundaries (round 201 lands a conservative per-triangle clip that
-keeps the boundary jagged at the lattice grain) are the remaining
-gaps.
+appear as triangle edges per spec §"Special curve") is the remaining
+gap. Round 282 upgraded the round-201 conservative trim/hole clip to
+sub-cell boundary re-meshing, so the trim edge now follows the loop
+polygon at bisection precision rather than the lattice grain; the
+residual approximation is the straight chord across a loop corner
+inside its straddling cell.
 
 ## License
 

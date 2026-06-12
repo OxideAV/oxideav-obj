@@ -3567,6 +3567,235 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
     out
 }
 
+/// Sub-cell boundary re-mesher for the surface trim/hole clip
+/// (spec §"Trimming loops and holes", §"trim u0 u1 curv2d …",
+/// §"hole u0 u1 curv2d …").
+///
+/// The lattice classification pass marks each `(samples + 1)²` sample
+/// vertex as kept (inside at least one trim loop — or no trim loops at
+/// all, per spec "If the first trim statement in the sequence is
+/// omitted, the enclosing outer trimming loop is taken to be the
+/// parameter range of the surface" — AND outside every hole loop) or
+/// dropped. Fully-kept triangles emit unchanged and fully-dropped
+/// triangles vanish, exactly like the conservative clip; the
+/// previously-dropped **straddling** triangles (1 or 2 corners kept)
+/// are now clipped against the in/out classification function instead
+/// of being discarded wholesale:
+///
+///   * each lattice edge whose endpoints classify differently is
+///     bisected in parameter space until the inside/outside frontier
+///     is pinned to float precision, yielding a boundary vertex on
+///     the trimming-loop polygon;
+///   * the kept sub-polygon (a triangle for 1-kept corners, a quad
+///     split into two triangles for 2-kept corners) is emitted with
+///     the original winding;
+///   * crossings are cached per undirected lattice edge so adjacent
+///     straddling triangles share their boundary vertex and the
+///     re-meshed rim stays watertight;
+///   * sub-triangles whose parameter-space area collapses below a
+///     small fraction of the cell area (loops grazing a lattice line)
+///     are suppressed rather than emitted as degenerate slivers.
+///
+/// The synthesised boundary vertex's 3D position is interpolated
+/// linearly along the lattice edge at the bisected parameter — the
+/// same piecewise-linear approximation the triangle lattice itself
+/// carries, so the re-meshed boundary is exactly as accurate as the
+/// surrounding mesh. Boundary vertices that end up referenced by no
+/// surviving sub-triangle (every candidate was a suppressed sliver)
+/// are garbage-collected by [`TrimRemesh::finish`] so the vertex pool
+/// only grows where geometry actually appeared.
+struct TrimRemesh<'a> {
+    /// `(samples + 1)` — lattice vertices per row.
+    stride: usize,
+    samples: u32,
+    /// Parameter-rectangle origin + spans (`surf s0 s1 t0 t1`).
+    s0: f32,
+    span_s: f32,
+    t0: f32,
+    span_t: f32,
+    trims: &'a [Vec<[f32; 2]>],
+    holes: &'a [Vec<[f32; 2]>],
+    /// The lattice 3D positions (row-major, `stride²` entries).
+    lattice: &'a [[f32; 3]],
+    /// Per-lattice-vertex kept mask from the classification pass.
+    kept: &'a [bool],
+    /// Suppress emitted sub-triangles below this parameter-space area.
+    area_eps: f32,
+    /// Synthesised boundary vertices (positions + parameter coords),
+    /// indexed from `lattice.len()` upward.
+    boundary_positions: Vec<[f32; 3]>,
+    boundary_uvs: Vec<[f32; 2]>,
+    /// Undirected lattice edge → synthesised boundary vertex index.
+    edge_cache: HashMap<(u32, u32), u32>,
+}
+
+impl<'a> TrimRemesh<'a> {
+    /// Parameter-space coordinate of any vertex index (lattice or
+    /// synthesised boundary vertex).
+    fn uv_of(&self, i: u32) -> [f32; 2] {
+        let lattice_count = self.lattice.len() as u32;
+        if i < lattice_count {
+            let su = (i as usize) % self.stride;
+            let sv = (i as usize) / self.stride;
+            [
+                self.s0 + (su as f32 / self.samples as f32) * self.span_s,
+                self.t0 + (sv as f32 / self.samples as f32) * self.span_t,
+            ]
+        } else {
+            self.boundary_uvs[(i - lattice_count) as usize]
+        }
+    }
+
+    /// The trim/hole classification function — identical to the
+    /// per-lattice-vertex pass in [`flush_surface`] so the bisected
+    /// frontier converges onto the same region boundary.
+    fn inside(&self, uv: [f32; 2]) -> bool {
+        let in_trim = self.trims.is_empty()
+            || self
+                .trims
+                .iter()
+                .any(|loop_uv| point_in_polygon(uv, loop_uv));
+        let in_hole = self
+            .holes
+            .iter()
+            .any(|loop_uv| point_in_polygon(uv, loop_uv));
+        in_trim && !in_hole
+    }
+
+    /// Boundary vertex on the lattice edge `inside_idx → outside_idx`,
+    /// synthesised by bisecting the classification function along the
+    /// edge in parameter space. Cached per undirected edge so the two
+    /// triangles sharing the edge agree on the vertex.
+    fn crossing(&mut self, inside_idx: u32, outside_idx: u32) -> u32 {
+        let key = if inside_idx < outside_idx {
+            (inside_idx, outside_idx)
+        } else {
+            (outside_idx, inside_idx)
+        };
+        if let Some(&idx) = self.edge_cache.get(&key) {
+            return idx;
+        }
+        let uv_in = self.uv_of(inside_idx);
+        let uv_out = self.uv_of(outside_idx);
+        // Invariant: `lo` classifies inside, `hi` outside. 24 rounds
+        // pin the frontier to ~2⁻²⁴ of the edge length — beyond f32
+        // lattice resolution.
+        let mut lo = 0.0f32;
+        let mut hi = 1.0f32;
+        for _ in 0..24 {
+            let mid = 0.5 * (lo + hi);
+            let uv = [
+                uv_in[0] + (uv_out[0] - uv_in[0]) * mid,
+                uv_in[1] + (uv_out[1] - uv_in[1]) * mid,
+            ];
+            if self.inside(uv) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        // Land on the last known-inside parameter so the synthesised
+        // vertex itself still classifies inside the trimmed region.
+        let t = lo;
+        let pa = self.lattice[inside_idx as usize];
+        let pb = self.lattice[outside_idx as usize];
+        let idx = self.lattice.len() as u32 + self.boundary_positions.len() as u32;
+        self.boundary_positions.push([
+            pa[0] + (pb[0] - pa[0]) * t,
+            pa[1] + (pb[1] - pa[1]) * t,
+            pa[2] + (pb[2] - pa[2]) * t,
+        ]);
+        self.boundary_uvs.push([
+            uv_in[0] + (uv_out[0] - uv_in[0]) * t,
+            uv_in[1] + (uv_out[1] - uv_in[1]) * t,
+        ]);
+        self.edge_cache.insert(key, idx);
+        idx
+    }
+
+    /// Push triangle `(a, b, c)` unless its parameter-space area is a
+    /// degenerate sliver (loop boundary grazing a lattice line).
+    fn push_triangle(&self, indices: &mut Vec<u32>, a: u32, b: u32, c: u32) {
+        let p = self.uv_of(a);
+        let q = self.uv_of(b);
+        let r = self.uv_of(c);
+        let area2 = ((q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])).abs();
+        if area2 > self.area_eps {
+            indices.push(a);
+            indices.push(b);
+            indices.push(c);
+        }
+    }
+
+    /// Clip one CCW lattice triangle against the trim/hole region and
+    /// append the surviving (sub-)triangles to `indices`.
+    fn clip_triangle(&mut self, indices: &mut Vec<u32>, a: u32, b: u32, c: u32) {
+        let ka = self.kept[a as usize];
+        let kb = self.kept[b as usize];
+        let kc = self.kept[c as usize];
+        match (ka, kb, kc) {
+            (true, true, true) => {
+                indices.push(a);
+                indices.push(b);
+                indices.push(c);
+            }
+            (false, false, false) => {}
+            // Exactly one corner kept: rotate it to the front (winding
+            // preserved) and keep the corner triangle bounded by the
+            // two edge crossings.
+            (true, false, false) => self.clip_one_kept(indices, a, b, c),
+            (false, true, false) => self.clip_one_kept(indices, b, c, a),
+            (false, false, true) => self.clip_one_kept(indices, c, a, b),
+            // Exactly two corners kept: rotate the dropped corner to
+            // the back and keep the quad `(i1, i2, cross(i2→o),
+            // cross(i1→o))` split into two triangles.
+            (true, true, false) => self.clip_two_kept(indices, a, b, c),
+            (false, true, true) => self.clip_two_kept(indices, b, c, a),
+            (true, false, true) => self.clip_two_kept(indices, c, a, b),
+        }
+    }
+
+    /// `(i, o1, o2)` with only `i` kept → triangle
+    /// `(i, cross(i→o1), cross(i→o2))`.
+    fn clip_one_kept(&mut self, indices: &mut Vec<u32>, i: u32, o1: u32, o2: u32) {
+        let p1 = self.crossing(i, o1);
+        let p2 = self.crossing(i, o2);
+        self.push_triangle(indices, i, p1, p2);
+    }
+
+    /// `(i1, i2, o)` with `o` dropped → quad
+    /// `(i1, i2, cross(i2→o), cross(i1→o))` as two triangles.
+    fn clip_two_kept(&mut self, indices: &mut Vec<u32>, i1: u32, i2: u32, o: u32) {
+        let p1 = self.crossing(i2, o);
+        let p2 = self.crossing(i1, o);
+        self.push_triangle(indices, i1, i2, p1);
+        self.push_triangle(indices, i1, p1, p2);
+    }
+
+    /// Garbage-collect boundary vertices that no surviving sub-triangle
+    /// references (every candidate was a suppressed sliver), remap the
+    /// indices, and return the referenced boundary positions in index
+    /// order ready to append after the lattice vertices.
+    fn finish(self, indices: &mut [u32]) -> Vec<[f32; 3]> {
+        let lattice_count = self.lattice.len() as u32;
+        let mut remap: HashMap<u32, u32> = HashMap::new();
+        let mut compacted: Vec<[f32; 3]> = Vec::new();
+        for idx in indices.iter_mut() {
+            let old = *idx;
+            if old < lattice_count {
+                continue;
+            }
+            let next = lattice_count + remap.len() as u32;
+            let slot = *remap.entry(old).or_insert_with(|| {
+                compacted.push(self.boundary_positions[(old - lattice_count) as usize]);
+                next
+            });
+            *idx = slot;
+        }
+        compacted
+    }
+}
+
 /// Evaluate one `surf` element against an active Bezier / B-spline /
 /// Cardinal / Taylor `cstype` and return the triangulated primitive,
 /// or `None` when the directive is incomplete / malformed (lenient-
@@ -3761,7 +3990,7 @@ fn flush_surface(
         return None;
     }
 
-    let positions = if bspline {
+    let mut positions = if bspline {
         sample_bspline_surface(
             &grid, &weights, kind, du as u32, dv as u32, parm_u, parm_v, s0, s1, t0, t1, cols,
             rows, samples,
@@ -3840,29 +4069,63 @@ fn flush_surface(
 
     // Build a triangle grid over the (samples + 1) × (samples + 1)
     // sample lattice. Vertex (su, sv) lives at index sv * stride + su.
+    // Two CCW triangles per cell (spec §"surf" note: the front of the
+    // surface is the side where u increases to the right and v
+    // increases upward). When trim/hole loops are active, straddling
+    // boundary triangles are sub-cell re-meshed against the loop
+    // polygon via [`TrimRemesh`] instead of dropped wholesale, so the
+    // trimmed rim follows the loop boundary rather than staying
+    // jagged at the lattice grain.
     let mut indices: Vec<u32> = Vec::with_capacity((samples as usize) * (samples as usize) * 6);
-    for sv in 0..samples as usize {
-        for su in 0..samples as usize {
-            let i00 = (sv * stride + su) as u32;
-            let i10 = (sv * stride + su + 1) as u32;
-            let i01 = ((sv + 1) * stride + su) as u32;
-            let i11 = ((sv + 1) * stride + su + 1) as u32;
-            // Conservative clip: drop any triangle whose all three
-            // vertices aren't all kept. This preserves the lattice
-            // resolution near the loop boundary at the cost of a small
-            // jagged edge — sub-cell clipping (which would require
-            // re-meshing the boundary cells against the polygon
-            // boundary) is deferred.
-            let keep = |i: u32| !trimming || kept[i as usize];
-            // Two CCW triangles per cell (spec §"surf" note: the front
-            // of the surface is the side where u increases to the right
-            // and v increases upward).
-            if keep(i00) && keep(i10) && keep(i11) {
+    let mut boundary_vertex_count = 0usize;
+    if trimming {
+        let span_s = s1 - s0;
+        let span_t = t1 - t0;
+        // Sliver threshold: 10⁻⁶ of one lattice cell's parameter-space
+        // area (×2 because `push_triangle` compares doubled areas).
+        // Loops that graze a lattice line produce crossings at the
+        // line itself; the resulting zero-width sub-triangles are
+        // suppressed instead of emitted as degenerate slivers.
+        let cell_area2 = (span_s / samples as f32).abs() * (span_t / samples as f32).abs() * 2.0;
+        let mut remesh = TrimRemesh {
+            stride,
+            samples,
+            s0,
+            span_s,
+            t0,
+            span_t,
+            trims,
+            holes,
+            lattice: &positions,
+            kept: &kept,
+            area_eps: cell_area2 * 1e-6,
+            boundary_positions: Vec::new(),
+            boundary_uvs: Vec::new(),
+            edge_cache: HashMap::new(),
+        };
+        for sv in 0..samples as usize {
+            for su in 0..samples as usize {
+                let i00 = (sv * stride + su) as u32;
+                let i10 = (sv * stride + su + 1) as u32;
+                let i01 = ((sv + 1) * stride + su) as u32;
+                let i11 = ((sv + 1) * stride + su + 1) as u32;
+                remesh.clip_triangle(&mut indices, i00, i10, i11);
+                remesh.clip_triangle(&mut indices, i00, i11, i01);
+            }
+        }
+        let boundary = remesh.finish(&mut indices);
+        boundary_vertex_count = boundary.len();
+        positions.extend(boundary);
+    } else {
+        for sv in 0..samples as usize {
+            for su in 0..samples as usize {
+                let i00 = (sv * stride + su) as u32;
+                let i10 = (sv * stride + su + 1) as u32;
+                let i01 = ((sv + 1) * stride + su) as u32;
+                let i11 = ((sv + 1) * stride + su + 1) as u32;
                 indices.push(i00);
                 indices.push(i10);
                 indices.push(i11);
-            }
-            if keep(i00) && keep(i11) && keep(i01) {
                 indices.push(i00);
                 indices.push(i11);
                 indices.push(i01);
@@ -3952,6 +4215,15 @@ fn flush_surface(
         prim.extras.insert(
             "obj:surface_hole_loops".to_string(),
             serde_json::Value::Number(serde_json::Number::from(holes.len() as u64)),
+        );
+        // Sub-cell boundary re-mesh provenance: how many vertices were
+        // synthesised on the trim/hole loop boundary (0 when every
+        // straddling cell collapsed to suppressed slivers, e.g. loops
+        // aligned exactly with lattice lines). Boundary vertices sit
+        // after the `(samples + 1)²` lattice block in `positions`.
+        prim.extras.insert(
+            "obj:surface_trim_boundary_vertices".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(boundary_vertex_count as u64)),
         );
     }
 

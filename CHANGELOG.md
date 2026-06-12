@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 282: sub-cell trim/hole boundary re-meshing (spec §"Trimming
+  loops and holes", §"trim u0 u1 curv2d …", §"hole u0 u1 curv2d …").
+  The round-201 conservative clip dropped any lattice triangle whose
+  three corners didn't all classify inside the trimmed region, so the
+  trim edge stayed jagged at the lattice grain. Straddling boundary
+  triangles (1 or 2 corners kept) are now clipped against the in/out
+  classification function instead of dropped wholesale: each crossing
+  lattice edge is bisected in parameter space until the inside/outside
+  frontier is pinned (24 rounds ≈ 2⁻²⁴ of the edge length), the
+  synthesised boundary vertex — 3D position interpolated linearly
+  along the lattice edge, the same piecewise-linear approximation the
+  triangle lattice itself carries — is appended after the
+  `(samples + 1)²` lattice block, and the kept sub-polygon (corner
+  triangle for 1-kept, quad split into two triangles for 2-kept) is
+  emitted with the original CCW winding. Crossings are cached per
+  undirected lattice edge so adjacent straddling cells share their
+  boundary vertex and the re-meshed rim stays watertight;
+  sub-triangles whose parameter-space area collapses below 10⁻⁶ of a
+  lattice cell (loops grazing a lattice line exactly) are suppressed
+  rather than emitted as degenerate slivers, and boundary vertices
+  left unreferenced by that suppression are garbage-collected from
+  the vertex pool. On an axis-aligned square loop sitting between
+  lattice lines the kept area now matches the analytic trimmed area
+  to within the chord-across-corner error (~0.4 % observed at
+  8 samples) where the conservative whole-cell staircase missed
+  ≈ 60 % of the loop on the same fixture. New per-primitive
+  provenance `obj:surface_trim_boundary_vertices` counts the
+  synthesised vertices (0 when every straddling cell collapsed to
+  suppressed slivers). Verbatim round-trip is untouched — the encoder
+  still filters synthetic surfaces via the shared
+  `obj:tessellated_curve` sentinel and replays the original `trim` /
+  `hole` block from `Scene3D::extras["obj:freeform_directives"]`.
 - Round 273: typed decomposition of the `trim` / `hole` / `scrv` loop
   body statements per spec §"Trimming loops and holes" / §"trim u0 u1
   curv2d …" / §"hole u0 u1 curv2d …" and §"Special curve" / §"scrv u0
