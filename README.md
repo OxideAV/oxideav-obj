@@ -462,10 +462,11 @@ a new synthetic mesh named `"obj:scrvs"`. A `scrv` shares the
 those it is **not** a closed loop — the spec describes it as a
 "sequence of curves which lie on a given surface to build a single
 special curve" that must appear as a sequence of triangle edges in
-the surface's final triangulation. Until surface-aware triangulation
-honours that constraint, the special curve is emitted as a
-stand-alone parameter-space polyline so consumers can resolve it
-without re-walking the directive stream. The `curv2d` references
+the surface's final triangulation. This round emits the special
+curve as a stand-alone parameter-space polyline so consumers can
+resolve it without re-walking the directive stream; round 290
+additionally embeds it as actual triangle edges on the `obj:surfaces`
+mesh (see below). The `curv2d` references
 are 1-based global per spec ("This curve must have been previously
 defined with the curv2 statement"), resolved against the same
 `collect_all_curv2_polylines` pre-pass the round-201 trim/hole
@@ -791,14 +792,47 @@ still filters synthetic surfaces via the shared
 `obj:tessellated_curve` sentinel and replays the original `trim` /
 `hole` block from `Scene3D::extras["obj:freeform_directives"]`.
 
-The `.mod` binary form remains out of scope; surface-aware
-triangulation against `scrv` polylines (the special curve must
-appear as triangle edges per spec §"Special curve") is the remaining
-gap. Round 282 upgraded the round-201 conservative trim/hole clip to
-sub-cell boundary re-meshing, so the trim edge now follows the loop
-polygon at bisection precision rather than the lattice grain; the
-residual approximation is the straight chord across a loop corner
-inside its straddling cell.
+Round 290: special-curve (`scrv`) embedding as surface triangle edges
+— spec §"Special curve": "A special curve is guaranteed to be included
+in any triangulation of the surface. … the line formed by
+approximating the special curve with a sequence of straight line
+segments will actually appear as a sequence of triangle edges in the
+final triangulation." The round-206 `scrv` pass emitted the special
+curve only as a stand-alone parameter-space polyline on the
+`obj:scrvs` mesh; the tessellated `obj:surfaces` triangle grid ignored
+it, so the spec's triangle-edge guarantee was unmet. Now every `surf`
+whose enclosing `cstype … end` block carries a `scrv` directive has
+the special curve embedded into its triangulation: the `scrv` is
+resolved to a parameter-space polyline (the same `(u0, u1, curv2d)`
+body grammar and `collect_all_curv2_polylines` pre-pass `trim` /
+`hole` use, but left open — a special curve is a constraint, not a
+closed region), then each straight segment is forced to coincide with
+a chain of triangle edges. The constraint runs on the final kept
+geometry **after** the round-282 trim/hole re-mesh, so trimming and
+special-curve embedding compose. The embedder works on the triangle
+soup with no adjacency structure: any triangle whose interior a
+segment crosses is split so the chord between the two boundary hits
+becomes an edge, crossing vertices are deduplicated on a quantised
+parameter grid (watertight across adjacent splits), each synthesised
+vertex's 3D position is the barycentric blend of the host triangle's
+corners (so the embedded curve is exactly as accurate as the
+surrounding piecewise-linear facet — no new surface evaluation), and a
+segment that already lies along existing lattice edges counts as
+embedded with no split. New per-surface provenance: `obj:surface_scrv`
+(marker), `obj:surface_scrv_curves` (count of special curves that
+overlapped the meshed surface), and `obj:surface_scrv_vertices` (count
+of synthesised constraint vertices). Verbatim round-trip is untouched
+— the synthetic surface still carries the shared
+`obj:tessellated_curve` sentinel so the encoder filters it and replays
+the original `scrv` block from
+`Scene3D::extras["obj:freeform_directives"]`.
+
+The `.mod` binary form remains out of scope. Round 282 upgraded the
+round-201 conservative trim/hole clip to sub-cell boundary re-meshing,
+so the trim edge now follows the loop polygon at bisection precision
+rather than the lattice grain (residual approximation: the straight
+chord across a loop corner inside its straddling cell); round 290
+embeds the `scrv` special curve as triangle edges on the surface mesh.
 
 ## License
 

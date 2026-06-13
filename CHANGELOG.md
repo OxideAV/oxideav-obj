@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 290: special-curve (`scrv`) embedding as surface triangle edges
+  (spec §"Special curve": "A special curve is guaranteed to be included
+  in any triangulation of the surface. … the line formed by
+  approximating the special curve with a sequence of straight line
+  segments will actually appear as a sequence of triangle edges in the
+  final triangulation"). The round-206 `scrv` pass only emitted the
+  special curve as a stand-alone parameter-space polyline on the
+  `obj:scrvs` mesh; the tessellated `obj:surfaces` triangle grid ignored
+  it, leaving the spec's triangle-edge guarantee unmet. Now every `surf`
+  whose enclosing `cstype … end` block carries a `scrv` directive has the
+  special curve embedded into its triangulation. The `scrv` is resolved
+  to a parameter-space polyline (same `(u0, u1, curv2d)` body grammar and
+  `collect_all_curv2_polylines` pre-pass `trim` / `hole` use, but left
+  open — a special curve is a constraint, not a closed region), then each
+  straight segment is forced to coincide with a chain of triangle edges.
+  The constraint runs on the final kept geometry **after** the round-282
+  trim/hole re-mesh, so trimming and special-curve embedding compose. The
+  embedder operates on the triangle soup with no adjacency structure: any
+  triangle whose interior a segment crosses is split so the chord between
+  the two boundary hits becomes an edge; crossing vertices are
+  deduplicated on a quantised parameter grid (watertight across adjacent
+  splits); each synthesised vertex's 3D position is the barycentric blend
+  of its host triangle's corners (so the embedded curve is exactly as
+  accurate as the surrounding piecewise-linear facet — no new surface
+  evaluation is introduced); and a segment already coincident with
+  existing lattice edges counts as embedded with no split. New
+  per-surface provenance `obj:surface_scrv` (marker),
+  `obj:surface_scrv_curves` (count of special curves that overlapped the
+  meshed surface), and `obj:surface_scrv_vertices` (count of synthesised
+  constraint vertices). Verbatim round-trip is untouched — the synthetic
+  surface still carries the shared `obj:tessellated_curve` sentinel so
+  the encoder filters it and replays the original `scrv` block from
+  `Scene3D::extras["obj:freeform_directives"]`.
 - Round 282: sub-cell trim/hole boundary re-meshing (spec §"Trimming
   loops and holes", §"trim u0 u1 curv2d …", §"hole u0 u1 curv2d …").
   The round-201 conservative clip dropped any lattice triangle whose

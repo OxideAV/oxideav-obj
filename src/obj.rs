@@ -3321,6 +3321,18 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
     // clip pass can pair holes with their enclosing trim region.
     let mut pending_trims: Vec<Vec<[f32; 2]>> = Vec::new();
     let mut pending_holes: Vec<Vec<[f32; 2]>> = Vec::new();
+    // Special-curve (`scrv`) loops accumulated for the current surface
+    // block — spec §"Special curve": "A special curve is guaranteed to
+    // be included in any triangulation of the surface. … the line formed
+    // by approximating the special curve with a sequence of straight line
+    // segments will actually appear as a sequence of triangle edges in
+    // the final triangulation." Resolved here to the same open
+    // parameter-space polyline shape as `trim` / `hole` (they share the
+    // identical `(u0, u1, curv2d)` body grammar, spec §"scrv u0 u1
+    // curv2d …"), but unlike a trim/hole loop a special curve is NOT
+    // closed — it is a constraint the surface mesh must route triangle
+    // edges along, not a region boundary.
+    let mut pending_scrvs: Vec<Vec<[f32; 2]>> = Vec::new();
 
     let resolve_loop = |entry: &Vec<String>| -> Option<Vec<[f32; 2]>> {
         // `trim u0 u1 curv2d u0 u1 curv2d …` — one or more (u0, u1,
@@ -3365,14 +3377,15 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                  step_v: Option<u32>,
                  surfs: &[&Vec<String>],
                  trims: &[Vec<[f32; 2]>],
-                 holes: &[Vec<[f32; 2]>]| {
+                 holes: &[Vec<[f32; 2]>],
+                 scrvs: &[Vec<[f32; 2]>]| {
         let Some(kind) = kind else {
             return;
         };
         for entry in surfs {
             if let Some(prim) = flush_surface(
                 doc, kind, deg_u, deg_v, parm_u, parm_v, bmat_u, bmat_v, step_u, step_v, entry,
-                samples, trims, holes,
+                samples, trims, holes, scrvs,
             ) {
                 out.push(prim);
             }
@@ -3399,10 +3412,12 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     &pending_surfs,
                     &pending_trims,
                     &pending_holes,
+                    &pending_scrvs,
                 );
                 pending_surfs.clear();
                 pending_trims.clear();
                 pending_holes.clear();
+                pending_scrvs.clear();
                 deg_u = None;
                 deg_v = None;
                 parm_u.clear();
@@ -3516,6 +3531,20 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     pending_holes.push(loop_uv);
                 }
             }
+            // Spec §"scrv u0 u1 curv2d u0 u1 curv2d …" / §"Special
+            // curve": the special curve shares the trim/hole body
+            // grammar but is an open constraint polyline, not a closed
+            // region boundary. `resolve_loop` assembles the same
+            // parameter-space polyline (its `polygon.len() < 3` floor
+            // still admits a 2-point straight special curve because a
+            // single curv2 segment rasterises to `samples + 1 ≥ 3`
+            // points). The eventual `flush_surface` call routes triangle
+            // edges along it.
+            "scrv" => {
+                if let Some(loop_uv) = resolve_loop(entry) {
+                    pending_scrvs.push(loop_uv);
+                }
+            }
             "end" => {
                 flush(
                     &mut out,
@@ -3531,10 +3560,12 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     &pending_surfs,
                     &pending_trims,
                     &pending_holes,
+                    &pending_scrvs,
                 );
                 pending_surfs.clear();
                 pending_trims.clear();
                 pending_holes.clear();
+                pending_scrvs.clear();
                 active_kind = None;
                 deg_u = None;
                 deg_v = None;
@@ -3563,6 +3594,7 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
         &pending_surfs,
         &pending_trims,
         &pending_holes,
+        &pending_scrvs,
     );
     out
 }
@@ -3775,11 +3807,13 @@ impl<'a> TrimRemesh<'a> {
     /// Garbage-collect boundary vertices that no surviving sub-triangle
     /// references (every candidate was a suppressed sliver), remap the
     /// indices, and return the referenced boundary positions in index
-    /// order ready to append after the lattice vertices.
-    fn finish(self, indices: &mut [u32]) -> Vec<[f32; 3]> {
+    /// order (paired with their parameter-space coordinates) ready to
+    /// append after the lattice vertices.
+    fn finish(self, indices: &mut [u32]) -> (Vec<[f32; 3]>, Vec<[f32; 2]>) {
         let lattice_count = self.lattice.len() as u32;
         let mut remap: HashMap<u32, u32> = HashMap::new();
         let mut compacted: Vec<[f32; 3]> = Vec::new();
+        let mut compacted_uvs: Vec<[f32; 2]> = Vec::new();
         for idx in indices.iter_mut() {
             let old = *idx;
             if old < lattice_count {
@@ -3788,11 +3822,548 @@ impl<'a> TrimRemesh<'a> {
             let next = lattice_count + remap.len() as u32;
             let slot = *remap.entry(old).or_insert_with(|| {
                 compacted.push(self.boundary_positions[(old - lattice_count) as usize]);
+                compacted_uvs.push(self.boundary_uvs[(old - lattice_count) as usize]);
                 next
             });
             *idx = slot;
         }
-        compacted
+        (compacted, compacted_uvs)
+    }
+}
+
+/// Special-curve (`scrv`) constraint inserter — spec §"Special curve":
+/// "A special curve is guaranteed to be included in any triangulation of
+/// the surface. … the line formed by approximating the special curve
+/// with a sequence of straight line segments will actually appear as a
+/// sequence of triangle edges in the final triangulation."
+///
+/// The inserter takes the surface triangle soup (index list into a shared
+/// position / parameter-coordinate vertex pool) and forces every straight
+/// segment of a `scrv` polyline to coincide with a chain of triangle
+/// edges. It works directly on the soup — no adjacency structure — by
+/// repeatedly splitting any triangle whose interior the segment passes
+/// through:
+///
+///   * If a constraint segment crosses a triangle (entering and leaving
+///     through its boundary, or starting / ending inside it), the
+///     crossing points are computed in parameter space, registered as
+///     vertices (deduplicated so adjacent triangles sharing a crossing
+///     agree on its index), and the triangle is re-triangulated so the
+///     chord between the two boundary hits becomes an edge.
+///   * Re-triangulation of one triangle can leave a neighbouring
+///     triangle still straddling the same segment, so the whole pass
+///     iterates the triangle list to a fixpoint (bounded — every split
+///     strictly increases the triangle count toward the finite set of
+///     lattice-cell / segment intersections).
+///
+/// A synthesised vertex's 3D position is the lattice's own
+/// piecewise-linear interpolation of the triangle it was born in
+/// (barycentric blend of the triangle's three corners), so the embedded
+/// special curve is exactly as accurate as the surrounding mesh — no new
+/// surface evaluation is introduced, matching the trim/hole re-mesh
+/// policy.
+struct ScrvConstraint<'a> {
+    /// Shared 3D position pool (lattice + trim-boundary + scrv vertices).
+    positions: &'a mut Vec<[f32; 3]>,
+    /// Parameter-space coordinate of every entry in `positions`.
+    uvs: &'a mut Vec<[f32; 2]>,
+    s0: f32,
+    span_s: f32,
+    t0: f32,
+    span_t: f32,
+    /// Quantised parameter coordinate → vertex index, so two triangles
+    /// that split at the same crossing reuse one vertex (watertight).
+    vertex_cache: HashMap<(i64, i64), u32>,
+}
+
+impl ScrvConstraint<'_> {
+    /// Snap a parameter coordinate to a stable integer grid (≈ 2⁻²⁰ of
+    /// the parameter span) so crossings computed independently in two
+    /// adjacent triangles map to the same cached vertex.
+    fn key(&self, uv: [f32; 2]) -> (i64, i64) {
+        let qs = if self.span_s.abs() > f32::EPSILON {
+            ((uv[0] - self.s0) / self.span_s * (1 << 20) as f32).round() as i64
+        } else {
+            0
+        };
+        let qt = if self.span_t.abs() > f32::EPSILON {
+            ((uv[1] - self.t0) / self.span_t * (1 << 20) as f32).round() as i64
+        } else {
+            0
+        };
+        (qs, qt)
+    }
+
+    /// Resolve a parameter coordinate sitting inside triangle `(a, b, c)`
+    /// to a vertex index, reusing an existing vertex when the coordinate
+    /// coincides (within the snap grid) with one already in the pool and
+    /// otherwise appending a fresh vertex whose 3D position is the
+    /// barycentric blend of the triangle's corners.
+    fn vertex_for(&mut self, uv: [f32; 2], tri: [u32; 3]) -> u32 {
+        let k = self.key(uv);
+        if let Some(&idx) = self.vertex_cache.get(&k) {
+            return idx;
+        }
+        // Barycentric weights of `uv` within the triangle in parameter
+        // space; the same weights lift to the 3D position so the new
+        // vertex lies on the existing piecewise-linear surface facet.
+        let pa = self.uvs[tri[0] as usize];
+        let pb = self.uvs[tri[1] as usize];
+        let pc = self.uvs[tri[2] as usize];
+        let det = (pb[1] - pc[1]) * (pa[0] - pc[0]) + (pc[0] - pb[0]) * (pa[1] - pc[1]);
+        let pos = if det.abs() < 1e-20 {
+            // Degenerate parameter triangle — fall back to the corner
+            // average so the vertex still lands on the facet.
+            let za = self.positions[tri[0] as usize];
+            let zb = self.positions[tri[1] as usize];
+            let zc = self.positions[tri[2] as usize];
+            [
+                (za[0] + zb[0] + zc[0]) / 3.0,
+                (za[1] + zb[1] + zc[1]) / 3.0,
+                (za[2] + zb[2] + zc[2]) / 3.0,
+            ]
+        } else {
+            let l0 = ((pb[1] - pc[1]) * (uv[0] - pc[0]) + (pc[0] - pb[0]) * (uv[1] - pc[1])) / det;
+            let l1 = ((pc[1] - pa[1]) * (uv[0] - pc[0]) + (pa[0] - pc[0]) * (uv[1] - pc[1])) / det;
+            let l2 = 1.0 - l0 - l1;
+            let za = self.positions[tri[0] as usize];
+            let zb = self.positions[tri[1] as usize];
+            let zc = self.positions[tri[2] as usize];
+            [
+                l0 * za[0] + l1 * zb[0] + l2 * zc[0],
+                l0 * za[1] + l1 * zb[1] + l2 * zc[1],
+                l0 * za[2] + l1 * zb[2] + l2 * zc[2],
+            ]
+        };
+        let idx = self.positions.len() as u32;
+        self.positions.push(pos);
+        self.uvs.push(uv);
+        self.vertex_cache.insert(k, idx);
+        idx
+    }
+
+    /// Embed one `scrv` polyline into the triangle soup. Returns `true`
+    /// if the curve overlapped the meshed surface (so it is now present
+    /// as a chain of triangle edges) — including the case where the
+    /// curve already lay along existing edges and needed no splits.
+    fn apply(&mut self, indices: &mut Vec<u32>, polyline: &[[f32; 2]]) -> bool {
+        let mut any = false;
+        for seg in polyline.windows(2) {
+            if self.insert_segment(indices, seg[0], seg[1]) {
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// Whether the segment `a → b` overlaps the meshed surface at all —
+    /// i.e. some triangle's interior or boundary carries a non-degenerate
+    /// portion of it. Used so a special curve that already lies on
+    /// existing edges still counts as "embedded".
+    fn overlaps_surface(&self, indices: &[u32], a: [f32; 2], b: [f32; 2]) -> bool {
+        let mut tri = 0usize;
+        while tri * 3 < indices.len() {
+            let t = [indices[tri * 3], indices[tri * 3 + 1], indices[tri * 3 + 2]];
+            if self.clip_raw_span(t, a, b).is_some() {
+                return true;
+            }
+            tri += 1;
+        }
+        false
+    }
+
+    /// Force the straight segment `a → b` (parameter space) to lie along
+    /// triangle edges by splitting every triangle the open segment
+    /// crosses. Iterates the triangle list to a fixpoint. Returns `true`
+    /// if the segment overlapped the surface (embedded), regardless of
+    /// whether splits were needed.
+    fn insert_segment(&mut self, indices: &mut Vec<u32>, a: [f32; 2], b: [f32; 2]) -> bool {
+        let overlapped = self.overlaps_surface(indices, a, b);
+        // Bound the rework: each split removes one triangle and adds two
+        // or three, so the soup grows monotonically toward the finite
+        // arrangement of (segment × triangle) crossings. The cap guards
+        // against a pathological float cycle.
+        let max_iters = 64 * (indices.len() / 3).max(1) + 4096;
+        let mut iters = 0;
+        loop {
+            let mut split_at: Option<usize> = None;
+            let mut tri = 0usize;
+            while tri * 3 < indices.len() {
+                let t = [indices[tri * 3], indices[tri * 3 + 1], indices[tri * 3 + 2]];
+                if self.crosses_interior(t, a, b) {
+                    split_at = Some(tri);
+                    break;
+                }
+                tri += 1;
+            }
+            let Some(tri) = split_at else {
+                break;
+            };
+            let t = [indices[tri * 3], indices[tri * 3 + 1], indices[tri * 3 + 2]];
+            if !self.split_triangle(indices, tri, t, a, b) {
+                // No progress possible on this triangle (numeric edge
+                // case) — stop to avoid spinning.
+                break;
+            }
+            iters += 1;
+            if iters > max_iters {
+                break;
+            }
+        }
+        overlapped
+    }
+
+    /// Does the segment `a → b` pass through the open interior of
+    /// triangle `t` along a portion that is not already one of `t`'s
+    /// edges? Computes the segment's clipped span inside the triangle and
+    /// reports whether that span has positive length and at least one of
+    /// its endpoints is strictly interior to an edge / face (i.e. the
+    /// triangle genuinely needs splitting).
+    fn crosses_interior(&self, t: [u32; 3], a: [f32; 2], b: [f32; 2]) -> bool {
+        self.clip_span(t, a, b).is_some()
+    }
+
+    /// Clip segment `a → b` to triangle `t` (parameter space), returning
+    /// the in-triangle sub-segment `(p, q)` whenever the segment overlaps
+    /// the triangle along a non-degenerate span. No edge-coincidence
+    /// filtering — used by [`Self::overlaps_surface`] to count a special
+    /// curve that already lies on existing edges as embedded.
+    fn clip_raw_span(&self, t: [u32; 3], a: [f32; 2], b: [f32; 2]) -> Option<([f32; 2], [f32; 2])> {
+        let va = self.uvs[t[0] as usize];
+        let vb = self.uvs[t[1] as usize];
+        let vc = self.uvs[t[2] as usize];
+        // Parameter-space area scale of this triangle; used to size the
+        // geometric epsilon so the test is invariant to lattice density.
+        let area2 = ((vb[0] - va[0]) * (vc[1] - va[1]) - (vb[1] - va[1]) * (vc[0] - va[0])).abs();
+        if area2 < 1e-18 {
+            return None;
+        }
+        let eps = (area2.sqrt()) * 1e-4;
+        // Clip the segment against the three half-planes of the triangle
+        // (CCW or CW handled by sign normalisation). Parameter t along
+        // a→b kept in [t_lo, t_hi].
+        let mut t_lo = 0.0f32;
+        let mut t_hi = 1.0f32;
+        let edges = [(va, vb), (vb, vc), (vc, va)];
+        // Triangle orientation sign.
+        let orient = (vb[0] - va[0]) * (vc[1] - va[1]) - (vb[1] - va[1]) * (vc[0] - va[0]);
+        let sgn = if orient >= 0.0 { 1.0 } else { -1.0 };
+        let dir = [b[0] - a[0], b[1] - a[1]];
+        for (e0, e1) in edges {
+            // Inward normal (for CCW): rotate edge by +90°, scaled by
+            // orientation sign so it points into the triangle.
+            let ex = e1[0] - e0[0];
+            let ey = e1[1] - e0[1];
+            let nx = -ey * sgn;
+            let ny = ex * sgn;
+            // Signed inside-distance of a→b endpoints w.r.t. this edge.
+            let da = nx * (a[0] - e0[0]) + ny * (a[1] - e0[1]);
+            let db = nx * (b[0] - e0[0]) + ny * (b[1] - e0[1]);
+            let denom = db - da;
+            if denom.abs() < 1e-20 {
+                // Segment parallel to the edge: reject only if fully
+                // outside.
+                if da < -eps * (nx * nx + ny * ny).sqrt() {
+                    return None;
+                }
+                continue;
+            }
+            // Crossing parameter where the inside-distance hits 0.
+            let tc = -da / denom;
+            if denom > 0.0 {
+                // Entering the half-plane.
+                if tc > t_lo {
+                    t_lo = tc;
+                }
+            } else if tc < t_hi {
+                // Leaving the half-plane.
+                t_hi = tc;
+            }
+            if t_lo > t_hi {
+                return None;
+            }
+        }
+        if t_hi - t_lo <= 1e-6 {
+            return None;
+        }
+        let p = [a[0] + dir[0] * t_lo, a[1] + dir[1] * t_lo];
+        let q = [a[0] + dir[0] * t_hi, a[1] + dir[1] * t_hi];
+        Some((p, q))
+    }
+
+    /// Clip segment `a → b` to triangle `t`, returning the in-triangle
+    /// sub-segment only when the triangle genuinely needs splitting — the
+    /// span is non-degenerate AND not already coincident with a single
+    /// triangle edge (in which case the constraint is already satisfied).
+    fn clip_span(&self, t: [u32; 3], a: [f32; 2], b: [f32; 2]) -> Option<([f32; 2], [f32; 2])> {
+        let (p, q) = self.clip_raw_span(t, a, b)?;
+        let va = self.uvs[t[0] as usize];
+        let vb = self.uvs[t[1] as usize];
+        let vc = self.uvs[t[2] as usize];
+        let area2 = ((vb[0] - va[0]) * (vc[1] - va[1]) - (vb[1] - va[1]) * (vc[0] - va[0])).abs();
+        let eps = area2.sqrt() * 1e-4;
+        if self.span_on_single_edge(va, vb, vc, p, q, eps) {
+            return None;
+        }
+        Some((p, q))
+    }
+
+    /// True when both `p` and `q` lie (within `eps`) on the same triangle
+    /// edge line — meaning the chord coincides with an existing edge and
+    /// no split is required.
+    fn span_on_single_edge(
+        &self,
+        va: [f32; 2],
+        vb: [f32; 2],
+        vc: [f32; 2],
+        p: [f32; 2],
+        q: [f32; 2],
+        eps: f32,
+    ) -> bool {
+        let on = |e0: [f32; 2], e1: [f32; 2], pt: [f32; 2]| -> bool {
+            let ex = e1[0] - e0[0];
+            let ey = e1[1] - e0[1];
+            let len = (ex * ex + ey * ey).sqrt();
+            if len < 1e-20 {
+                return false;
+            }
+            let dist = ((pt[0] - e0[0]) * ey - (pt[1] - e0[1]) * ex).abs() / len;
+            dist <= eps
+        };
+        (on(va, vb, p) && on(va, vb, q))
+            || (on(vb, vc, p) && on(vb, vc, q))
+            || (on(vc, va, p) && on(vc, va, q))
+    }
+
+    /// Replace triangle `tri` (corners `t`) with a fan that routes the
+    /// constraint chord `p–q` (the clipped span of `a → b`) along new
+    /// edges. `p` and `q` are realised as vertices (deduplicated); the
+    /// triangle is re-meshed as the union of the sub-polygons on either
+    /// side of the chord, each ear-triangulated. Returns `false` if the
+    /// span degenerated between detection and split (numeric race).
+    fn split_triangle(
+        &mut self,
+        indices: &mut Vec<u32>,
+        tri: usize,
+        t: [u32; 3],
+        a: [f32; 2],
+        b: [f32; 2],
+    ) -> bool {
+        let Some((p, q)) = self.clip_span(t, a, b) else {
+            return false;
+        };
+        let ip = self.vertex_for(p, t);
+        let iq = self.vertex_for(q, t);
+        if ip == iq {
+            return false;
+        }
+        // Re-triangulate the original triangle with the two chord
+        // endpoints inserted on its boundary / interior. Build the set of
+        // boundary loop vertices by walking the triangle edges and
+        // splicing in p / q where they fall, then ear-clip the loop while
+        // forcing the p–q diagonal. The robust, allocation-light path:
+        // collect the triangle's 3 corners plus p and q, then emit the
+        // constrained triangulation via the helper below.
+        let new_tris = self.constrained_split(t, ip, iq);
+        if new_tris.is_empty() {
+            return false;
+        }
+        // Overwrite the original slot with the first new triangle and
+        // append the rest, preserving the soup invariant.
+        let first = new_tris[0];
+        indices[tri * 3] = first[0];
+        indices[tri * 3 + 1] = first[1];
+        indices[tri * 3 + 2] = first[2];
+        for nt in &new_tris[1..] {
+            indices.push(nt[0]);
+            indices.push(nt[1]);
+            indices.push(nt[2]);
+        }
+        true
+    }
+
+    /// Build a constrained triangulation of the original triangle
+    /// `(t[0], t[1], t[2])` after inserting the two chord vertices `ip` /
+    /// `iq`, guaranteeing the edge `ip–iq` is present. Handles the three
+    /// placements that arise from clipping a straight chord against a
+    /// triangle: both chord endpoints on the boundary (the usual
+    /// crossing), or one endpoint strictly interior (a chord that starts
+    /// or ends inside the triangle). The triangle is decomposed by
+    /// fanning every region from the chord, which keeps the chord as a
+    /// shared edge of the surrounding sub-triangles.
+    fn constrained_split(&self, t: [u32; 3], ip: u32, iq: u32) -> Vec<[u32; 3]> {
+        // Locate where ip and iq sit relative to the triangle: on an edge
+        // (return the edge's two corner indices) or interior (None).
+        let p_edge = self.locate_on_edge(t, ip);
+        let q_edge = self.locate_on_edge(t, iq);
+        let mut out: Vec<[u32; 3]> = Vec::new();
+        match (p_edge, q_edge) {
+            (Some((pa, pb)), Some((qa, qb))) => {
+                // Both endpoints on the boundary — the general crossing.
+                // Re-triangulate the boundary polygon
+                // [corner sequence with ip and iq spliced in] by walking
+                // the three corners in order and inserting the chord
+                // vertices on their edges, then fan from ip.
+                let loop_verts = self.boundary_loop(t, ip, (pa, pb), iq, (qa, qb));
+                self.fan_with_chord(&loop_verts, ip, iq, &mut out);
+            }
+            (Some((pa, pb)), None) => {
+                // q is interior: fan the triangle from q, then split the
+                // wedge that contains the boundary point p along p.
+                self.split_one_interior(t, iq, ip, (pa, pb), &mut out);
+            }
+            (None, Some((qa, qb))) => {
+                self.split_one_interior(t, ip, iq, (qa, qb), &mut out);
+            }
+            (None, None) => {
+                // Both interior (a chord wholly inside the triangle):
+                // connect each triangle corner to the nearer chord end so
+                // the chord becomes a shared interior edge.
+                out.push([t[0], t[1], ip]);
+                out.push([t[1], t[2], ip]);
+                out.push([t[2], t[0], iq]);
+                out.push([t[0], ip, iq]);
+                out.push([t[2], iq, ip]);
+                out.push([t[1], ip, iq]);
+            }
+        }
+        out
+    }
+
+    /// Return the two corner indices of the triangle edge that vertex `v`
+    /// lies on (within an epsilon), or `None` when `v` is strictly
+    /// interior. `v` is one of the freshly-inserted chord vertices.
+    fn locate_on_edge(&self, t: [u32; 3], v: u32) -> Option<(u32, u32)> {
+        let pt = self.uvs[v as usize];
+        let corners = [t[0], t[1], t[2]];
+        let uv = [
+            self.uvs[t[0] as usize],
+            self.uvs[t[1] as usize],
+            self.uvs[t[2] as usize],
+        ];
+        let area2 = ((uv[1][0] - uv[0][0]) * (uv[2][1] - uv[0][1])
+            - (uv[1][1] - uv[0][1]) * (uv[2][0] - uv[0][0]))
+            .abs();
+        let eps = area2.sqrt() * 1e-3;
+        for e in 0..3 {
+            let e0 = uv[e];
+            let e1 = uv[(e + 1) % 3];
+            let ex = e1[0] - e0[0];
+            let ey = e1[1] - e0[1];
+            let len = (ex * ex + ey * ey).sqrt();
+            if len < 1e-20 {
+                continue;
+            }
+            let dist = ((pt[0] - e0[0]) * ey - (pt[1] - e0[1]) * ex).abs() / len;
+            // Project onto the edge to confirm the point is between the
+            // endpoints, not on the line beyond them.
+            let proj = ((pt[0] - e0[0]) * ex + (pt[1] - e0[1]) * ey) / (len * len);
+            if dist <= eps && (-1e-3..=1.0 + 1e-3).contains(&proj) {
+                return Some((corners[e], corners[(e + 1) % 3]));
+            }
+        }
+        None
+    }
+
+    /// Walk the triangle's three boundary edges in order, splicing the
+    /// chord endpoints `ip` / `iq` onto the edges they sit on, to produce
+    /// the closed boundary vertex loop the chord divides.
+    fn boundary_loop(
+        &self,
+        t: [u32; 3],
+        ip: u32,
+        p_edge: (u32, u32),
+        iq: u32,
+        q_edge: (u32, u32),
+    ) -> Vec<u32> {
+        let mut loop_verts: Vec<u32> = Vec::with_capacity(5);
+        for e in 0..3 {
+            let from = t[e];
+            let to = t[(e + 1) % 3];
+            loop_verts.push(from);
+            // Splice any chord vertex that lies on this directed edge,
+            // ordered by distance from `from`.
+            let mut on_edge: Vec<(f32, u32)> = Vec::new();
+            for (cv, ce) in [(ip, p_edge), (iq, q_edge)] {
+                if (ce.0 == from && ce.1 == to) || (ce.0 == to && ce.1 == from) {
+                    let pf = self.uvs[from as usize];
+                    let pt = self.uvs[cv as usize];
+                    let d = (pt[0] - pf[0]).hypot(pt[1] - pf[1]);
+                    on_edge.push((d, cv));
+                }
+            }
+            on_edge.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+            for (_, cv) in on_edge {
+                loop_verts.push(cv);
+            }
+        }
+        loop_verts
+    }
+
+    /// Triangulate a convex boundary loop that contains both chord
+    /// endpoints `ip` and `iq`, forcing the chord `ip–iq` to be an edge.
+    /// The chord splits the loop into two convex sub-chains; each is
+    /// fan-triangulated from one chord endpoint, so the chord is the
+    /// shared base of both fans.
+    fn fan_with_chord(&self, loop_verts: &[u32], ip: u32, iq: u32, out: &mut Vec<[u32; 3]>) {
+        let n = loop_verts.len();
+        if n < 3 {
+            return;
+        }
+        let pos_ip = loop_verts.iter().position(|&v| v == ip);
+        let pos_iq = loop_verts.iter().position(|&v| v == iq);
+        let (Some(i), Some(j)) = (pos_ip, pos_iq) else {
+            // Chord endpoint missing from the loop (shouldn't happen) —
+            // fall back to a plain fan so no geometry is lost.
+            for k in 1..n - 1 {
+                out.push([loop_verts[0], loop_verts[k], loop_verts[k + 1]]);
+            }
+            return;
+        };
+        // Chain 1: ip → … → iq (forward). Chain 2: iq → … → ip (forward,
+        // wrapping). Fan each from its first vertex.
+        let chain = |start: usize, end: usize| -> Vec<u32> {
+            let mut c = Vec::new();
+            let mut k = start;
+            loop {
+                c.push(loop_verts[k]);
+                if k == end {
+                    break;
+                }
+                k = (k + 1) % n;
+            }
+            c
+        };
+        for sub in [chain(i, j), chain(j, i)] {
+            for k in 1..sub.len().saturating_sub(1) {
+                out.push([sub[0], sub[k], sub[k + 1]]);
+            }
+        }
+    }
+
+    /// One chord endpoint (`inner`) is strictly interior, the other
+    /// (`bound`) sits on edge `(ea, eb)`. Fan the triangle from `inner`
+    /// (three wedges), then split the wedge whose far edge is `(ea, eb)`
+    /// along `bound` so the chord `inner–bound` is an edge.
+    fn split_one_interior(
+        &self,
+        t: [u32; 3],
+        inner: u32,
+        bound: u32,
+        edge: (u32, u32),
+        out: &mut Vec<[u32; 3]>,
+    ) {
+        for e in 0..3 {
+            let from = t[e];
+            let to = t[(e + 1) % 3];
+            if (from == edge.0 && to == edge.1) || (from == edge.1 && to == edge.0) {
+                // This wedge's outer edge carries `bound`: split into two.
+                out.push([from, bound, inner]);
+                out.push([bound, to, inner]);
+            } else {
+                out.push([from, to, inner]);
+            }
+        }
     }
 }
 
@@ -3817,6 +4388,7 @@ fn flush_surface(
     samples: u32,
     trims: &[Vec<[f32; 2]>],
     holes: &[Vec<[f32; 2]>],
+    scrvs: &[Vec<[f32; 2]>],
 ) -> Option<Primitive> {
     // `surf s0 s1 t0 t1 v1/vt1/vn1 …` — minimum is the keyword + 4
     // range scalars + at least one control vertex.
@@ -4078,9 +4650,30 @@ fn flush_surface(
     // jagged at the lattice grain.
     let mut indices: Vec<u32> = Vec::with_capacity((samples as usize) * (samples as usize) * 6);
     let mut boundary_vertex_count = 0usize;
+    // Parameter-space coordinate of every vertex in `positions`, kept in
+    // lock-step so the special-curve constraint pass (which works in
+    // parameter space) can address any vertex — lattice or synthesised.
+    // Only populated when there is special-curve work to do; the common
+    // (no-scrv) path skips it entirely so existing behaviour is byte-for-
+    // byte unchanged.
+    let span_s = s1 - s0;
+    let span_t = t1 - t0;
+    let want_scrv = !scrvs.is_empty();
+    let mut uvs: Vec<[f32; 2]> = if want_scrv {
+        let mut v = Vec::with_capacity(positions.len());
+        for sv in 0..stride {
+            for su in 0..stride {
+                v.push([
+                    s0 + (su as f32 / samples as f32) * span_s,
+                    t0 + (sv as f32 / samples as f32) * span_t,
+                ]);
+            }
+        }
+        v
+    } else {
+        Vec::new()
+    };
     if trimming {
-        let span_s = s1 - s0;
-        let span_t = t1 - t0;
         // Sliver threshold: 10⁻⁶ of one lattice cell's parameter-space
         // area (×2 because `push_triangle` compares doubled areas).
         // Loops that graze a lattice line produce crossings at the
@@ -4113,9 +4706,12 @@ fn flush_surface(
                 remesh.clip_triangle(&mut indices, i00, i11, i01);
             }
         }
-        let boundary = remesh.finish(&mut indices);
+        let (boundary, boundary_uvs) = remesh.finish(&mut indices);
         boundary_vertex_count = boundary.len();
         positions.extend(boundary);
+        if want_scrv {
+            uvs.extend(boundary_uvs);
+        }
     } else {
         for sv in 0..samples as usize {
             for su in 0..samples as usize {
@@ -4131,6 +4727,38 @@ fn flush_surface(
                 indices.push(i01);
             }
         }
+    }
+
+    // Special-curve (`scrv`) constraint pass — spec §"Special curve":
+    // "A special curve is guaranteed to be included in any triangulation
+    // of the surface. … the line formed by approximating the special
+    // curve with a sequence of straight line segments will actually
+    // appear as a sequence of triangle edges in the final
+    // triangulation." Each `scrv` polyline (resolved in parameter space
+    // exactly like a trim/hole loop, but left open) is inserted into the
+    // freshly-built surface triangulation as a constraint: every
+    // straight segment of the approximated special curve is forced to
+    // coincide with a chain of triangle edges. Done after the trim/hole
+    // re-mesh so the constraint operates on the final kept geometry.
+    let mut scrv_constraint_vertices = 0usize;
+    let mut scrv_constraint_curves = 0usize;
+    if want_scrv {
+        let lattice_count = positions.len();
+        let mut con = ScrvConstraint {
+            positions: &mut positions,
+            uvs: &mut uvs,
+            s0,
+            span_s,
+            t0,
+            span_t,
+            vertex_cache: HashMap::new(),
+        };
+        for scrv in scrvs {
+            if con.apply(&mut indices, scrv) {
+                scrv_constraint_curves += 1;
+            }
+        }
+        scrv_constraint_vertices = positions.len() - lattice_count;
     }
 
     let mut prim = Primitive::new(Topology::Triangles);
@@ -4224,6 +4852,27 @@ fn flush_surface(
         prim.extras.insert(
             "obj:surface_trim_boundary_vertices".to_string(),
             serde_json::Value::Number(serde_json::Number::from(boundary_vertex_count as u64)),
+        );
+    }
+    if want_scrv {
+        // Spec §"Special curve" — record how many special curves were
+        // embedded as triangle edges and how many constraint vertices
+        // (segment endpoints + lattice-edge crossings) the embedding
+        // synthesised. The synthesised vertices sit after the lattice
+        // (and any trim-boundary) block in `positions`. `obj:surface_
+        // scrv_curves` is 0 when every `scrv` collapsed (e.g. it lay
+        // wholly outside the parameter rectangle).
+        prim.extras.insert(
+            "obj:surface_scrv".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        prim.extras.insert(
+            "obj:surface_scrv_curves".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(scrv_constraint_curves as u64)),
+        );
+        prim.extras.insert(
+            "obj:surface_scrv_vertices".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(scrv_constraint_vertices as u64)),
         );
     }
 

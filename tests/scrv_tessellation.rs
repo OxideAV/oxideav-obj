@@ -10,11 +10,12 @@
 //! resulting polyline is NOT a closed polygon — the spec describes it
 //! as a "sequence of curves which lie on a given surface to build a
 //! single special curve" that the surface triangulator must include
-//! as a sequence of triangle edges. Surface-aware triangulation
-//! against that constraint remains future work; this round emits the
-//! special curve as a stand-alone parameter-space polyline so
-//! consumers that care can resolve it without re-walking the
-//! directive stream.
+//! as a sequence of triangle edges. This module covers the
+//! stand-alone parameter-space polyline view (the `obj:scrvs` mesh) so
+//! consumers that care can resolve the special curve without
+//! re-walking the directive stream; the surface-aware embedding of the
+//! special curve as actual triangle edges on the `obj:surfaces` mesh
+//! is covered separately in `scrv_surface_edges.rs`.
 //!
 //! The free-form directive sequence still rides on
 //! `Scene3D::extras["obj:freeform_directives"]` so a decode → encode
