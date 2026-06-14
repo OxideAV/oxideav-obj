@@ -541,6 +541,26 @@ fn apply_directive(
             mat.extras
                 .insert(format!("mtl:{keyword}"), serde_json::json!(v));
         }
+        "map_aat" => {
+            // Per-material texture anti-aliasing toggle (spec
+            // §"map_aat on"). The spec documents only the `on` form,
+            // but the keyword is a boolean state-setter, so `off` is
+            // accepted symmetrically. Surfaced as a bool extra so a
+            // re-emit reproduces the exact `on` / `off` token; any
+            // other / missing argument drops the line silently
+            // (lenient-loader convention) without failing the parse.
+            if let Some(tok) = tokens.next() {
+                let flag = match tok {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    _ => None,
+                };
+                if let Some(b) = flag {
+                    mat.extras
+                        .insert("mtl:map_aat".to_string(), serde_json::json!(b));
+                }
+            }
+        }
         "map_Kd" => {
             pm.pending.base_color = Some(parse_map_with_options(keyword, tokens, &mut mat.extras));
         }
@@ -1305,6 +1325,15 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
             }
         }
 
+        // Per-material texture anti-aliasing toggle (spec §"map_aat
+        // on"). Emitted from the bool extra as the exact `on` / `off`
+        // token; handled explicitly here (and skipped in the
+        // string-only pass-through below) because the pass-through loop
+        // only re-emits string-valued keys.
+        if let Some(serde_json::Value::Bool(b)) = mat.extras.get("mtl:map_aat") {
+            writeln!(out, "map_aat {}", if *b { "on" } else { "off" }).unwrap();
+        }
+
         // Pass-through extras — `mtl:*` keys we didn't consume above.
         for (k, v) in &mat.extras {
             if !k.starts_with("mtl:") {
@@ -1333,7 +1362,8 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
                 | "mtl:displaced_pbr_map"
                 | "mtl:d_halo_factor"
                 | "mtl:refl:sphere"
-                | "mtl:refl:cube" => continue,
+                | "mtl:refl:cube"
+                | "mtl:map_aat" => continue,
                 _ => {}
             }
             // `mtl:<map>:options` chunks are spliced inline by

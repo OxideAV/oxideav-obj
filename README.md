@@ -144,6 +144,9 @@ The companion **MTL** parser/serialiser handles:
 - Wavefront-PBR extension (`Pr` roughness, `Pm` metallic, `Pc`
   clearcoat, `Ps` sheen, `map_Pr` / `map_Pm`) → `Material::roughness`
   / `Material::metallic` / `metallic_roughness_texture`.
+- `map_aat on` per-material texture anti-aliasing toggle (spec
+  §"map_aat on") → boolean `Material::extras["mtl:map_aat"]`,
+  round-tripped as the exact `on` / `off` token.
 
 Both decoders are registered against `Mesh3DRegistry` under the
 default-on `registry` cargo feature; drop the feature for a free-standing
@@ -860,6 +863,17 @@ groups is ignored") is a renderer-side pruning decision over the `mg`
 state and is left to the consumer. Verbatim round-trip is untouched —
 the encoder filters the seams via the shared sentinel and replays the
 original `con` line from `Scene3D::extras["obj:freeform_directives"]`.
+
+Round 302: MTL `map_aat on` per-material texture anti-aliasing toggle
+— spec §"map_aat on" ("Turns on anti-aliasing of textures in this
+material without anti-aliasing all textures in the scene"). The flag
+is surfaced as a boolean `Material::extras["mtl:map_aat"]` and
+round-trips the exact `on` / `off` token (the spec documents only the
+`on` form, but the keyword is a boolean state-setter so `off` is
+accepted symmetrically; any other or missing argument drops the line
+silently without failing the parse). The serialiser emits the flag
+explicitly because the string-only pass-through loop can't carry a
+bool-valued extra.
 
 The `.mod` binary form remains out of scope. Round 282 upgraded the
 round-201 conservative trim/hole clip to sub-cell boundary re-meshing,

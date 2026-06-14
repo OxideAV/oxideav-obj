@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 302: MTL `map_aat on` per-material texture anti-aliasing toggle
+  per spec §"map_aat on" ("Turns on anti-aliasing of textures in this
+  material without anti-aliasing all textures in the scene"). The flag is
+  surfaced as a boolean `Material::extras["mtl:map_aat"]` and round-trips
+  the exact `on` / `off` token. The spec documents only the `on` form,
+  but the keyword is a boolean state-setter so `off` is accepted
+  symmetrically; any other or missing argument drops the line silently
+  (lenient-loader convention) without failing the parse. The serialiser
+  emits the flag explicitly (the string-only pass-through loop can't carry
+  a bool) ahead of the other pass-through map keywords.
 - Round 295: connectivity (`con`) seam tessellation — spec §"Connectivity
   between free-form surfaces", §"con surf_1 q0_1 q1_1 curv2d_1 surf_2 q0_2
   q1_2 curv2d_2". With `with_curve_tessellation(samples)` enabled, every
