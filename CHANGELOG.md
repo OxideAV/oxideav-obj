@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 295: connectivity (`con`) seam tessellation — spec §"Connectivity
+  between free-form surfaces", §"con surf_1 q0_1 q1_1 curv2d_1 surf_2 q0_2
+  q1_2 curv2d_2". With `with_curve_tessellation(samples)` enabled, every
+  `con` statement now emits a pair of parameter-space
+  `Topology::LineStrip` seams — one per joined surface edge — on a new
+  synthetic mesh named `"obj:cons"`. Where round 251 surfaced the eight
+  raw arguments as the typed `Scene3D::extras["obj:connectivity"]` view,
+  this pass draws the seam itself ("This information is useful for edge
+  merging"): each side's `curv2d` is resolved through the same
+  `collect_all_curv2_polylines` pre-pass the `trim` / `hole` / `scrv`
+  passes use, and the `[q0, q1]` sub-range is walked with the shared
+  `append_curv2_segment` so a connectivity seam is sampled identically to
+  a special-curve segment. The appendix correspondence (`S1(T1(t1))` for
+  `t1 ∈ [q0_1, q1_1]` joined to `S2(T2(t2))` for `t2 ∈ [q0_2, q1_2]`,
+  "identical up to reparameterization", endpoints meeting exactly) means
+  the two emitted seams are the two sides of one weld. Per-seam
+  provenance: the shared `obj:tessellated_curve` sentinel, an `obj:con`
+  marker, `obj:con_side` (`1`/`2`), `obj:con_surf` + `obj:con_peer_surf`
+  (the joined surface's index and its mate's), `obj:con_curv2d`, and
+  `obj:con_q0` / `obj:con_q1`. A `con` without exactly eight arguments is
+  dropped from the geometry view; a side whose curve doesn't resolve
+  (non-positive / undefined `curv2d`, or a zero-length parameter range —
+  e.g. the spec example's `2.0 2.0` point-join) drops on its own while
+  the other side still emits. The spec's merging-group exclusion
+  ("Connectivity between surfaces in different merging groups is ignored")
+  is left to the consumer's renderer-side pruning over the `mg` state.
+  Verbatim round-trip is untouched — the encoder filters the seams via the
+  shared sentinel and replays the original `con` line. +9 tests
+  (`connectivity_seams.rs`).
 - Round 290: special-curve (`scrv`) embedding as surface triangle edges
   (spec §"Special curve": "A special curve is guaranteed to be included
   in any triangulation of the surface. … the line formed by

@@ -827,12 +827,48 @@ of synthesised constraint vertices). Verbatim round-trip is untouched
 the original `scrv` block from
 `Scene3D::extras["obj:freeform_directives"]`.
 
+Round 295: connectivity (`con`) seam tessellation — spec §"Connectivity
+between free-form surfaces", §"con surf_1 q0_1 q1_1 curv2d_1 surf_2 q0_2
+q1_2 curv2d_2": "Connectivity connects two surfaces along their trimming
+curves. … This information is useful for edge merging." The round-251
+pass surfaced the eight raw `con` arguments as the typed
+`Scene3D::extras["obj:connectivity"]` view; this round draws the seam
+itself as drawable geometry. With `with_curve_tessellation(samples)`
+enabled, every `con` emits a pair of parameter-space
+`Topology::LineStrip` seams — one per joined surface edge — on a new
+synthetic mesh named `"obj:cons"`. Each side's `curv2d` is resolved
+through the same `collect_all_curv2_polylines` pre-pass the `trim` /
+`hole` / `scrv` passes use ("This curve must have been previously
+defined with the curv2 statement"), and the `[q0, q1]` sub-range is
+walked with the shared `append_curv2_segment` so a connectivity seam is
+sampled identically to a special-curve segment. The appendix fixes the
+correspondence — the seam is `S1(T1(t1))` for `t1 ∈ [q0_1, q1_1]` and
+`S2(T2(t2))` for `t2 ∈ [q0_2, q1_2]`, "identical up to
+reparameterization" with endpoints meeting exactly — so the two emitted
+seams are the two sides of one weld. Per-seam provenance: the shared
+`obj:tessellated_curve` sentinel, an `obj:con` marker, `obj:con_side`
+(`1` / `2`), `obj:con_surf` and `obj:con_peer_surf` (the joined
+surface's index and its mate's, so a consumer holding one seam finds the
+other without re-parsing), `obj:con_curv2d`, and `obj:con_q0` /
+`obj:con_q1`. A `con` without exactly eight arguments is dropped from
+the geometry view (like the typed view); a side whose curve doesn't
+resolve (non-positive / undefined `curv2d`, or a zero-length parameter
+range — e.g. the spec example's `2.0 2.0` point-join on side 1) drops on
+its own while the other side still emits. The merging-group filter the
+spec mentions ("Connectivity between surfaces in different merging
+groups is ignored") is a renderer-side pruning decision over the `mg`
+state and is left to the consumer. Verbatim round-trip is untouched —
+the encoder filters the seams via the shared sentinel and replays the
+original `con` line from `Scene3D::extras["obj:freeform_directives"]`.
+
 The `.mod` binary form remains out of scope. Round 282 upgraded the
 round-201 conservative trim/hole clip to sub-cell boundary re-meshing,
 so the trim edge now follows the loop polygon at bisection precision
 rather than the lattice grain (residual approximation: the straight
 chord across a loop corner inside its straddling cell); round 290
-embeds the `scrv` special curve as triangle edges on the surface mesh.
+embeds the `scrv` special curve as triangle edges on the surface mesh;
+round 295 draws the `con` connectivity seam as a parameter-space
+polyline pair on the `obj:cons` mesh.
 
 ## License
 

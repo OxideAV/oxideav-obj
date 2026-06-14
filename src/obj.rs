@@ -2425,6 +2425,198 @@ fn tessellate_scrv(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
     out
 }
 
+/// Connectivity (`con`) seam tessellation pass — evaluates every `con`
+/// connectivity statement into a pair of synthetic parameter-space
+/// `LineStrip` polylines, one per joined surface edge.
+///
+/// Spec §"Connectivity between free-form surfaces" / §"con surf_1 q0_1
+/// q1_1 curv2d_1 surf_2 q0_2 q1_2 curv2d_2": the statement ties two
+/// previously-declared `surf` blocks together along a shared trimming-
+/// curve segment so a downstream merger can weld the surfaces' boundary
+/// vertices without re-deriving the adjacency numerically (spec:
+/// "This information is useful for edge merging. Without this surface
+/// and curve data, connectivity must be determined numerically at
+/// greater expense and with reduced accuracy using the mg statement.").
+/// The appendix gives the exact correspondence: the seam is the curve
+/// `S1(T1(t1))` for `t1 ∈ [q0_1, q1_1]` on the first surface and
+/// `S2(T2(t2))` for `t2 ∈ [q0_2, q1_2]` on the second, with the two
+/// "identical up to reparameterization" and the endpoints meeting
+/// exactly — `S1(T1(q0_1)) = S2(T2(q0_2))`, `S1(T1(q1_1)) =
+/// S2(T2(q1_2))`.
+///
+/// Where the round-251 typed view (`obj:connectivity`) surfaces the
+/// eight raw `con` arguments for a consumer to act on, this pass emits
+/// the seam itself as drawable geometry: the `curv2d` referenced on
+/// each side is resolved through the same `collect_all_curv2_polylines`
+/// table the trim / hole / scrv passes use (spec §"con … curv2d …":
+/// "This curve must have been previously defined with the curv2
+/// statement"), and the `[q0, q1]` sub-range is walked with the shared
+/// `append_curv2_segment` so a connectivity seam is sampled identically
+/// to a special-curve segment. Each side becomes one `LineStrip`
+/// primitive in parameter space (`z = 0`, matching the `curv2` / `scrv`
+/// synthetic layout) on a dedicated `obj:cons` mesh.
+///
+/// Each emitted primitive carries:
+///   * `obj:tessellated_curve` — `true` (shared encoder-filter sentinel
+///     so the encoder's existing `is_tessellated_curve` filter drops
+///     the synthetic seam from a re-emit; the original `con` line still
+///     rides on `obj:freeform_directives` for verbatim round-trip).
+///   * `obj:con` — `true`.
+///   * `obj:con_side` — `1` or `2`, which `(surf, q0, q1, curv2d)`
+///     quadruple of the statement this seam came from.
+///   * `obj:con_surf` — `i64`, the index of the surface this side joins
+///     (`surf_1` for side 1, `surf_2` for side 2). Carried as-is; the
+///     seam geometry comes from the `curv2d` curve, not from resolving
+///     the surface, so a forward reference to a surface that this pass
+///     doesn't number is still recorded.
+///   * `obj:con_peer_surf` — `i64`, the index of the surface on the
+///     *other* side of the join (so a consumer holding one seam can
+///     find its mate without re-parsing the statement).
+///   * `obj:con_curv2d` — `i64`, the 1-based `curv2d` index this seam
+///     was resolved from.
+///   * `obj:con_q0` / `obj:con_q1` — `f64`, the start / end parameter
+///     on `curv2d` for this side.
+///
+/// A `con` line that doesn't carry exactly eight arguments, or whose
+/// integer slots fail to parse as `i64` / float slots fail to parse as
+/// `f64`, is skipped without failing the parse (mirrors the
+/// `obj:connectivity` typed-view policy — lossy on malformed input, the
+/// verbatim channel stays the source of truth for the encoder). A side
+/// whose referenced `curv2d` didn't tessellate (block state incomplete,
+/// non-positive index, fewer than two resolved points over the
+/// requested sub-range) is dropped on its own; the other side of the
+/// same `con` can still emit. Spec §"con": "Connectivity between
+/// surfaces in different merging groups is ignored." — merging-group
+/// filtering is a renderer-side decision over the `mg` state and is NOT
+/// applied here; the seam is emitted whenever its curve resolves and
+/// the consumer prunes against the merging-group provenance if it
+/// chooses.
+fn tessellate_connectivity(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
+    let mut out: Vec<Primitive> = Vec::new();
+    if samples == 0 {
+        return out;
+    }
+
+    // Reuse the same pre-resolution pass the surface trim/hole clipper,
+    // the scrv pass, and the typed views use (spec §"con … curv2d …" —
+    // the connectivity curves reference `curv2` by 1-based global
+    // index, exactly like trim / hole / scrv).
+    let curv2_polylines = collect_all_curv2_polylines(doc, samples);
+
+    // Resolve one `(q0, q1, curv2d)` side of a `con` statement into a
+    // parameter-space polyline. Returns `None` when the side can't be
+    // realised as a ≥ 2-point seam (non-positive / out-of-range
+    // curv2d, the referenced curve didn't tessellate, or the sub-range
+    // collapsed to fewer than two points).
+    let resolve_side = |q0: f32, q1: f32, idx: i64| -> Option<Vec<[f32; 2]>> {
+        if idx <= 0 {
+            return None;
+        }
+        let slot = idx as usize - 1;
+        let entry = curv2_polylines.get(slot).and_then(|e| e.as_ref())?;
+        let (curve_u_min, curve_u_max, polyline) = entry;
+        let mut seam: Vec<[f32; 2]> = Vec::new();
+        append_curv2_segment(&mut seam, polyline, *curve_u_min, *curve_u_max, q0, q1);
+        if seam.len() < 2 {
+            return None;
+        }
+        Some(seam)
+    };
+
+    let make_prim = |seam: Vec<[f32; 2]>,
+                     side: u8,
+                     surf: i64,
+                     peer_surf: i64,
+                     curv2d: i64,
+                     q0: f32,
+                     q1: f32| {
+        // Lift the 2D parameter-space seam into a flat 3D position
+        // list (z = 0), matching the `curv2` / `scrv` synthetic
+        // primitive layout so consumers can treat all three
+        // uniformly.
+        let positions: Vec<[f32; 3]> = seam.iter().map(|p| [p[0], p[1], 0.0]).collect();
+        let n = positions.len() as u32;
+        let mut prim = Primitive::new(Topology::LineStrip);
+        prim.positions = positions;
+        prim.indices = if n > u16::MAX as u32 {
+            Some(Indices::U32((0..n).collect()))
+        } else {
+            Some(Indices::U16((0..n).map(|i| i as u16).collect()))
+        };
+        prim.extras.insert(
+            "obj:tessellated_curve".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        prim.extras
+            .insert("obj:con".to_string(), serde_json::Value::Bool(true));
+        prim.extras.insert(
+            "obj:con_side".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(side)),
+        );
+        prim.extras.insert(
+            "obj:con_surf".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(surf)),
+        );
+        prim.extras.insert(
+            "obj:con_peer_surf".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(peer_surf)),
+        );
+        prim.extras.insert(
+            "obj:con_curv2d".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(curv2d)),
+        );
+        prim.extras
+            .insert("obj:con_q0".to_string(), serde_json::Value::from(q0 as f64));
+        prim.extras
+            .insert("obj:con_q1".to_string(), serde_json::Value::from(q1 as f64));
+        prim
+    };
+
+    for entry in &doc.freeform_directives {
+        if entry.first().map(String::as_str) != Some("con") {
+            continue;
+        }
+        // Spec §"con surf_1 q0_1 q1_1 curv2d_1 surf_2 q0_2 q1_2
+        // curv2d_2": keyword + exactly eight positional args.
+        if entry.len() != 9 {
+            continue;
+        }
+        let (
+            Ok(surf_1),
+            Ok(q0_1),
+            Ok(q1_1),
+            Ok(curv2d_1),
+            Ok(surf_2),
+            Ok(q0_2),
+            Ok(q1_2),
+            Ok(curv2d_2),
+        ) = (
+            entry[1].parse::<i64>(),
+            entry[2].parse::<f32>(),
+            entry[3].parse::<f32>(),
+            entry[4].parse::<i64>(),
+            entry[5].parse::<i64>(),
+            entry[6].parse::<f32>(),
+            entry[7].parse::<f32>(),
+            entry[8].parse::<i64>(),
+        )
+        else {
+            continue;
+        };
+
+        // Side 1: curve `curv2d_1` over [q0_1, q1_1] on `surf_1`.
+        if let Some(seam) = resolve_side(q0_1, q1_1, curv2d_1) {
+            out.push(make_prim(seam, 1, surf_1, surf_2, curv2d_1, q0_1, q1_1));
+        }
+        // Side 2: curve `curv2d_2` over [q0_2, q1_2] on `surf_2`.
+        if let Some(seam) = resolve_side(q0_2, q1_2, curv2d_2) {
+            out.push(make_prim(seam, 2, surf_2, surf_1, curv2d_2, q0_2, q1_2));
+        }
+    }
+
+    out
+}
+
 /// Walk every `cstype` … `end` block once and lift every `sp` (special
 /// point) body statement that appears inside it into a typed
 /// parameter-space record. Spec §"Special point", §"sp vp1 vp …".
@@ -6733,6 +6925,22 @@ where
         Vec::new()
     };
 
+    // Connectivity (`con`) seam tessellation pass (round 295) —
+    // evaluates every `con` statement into a pair of parameter-space
+    // LineStrip seams, one per joined surface edge (spec §"Connectivity
+    // between free-form surfaces", §"con surf_1 q0_1 q1_1 curv2d_1
+    // surf_2 q0_2 q1_2 curv2d_2"). Gated on the same
+    // `curve_tessellation_samples` knob as the curv / curv2 / surf /
+    // scrv passes. The directives still ride on
+    // `Scene3D::extras["obj:freeform_directives"]` for verbatim
+    // round-trip; the encoder filters the synthetic seams out via the
+    // shared `obj:tessellated_curve` sentinel.
+    let tessellated_con = if options.curve_tessellation_samples > 0 {
+        tessellate_connectivity(&doc, options.curve_tessellation_samples)
+    } else {
+        Vec::new()
+    };
+
     let mut scene = build_scene(doc)?;
 
     if !tessellated.is_empty() {
@@ -6770,6 +6978,14 @@ where
     if !tessellated_sp.is_empty() {
         let mut mesh = Mesh::new(Some("obj:sps".to_string()));
         for prim in tessellated_sp {
+            mesh.primitives.push(prim);
+        }
+        scene.add_mesh(mesh);
+    }
+
+    if !tessellated_con.is_empty() {
+        let mut mesh = Mesh::new(Some("obj:cons".to_string()));
+        for prim in tessellated_con {
             mesh.primitives.push(prim);
         }
         scene.add_mesh(mesh);
