@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-obj/compare/v0.0.3...v0.0.4) - 2026-06-14
+
+### Other
+
+- round 308 — capture superseded cdc / cdp / res statements for verbatim round-trip
+- round 302 — MTL map_aat per-material texture anti-aliasing toggle
+- Round 295: draw con connectivity seam as parameter-space polyline pair
+- Round 290: embed scrv special curve as surface triangle edges
+- Round 282: sub-cell trim/hole boundary re-meshing on tessellated surfaces
+- Round 273: typed trim / hole / scrv loop accessor on Scene3D::extras
+- Round 266: typed ctech / stech approximation-technique accessor
+- Round 254: typed parm u/v body-statement accessor on Scene3D::extras
+- Round 251: typed con connectivity accessor on Scene3D::extras
+- drop release-plz.toml — use release-plz defaults across the workspace
+- Round 246: typed `sp` (special-point) accessor + synthetic-primitive pass
+- Round 243: maplib + usemap rendering-identifier pair
+- Round 240: MTL map_* options typed decomposition
+- Round 236: MTL Ka/Kd/Ks spectral + xyz alternative forms
+- Round 229: connectivity (con) + general-statement (call / csh) round-trip
+- Round 223: ctech / stech / shadow_obj / trace_obj round-trip
+- Round 218: multi-patch Bezier surf surface decomposition
+- Round 212: MTL illum model property decomposition
+- Round 206: scrv special-curve tessellation
+- Round 201: surface trim/hole clipping against curv2 loops
+
 ### Added
 
 - Round 308: the three remaining superseded OBJ statements — `cdc`
