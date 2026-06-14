@@ -1,11 +1,12 @@
 //! Wavefront free-form geometry directives — `vp`, `cstype`, `deg`,
 //! `curv`, `surf`, `parm`, `trim`, `hole`, `scrv`, `sp`, `end`, `bzp`
-//! (and the older `bsp` superseded form).
+//! (and the older `bsp` / `cdc` / `cdp` / `res` superseded forms).
 //!
 //! Coverage: spec §"vp u v w", §"Specifying free-form curves/surfaces"
 //! (`cstype`, `deg`), §"Free-form curve/surface body statements"
 //! (`parm`, `trim`, `hole`, `scrv`, `sp`, `end`), §"Elements" (`curv`,
-//! `surf`), §"Superseded statements" (`bzp` / `bsp`).
+//! `surf`), §"Superseded statements" (`bzp` / `bsp` / `cdc` / `cdp` /
+//! `res`).
 //!
 //! Round-trip strategy: the parser captures every free-form directive
 //! verbatim into `Scene3D::extras["obj:freeform_directives"]` as a
@@ -351,6 +352,73 @@ v 0 3 0\nv 1 3 0\nv 2 3 0\nv 3 3 0\n",
     let txt = std::str::from_utf8(&bytes).unwrap();
     assert!(txt.contains("\nbzp 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16"));
     assert!(txt.contains("\nbsp 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16"));
+}
+
+#[test]
+fn cdc_cdp_res_superseded_keywords_captured() {
+    // Spec §"Superseded statements" — `cdc` (Cardinal curve, ≥4 control
+    // points), `cdp` (Cardinal patch, 16 control points), and `res`
+    // (reference/display segment-count statement). Like `bzp` / `bsp`,
+    // the spec marks these read-only ("This release is the last release
+    // that will read these statements"), so we accept them in input and
+    // round-trip them verbatim rather than silently dropping them.
+    //
+    // The `cdc 1 2 3 4 5 6` line is the spec §"Comparison of 2.11 and
+    // 3.0 syntax", "Cardinal curve" worked example; `res useg vseg`
+    // carries the two segment counts.
+    let mut text = String::from(
+        "v 2.570000 1.280000 0.000000\n\
+v 0.940000 1.340000 0.000000\n\
+v -0.670000 0.820000 0.000000\n\
+v -0.770000 -0.940000 0.000000\n\
+v 1.030000 -1.350000 0.000000\n\
+v 3.070000 -1.310000 0.000000\n",
+    );
+    // 16 more positions so the `cdp` indices resolve to real vertices.
+    for i in 0..16 {
+        text.push_str(&format!("v {i}.0 0.0 0.0\n"));
+    }
+    text.push_str("res 4 4\n");
+    text.push_str("cdc 1 2 3 4 5 6\n");
+    text.push_str("cdp 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22\n");
+
+    let scene = obj::parse_obj(&text).unwrap();
+    let dirs = scene
+        .extras
+        .get("obj:freeform_directives")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(dirs.len(), 3, "expected res + cdc + cdp captured");
+    assert_eq!(dirs[0][0], "res");
+    assert_eq!(dirs[0].as_array().unwrap().len(), 1 + 2); // res useg vseg
+    assert_eq!(dirs[1][0], "cdc");
+    assert_eq!(dirs[1].as_array().unwrap().len(), 1 + 6); // cdc + 6 indices
+    assert_eq!(dirs[2][0], "cdp");
+    assert_eq!(dirs[2].as_array().unwrap().len(), 1 + 16); // cdp + 16 indices
+
+    // `cdc` / `cdp` reference vertex positions by index, so the position
+    // pool must survive the round-trip even though no polygonal element
+    // consumes it.
+    assert!(
+        scene.extras.contains_key("obj:positions"),
+        "cdc/cdp position pool must round-trip"
+    );
+
+    let bytes = obj::serialize_obj(&scene, None).unwrap();
+    let txt = std::str::from_utf8(&bytes).unwrap();
+    assert!(txt.contains("\nres 4 4"));
+    assert!(txt.contains("\ncdc 1 2 3 4 5 6"));
+    assert!(txt.contains("\ncdp 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22"));
+
+    // Round-trip stability: re-decoding yields the same directive set.
+    let scene2 = ObjDecoder::new().decode(&bytes).unwrap();
+    let dirs2 = scene2.extras.get("obj:freeform_directives").unwrap();
+    assert_eq!(
+        scene.extras.get("obj:freeform_directives").unwrap(),
+        dirs2,
+        "cdc/cdp/res round-trip not stable"
+    );
 }
 
 #[test]

@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 308: the three remaining superseded OBJ statements — `cdc`
+  (Cardinal curve), `cdp` (Cardinal patch), and `res useg vseg` (the
+  segment-count reference/display statement) per spec §"Superseded
+  statements" — now round-trip verbatim through
+  `Scene3D::extras["obj:freeform_directives"]`, joining the
+  already-handled `bzp` / `bsp` patches. The spec marks all five
+  read-only ("This release is the last release that will read these
+  statements. … read in the file and write it out."), so the parser
+  captures them on input rather than silently dropping them into the
+  lenient-loader fall-through. Because `cdc` / `cdp` reference vertex
+  positions by index, the `obj:positions` re-emit condition now also
+  fires for those keywords so the referenced position pool survives a
+  decode → encode → decode cycle even when no polygonal element consumes
+  it; `res` carries only the two segment counts and needs no position
+  pool.
 - Round 302: MTL `map_aat on` per-material texture anti-aliasing toggle
   per spec §"map_aat on" ("Turns on anti-aliasing of textures in this
   material without anti-aliasing all textures in the scene"). The flag is

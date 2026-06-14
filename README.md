@@ -69,7 +69,9 @@ modern loaders actually load):
   (the two operate independently per spec).
 - Free-form geometry (`vp` parameter-space vertices, `cstype`,
   `deg`, `curv`, `curv2`, `surf`, `parm`, `trim`, `hole`, `scrv`,
-  `sp`, `end`, plus superseded `bzp` / `bsp` patches) — captured
+  `sp`, `end`, plus the superseded `bzp` / `bsp` patches and the
+  superseded `cdc` Cardinal-curve / `cdp` Cardinal-patch / `res`
+  segment-count statements) — captured
   verbatim into `Scene3D::extras["obj:vp"]` (1-based parallel vertex
   pool) and `Scene3D::extras["obj:freeform_directives"]` (sequence
   of `[keyword, arg1, arg2, …]` arrays). The encoder replays both
@@ -874,6 +876,21 @@ accepted symmetrically; any other or missing argument drops the line
 silently without failing the parse). The serialiser emits the flag
 explicitly because the string-only pass-through loop can't carry a
 bool-valued extra.
+
+Round 308: the three remaining superseded statements — `cdc` (Cardinal
+curve), `cdp` (Cardinal patch), and `res useg vseg` (the segment-count
+reference/display statement) per spec §"Superseded statements" — now
+round-trip verbatim through `Scene3D::extras["obj:freeform_directives"]`,
+joining the already-handled `bzp` / `bsp` patches. The spec marks all
+five read-only ("This release is the last release that will read these
+statements. … read in the file and write it out. The system will
+convert the data to the new .obj format."), so the parser captures them
+on input rather than silently dropping them. Because `cdc` / `cdp`
+reference vertex positions by index, the `obj:positions` re-emit
+condition now also fires for those keywords so the referenced position
+pool survives a decode → encode → decode cycle even when no polygonal
+element consumes it. `res` carries only the two segment counts and needs
+no position pool.
 
 The `.mod` binary form remains out of scope. Round 282 upgraded the
 round-201 conservative trim/hole clip to sub-cell boundary re-meshing,

@@ -382,7 +382,8 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 doc.vp.push([u, v, w]);
             }
             "cstype" | "deg" | "curv" | "curv2" | "surf" | "parm" | "trim" | "hole" | "scrv"
-            | "sp" | "end" | "bzp" | "bsp" | "bmat" | "step" | "ctech" | "stech" | "con" => {
+            | "sp" | "end" | "bzp" | "bsp" | "cdc" | "cdp" | "res" | "bmat" | "step" | "ctech"
+            | "stech" | "con" => {
                 // Free-form geometry directives. Captured verbatim as
                 // a `(keyword, args)` sequence on the document so the
                 // encoder can replay them after the polygonal section.
@@ -392,7 +393,16 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 // Spec §"Free-form curve/surface attributes" /
                 // §"Specifying free-form curves/surfaces" /
                 // §"Free-form curve/surface body statements" /
-                // §"Superseded statements (bzp / bsp)" /
+                // §"Superseded statements" (bzp / bsp Bezier/B-spline
+                // patches, cdc Cardinal curve, cdp Cardinal patch, res
+                // segment-count reference/display statement — all read
+                // for round-trip but never written by the source
+                // system: "This release is the last release that will
+                // read these statements. … read in the file and write
+                // it out. The system will convert the data to the new
+                // .obj format." We preserve them verbatim so a
+                // decode → encode cycle keeps the legacy directive
+                // rather than silently dropping it.) /
                 // §"bmat u/v matrix" + §"step stepu stepv" /
                 // §"ctech technique resolution" (cparm / cspace / curv
                 // forms) + §"stech technique resolution" (cparma /
@@ -1023,7 +1033,7 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         && (doc.freeform_directives.iter().any(|d| {
             matches!(
                 d.first().map(String::as_str),
-                Some("curv" | "curv2" | "surf" | "bzp" | "bsp")
+                Some("curv" | "curv2" | "surf" | "bzp" | "bsp" | "cdc" | "cdp")
             )
         }))
     {
