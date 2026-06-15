@@ -4569,6 +4569,65 @@ impl ScrvConstraint<'_> {
     }
 }
 
+/// Compute smooth per-vertex normals for a triangulated surface mesh by
+/// accumulating area-weighted face normals (the un-normalised cross
+/// product, whose magnitude is twice the triangle area) onto each of a
+/// triangle's three vertices, then renormalising. Vertices with no
+/// incident non-degenerate triangle — or whose accumulated normal is
+/// zero (a flat fan of mutually-cancelling facets) — fall back to a
+/// `+Z` unit normal so the buffer stays length-parallel with positions
+/// and free of NaNs.
+///
+/// `indices` is a flat triangle list (`[i0, i1, i2, i0, i1, i2, …]`).
+/// The output is one normal per entry in `positions`.
+fn surface_vertex_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
+    let mut acc = vec![[0.0f64; 3]; positions.len()];
+    for tri in indices.chunks_exact(3) {
+        let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        let (Some(&pa), Some(&pb), Some(&pc)) =
+            (positions.get(a), positions.get(b), positions.get(c))
+        else {
+            continue;
+        };
+        let e1 = [
+            (pb[0] - pa[0]) as f64,
+            (pb[1] - pa[1]) as f64,
+            (pb[2] - pa[2]) as f64,
+        ];
+        let e2 = [
+            (pc[0] - pa[0]) as f64,
+            (pc[1] - pa[1]) as f64,
+            (pc[2] - pa[2]) as f64,
+        ];
+        // Cross product e1 × e2 — magnitude == 2·area, direction == the
+        // CCW front-face normal for spec-ordered winding.
+        let n = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
+        for &v in &[a, b, c] {
+            acc[v][0] += n[0];
+            acc[v][1] += n[1];
+            acc[v][2] += n[2];
+        }
+    }
+    acc.into_iter()
+        .map(|n| {
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if len > 1e-12 {
+                [
+                    (n[0] / len) as f32,
+                    (n[1] / len) as f32,
+                    (n[2] / len) as f32,
+                ]
+            } else {
+                [0.0, 0.0, 1.0]
+            }
+        })
+        .collect()
+}
+
 /// Evaluate one `surf` element against an active Bezier / B-spline /
 /// Cardinal / Taylor `cstype` and return the triangulated primitive,
 /// or `None` when the directive is incomplete / malformed (lenient-
@@ -4963,9 +5022,23 @@ fn flush_surface(
         scrv_constraint_vertices = positions.len() - lattice_count;
     }
 
+    // Per-vertex analytic-ish surface normals. The tessellated lattice
+    // (plus any trim-boundary / scrv-constraint vertices) is a real
+    // triangle mesh, so a renderer that wants smooth shading needs a
+    // normal per vertex. We accumulate area-weighted face normals over
+    // every emitted triangle and renormalise — area weighting makes the
+    // dominant local facets carry the result, which on a regular sample
+    // lattice converges to the true surface normal as `samples` grows.
+    // The winding is the spec-defined front orientation (spec §"surf":
+    // "the front of the surface is the side where u increases to the
+    // right and v increases upward"), so the cross-product sign points
+    // out of the surface front consistently across the whole mesh.
+    let surface_normals = surface_vertex_normals(&positions, &indices);
+
     let mut prim = Primitive::new(Topology::Triangles);
     let n_verts = positions.len() as u32;
     prim.positions = positions;
+    prim.normals = Some(surface_normals);
     prim.indices = if n_verts > u16::MAX as u32 {
         Some(Indices::U32(indices))
     } else {

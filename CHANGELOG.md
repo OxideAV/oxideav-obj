@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Round 315: smooth per-vertex normals on tessellated `surf` surfaces.
+  `with_curve_tessellation(N)` now fills the synthetic `Topology::Triangles`
+  primitive's `normals` buffer with area-weighted face-normal averages
+  (front orientation per spec §"surf": u-right / v-up CCW winding), so a
+  downstream renderer / glTF exporter shades curved surfaces smoothly
+  rather than flat. Covers the base sample lattice plus trim-boundary and
+  `scrv`-constraint vertices; degenerate fans fall back to a `+Z` unit
+  normal so the buffer stays length-parallel with positions and NaN-free.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-obj/compare/v0.0.3...v0.0.4) - 2026-06-14
 
 ### Other

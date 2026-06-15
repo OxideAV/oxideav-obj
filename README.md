@@ -81,7 +81,12 @@ modern loaders actually load):
   parameter-space trimming curves, and Bezier / B-spline / Cardinal /
   Taylor / basis-matrix `surf` surfaces is available via
   `ObjDecoder::with_curve_tessellation(samples)` (see the per-round
-  notes below).
+  notes below). Tessellated surfaces carry smooth per-vertex normals
+  (area-weighted face-normal averages over the emitted triangle lattice,
+  front-oriented per spec §"surf": u-right / v-up CCW winding) so a
+  downstream renderer or glTF exporter shades curved surfaces smoothly
+  rather than flat; the normal buffer covers the base lattice plus
+  trim-boundary and `scrv`-constraint vertices.
 
 The companion **MTL** parser/serialiser handles:
 
@@ -209,7 +214,9 @@ B-spline / NURBS, Cardinal (Catmull-Rom), Taylor, and basis-matrix
 (`bmatrix`) — are evaluated to real `LineStrip` / `Triangles` geometry
 on synthetic meshes, including multi-patch decomposition, `trim` / `hole`
 sub-cell boundary re-meshing, `scrv` special-curve triangle-edge
-embedding, `sp` special points, and `con` connectivity seams. Typed
+embedding, `sp` special points, and `con` connectivity seams. The
+triangulated surfaces carry smooth per-vertex normals for direct
+smooth-shaded rendering. Typed
 decompositions of `parm` / `con` / `sp` / `trim`-loop / `ctech` /
 `stech` body statements ride alongside the verbatim channel for
 consumers that don't want to re-parse positional tokens.
