@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 324: PBR-extension scalar-field texture-map siblings round-trip.
+  `map_Ps` (sheen), `map_Pc` (clearcoat-thickness), `map_Pcr`
+  (clearcoat-roughness), `map_aniso` and `map_anisor` now parse like the
+  other less-PBR-friendly maps — the file reference (plus any `-flag value`
+  option chunks) is preserved verbatim in `Material::extras["mtl:<map>"]`
+  and re-emitted by the encoder. Previously these were silently dropped,
+  making a decode → encode round-trip lossy for the upper half of the
+  Wavefront-PBR map family. The scalar fields `Ps` / `Pc` / `Pcr` /
+  `aniso` / `anisor` were already captured; this closes the matching maps.
+
 - Round 315: smooth per-vertex normals on tessellated `surf` surfaces.
   `with_curve_tessellation(N)` now fills the synthetic `Topology::Triangles`
   primitive's `normals` buffer with area-weighted face-normal averages

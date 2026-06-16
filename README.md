@@ -153,9 +153,16 @@ The companion **MTL** parser/serialiser handles:
   so consumers can read each option without re-parsing the raw token
   array. The typed key is parse-time-only; encoder output is still
   driven by the raw `:options` array.
-- Wavefront-PBR extension (`Pr` roughness, `Pm` metallic, `Pc`
-  clearcoat, `Ps` sheen, `map_Pr` / `map_Pm`) → `Material::roughness`
-  / `Material::metallic` / `metallic_roughness_texture`.
+- Wavefront-PBR extension scalars (`Pr` roughness, `Pm` metallic, `Pc`
+  clearcoat, `Pcr` clearcoat-roughness, `Ps` sheen, `aniso` /
+  `anisor` anisotropy) → `Material::roughness` / `Material::metallic`
+  for `Pr` / `Pm`, with the rest stashed on extras. The metallic-roughness
+  maps `map_Pr` / `map_Pm` drive `metallic_roughness_texture`; the
+  remaining PBR map siblings `map_Ps` / `map_Pc` / `map_Pcr` /
+  `map_aniso` / `map_anisor` — which glTF can't channel-map — ride
+  verbatim on `Material::extras["mtl:<map>"]` (with `-flag value` option
+  chunks parsed out) so a decode → encode round-trip is lossless for the
+  full PBR map family rather than dropping the unrepresentable ones.
 - `map_aat on` per-material texture anti-aliasing toggle (spec
   §"map_aat on") → boolean `Material::extras["mtl:map_aat"]`,
   round-tripped as the exact `on` / `off` token.
@@ -206,8 +213,10 @@ preserved so the encoder re-emits polygons rather than triangles.
 for in-spec models 0–10), `Tf` (all three forms), `sharpness`,
 displacement / decal / reflection maps (`refl -type sphere` / cube),
 texture references with full `-flag value` option parsing (both raw and
-typed views), the Wavefront-PBR extension (`Pr` / `Pm` / `Pc` / `Ps` /
-`map_Pr` / `map_Pm`), and `map_aat`.
+typed views), the Wavefront-PBR extension (`Pr` / `Pm` / `Pc` / `Pcr` /
+`Ps` / `aniso` / `anisor` scalars; `map_Pr` / `map_Pm` metallic-roughness
+maps; `map_Ps` / `map_Pc` / `map_Pcr` / `map_aniso` / `map_anisor`
+verbatim-round-trip maps), and `map_aat`.
 
 **Free-form geometry:** `vp`, `cstype`, `deg`, `curv`, `curv2`, `surf`,
 `parm`, `trim`, `hole`, `scrv`, `sp`, `con`, `ctech` / `stech`,

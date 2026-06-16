@@ -8,8 +8,12 @@
 //! This crate maps the Phong-Blinn vocabulary onto the glTF
 //! metallic-roughness model in [`Material`], preserving the original
 //! field values in [`Material::extras`] so a re-serialise reproduces
-//! the input. The Wavefront-PBR extension (`Pr`, `Pm`, `Pc`, `Ps`,
-//! `map_Pr`, `map_Pm`) lands directly in the corresponding PBR slots.
+//! the input. The Wavefront-PBR extension scalar fields (`Pr`, `Pm`,
+//! `Pc`, `Pcr`, `Ps`, `aniso`, `anisor`) and the `map_Pr` / `map_Pm`
+//! metallic-roughness maps land in the corresponding PBR slots; the
+//! remaining PBR map siblings (`map_Ps`, `map_Pc`, `map_Pcr`,
+//! `map_aniso`, `map_anisor`), which glTF can't channel-map, ride
+//! verbatim on extras for a lossless round-trip.
 
 use oxideav_mesh3d::{AlphaMode, Error, ImageData, Material, Result, Sampler, Texture, TextureRef};
 
@@ -722,11 +726,26 @@ fn apply_directive(
                 }
             }
         }
-        "map_Ka" | "map_Ks" | "map_Ns" | "map_d" | "disp" | "map_disp" | "decal" | "map_decal" => {
+        "map_Ka" | "map_Ks" | "map_Ns" | "map_d" | "disp" | "map_disp" | "decal" | "map_decal"
+        | "map_Ps" | "map_Pc" | "map_Pcr" | "map_aniso" | "map_anisor" => {
             // Less-PBR-friendly maps preserved in extras for round-trip.
             // Both the bare (`disp`, `decal`) and `map_*` variants are
             // accepted; the original spelling is kept as the extras key
             // so the encoder re-emits the same form.
+            //
+            // The `map_Ps` (sheen), `map_Pc` (clearcoat-thickness),
+            // `map_Pcr` (clearcoat-roughness) and `map_aniso` /
+            // `map_anisor` (anisotropy / anisotropy-rotation) entries are
+            // the texture-map siblings of the already-modelled `Ps` /
+            // `Pc` / `Pcr` / `aniso` / `anisor` scalar PBR fields. glTF's
+            // metallic-roughness material model has no direct channel for
+            // these, so rather than fuse / drop them we keep the file
+            // reference verbatim in extras (with its `-flag value` option
+            // chunks parsed out the same way as every other map) and let
+            // the generic string-passthrough re-emit it on encode. This
+            // makes a decode → encode round-trip lossless for the full
+            // PBR-extension map family instead of silently dropping the
+            // ones glTF can't represent.
             let s = parse_map_with_options(keyword, tokens, &mut mat.extras);
             mat.extras
                 .insert(format!("mtl:{keyword}"), serde_json::Value::String(s));
