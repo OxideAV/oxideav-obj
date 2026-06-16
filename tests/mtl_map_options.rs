@@ -139,3 +139,78 @@ fn map_kd_with_o_and_s_consumes_three_floats_each() {
     let strs: Vec<&str> = opts.iter().filter_map(|v| v.as_str()).collect();
     assert_eq!(strs, vec!["-o 0.1 0.0 0.0", "-s 2 2 1"]);
 }
+
+#[test]
+fn map_kd_with_o_single_u_does_not_swallow_filename() {
+    // The MTL spec marks `v` and `w` optional on `-o u [v] [w]`
+    // (§"-o u v w"). A `-o 0.2 logo.mpc` line supplies only the
+    // mandatory `u`; the next token is the filename and must NOT be
+    // absorbed as the missing `v`. (Fixed-arity-3 parsing would
+    // mis-split this as `-o 0.2 logo.mpc` with an empty filename.)
+    let mats = mtl::parse_mtl("newmtl Logo\nKd 1 1 1\nmap_Kd -o 0.2 logo.mpc\n").unwrap();
+    let m = &mats[0];
+    let pending = m.extras.get("mtl:pending_textures").unwrap();
+    assert_eq!(pending["base_color"].as_str(), Some("logo.mpc"));
+    let opts = m
+        .extras
+        .get("mtl:map_Kd:options")
+        .and_then(|v| v.as_array())
+        .unwrap();
+    let strs: Vec<&str> = opts.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(strs, vec!["-o 0.2"]);
+
+    // Typed view fills the omitted v / w with the spec default 0.
+    let typed = m.extras.get("mtl:map_Kd:options_typed").unwrap();
+    assert_eq!(typed["o"], serde_json::json!([0.2, 0.0, 0.0]));
+
+    // Round-trips: `-o 0.2` is spliced back ahead of the clean filename.
+    let mut scene = oxideav_mesh3d::Scene3D::new();
+    let _ = mtl::merge_materials_into_scene(&mut scene, mats);
+    let bytes = mtl::serialize_mtl(&scene.materials, &scene.textures).unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        text.contains("map_Kd -o 0.2 logo.mpc"),
+        "missing spliced single-u offset in:\n{text}",
+    );
+}
+
+#[test]
+fn map_kd_with_s_two_args_keeps_remaining_for_filename() {
+    // `-s u v` (two args, `w` omitted) followed by the filename. Only
+    // the two numeric tokens belong to `-s`; the path stays separate.
+    let mats = mtl::parse_mtl("newmtl Tile\nKd 1 1 1\nmap_Kd -s 1.5 2.0 tile.png\n").unwrap();
+    let m = &mats[0];
+    let pending = m.extras.get("mtl:pending_textures").unwrap();
+    assert_eq!(pending["base_color"].as_str(), Some("tile.png"));
+    let opts = m
+        .extras
+        .get("mtl:map_Kd:options")
+        .and_then(|v| v.as_array())
+        .unwrap();
+    let strs: Vec<&str> = opts.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(strs, vec!["-s 1.5 2.0"]);
+
+    // Typed view fills the omitted w with the spec default 1 for `-s`.
+    let typed = m.extras.get("mtl:map_Kd:options_typed").unwrap();
+    assert_eq!(typed["s"], serde_json::json!([1.5, 2.0, 1.0]));
+}
+
+#[test]
+fn map_kd_mixed_variadic_offset_and_turbulence_then_filename() {
+    // `-o` with one arg and `-t` with two args, interleaved with a
+    // fixed-arity flag, all ahead of the filename. Each variadic flag
+    // consumes only its own numeric run.
+    let mats =
+        mtl::parse_mtl("newmtl Marble\nKd 1 1 1\nmap_Kd -o 0.5 -clamp on -t 1.0 0.5 marble.png\n")
+            .unwrap();
+    let m = &mats[0];
+    let pending = m.extras.get("mtl:pending_textures").unwrap();
+    assert_eq!(pending["base_color"].as_str(), Some("marble.png"));
+    let opts = m
+        .extras
+        .get("mtl:map_Kd:options")
+        .and_then(|v| v.as_array())
+        .unwrap();
+    let strs: Vec<&str> = opts.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(strs, vec!["-o 0.5", "-clamp on", "-t 1.0 0.5"]);
+}

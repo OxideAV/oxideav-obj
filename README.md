@@ -137,10 +137,15 @@ The companion **MTL** parser/serialiser handles:
   `map_Bump` → `normal_texture`, `map_d` etc.) emitted as
   `ImageData::External { uri, mime: None }` — the caller resolves
   paths against the OBJ file's directory. Leading `-flag value`
-  option chunks (`-blendu`, `-bm`, `-mm`, `-clamp`, `-imfchan`, `-o`,
-  `-s`, `-t`, `-texres`) are parsed out of the filename and surfaced
-  via `Material::extras["mtl:<map_name>:options"]`; the encoder
-  splices them back inline. A parallel typed view rides on
+  option chunks (`-blendu`, `-blendv`, `-cc`, `-bm`, `-boost`, `-mm`,
+  `-clamp`, `-imfchan`, `-o`, `-s`, `-t`, `-texres`) are parsed out of
+  the filename and surfaced via `Material::extras["mtl:<map_name>:options"]`;
+  the encoder splices them back inline. The offset / scale / turbulence
+  flags `-o` / `-s` / `-t` are variable-arity per spec (`u` mandatory,
+  `v` / `w` optional): the parser consumes only the numeric run that
+  follows each flag, so `map_Kd -o 0.2 logo.mpc` keeps `logo.mpc` as the
+  filename rather than swallowing it as the omitted `v`. A parallel typed
+  view rides on
   `Material::extras["mtl:<map_name>:options_typed"]` with stable
   primitive-valued keys per flag (`bool` for the `on`/`off` flags,
   `f64` for `bm` / `boost` / `texres`, `[base, gain]` for `mm`,

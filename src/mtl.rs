@@ -763,6 +763,32 @@ fn map_options_and_filename(tokens: &mut std::str::SplitWhitespace<'_>) -> (Vec<
         if !is_flag {
             break;
         }
+        // `-o` / `-s` / `-t` are documented as `u [v] [w]` (§"-o u v w" /
+        // §"-s u v w" / §"-t u v w"): `u` is required, `v` and `w` are
+        // optional. Consume `u` plus up to two further numeric tokens,
+        // stopping at the first non-numeric token (which begins the
+        // filename, e.g. `-o 0.2 logo.mpc`). Treating these as fixed
+        // arity 3 would let a path like `logo.mpc` be swallowed as the
+        // missing `v` argument, corrupting both the option chunk and the
+        // filename on round-trip.
+        if matches!(t, "-o" | "-s" | "-t") {
+            // Require at least the mandatory `u` argument; if it is
+            // missing or non-numeric the flag is malformed — preserve it
+            // verbatim so the user sees the bad input.
+            if i + 1 >= toks.len() || toks[i + 1].parse::<f64>().is_err() {
+                opts.push(t.to_string());
+                i += 1;
+                continue;
+            }
+            let mut end = i + 2; // flag + mandatory `u`
+            while end < toks.len() && end < i + 4 && toks[end].parse::<f64>().is_ok() {
+                end += 1;
+            }
+            let chunk: Vec<&str> = toks[i..end].to_vec();
+            opts.push(chunk.join(" "));
+            i = end;
+            continue;
+        }
         let arg_count = flag_arg_count(t);
         if arg_count == 0 {
             // Unknown flag — preserve verbatim and hope the next token
@@ -793,13 +819,10 @@ fn flag_arg_count(flag: &str) -> usize {
         "-imfchan" | "-type" => 1,                     // single char / keyword
         "-mm" => 2,                                    // base gain
         // `-o`, `-s`, `-t` are documented as `u [v] [w]` — variable
-        // arity. We greedily consume up to three numeric tokens after
-        // the flag in `consume_uvw`, but the static count is 3 so
-        // well-formed inputs round-trip cleanly. If a path follows
-        // earlier than expected (e.g. `-o 1 path.png`), the path
-        // accidentally absorbs the missing v / w; users who need that
-        // edge case can supply explicit zeros.
-        "-o" | "-s" | "-t" => 3,
+        // arity with `u` mandatory and `v` / `w` optional. They are
+        // handled directly in `map_options_and_filename` (which greedily
+        // consumes 1..=3 numeric tokens and stops at the first
+        // non-numeric token), so they never reach this fixed-arity table.
         _ => 0,
     }
 }
