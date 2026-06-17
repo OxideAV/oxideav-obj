@@ -86,7 +86,16 @@ modern loaders actually load):
   front-oriented per spec §"surf": u-right / v-up CCW winding) so a
   downstream renderer or glTF exporter shades curved surfaces smoothly
   rather than flat; the normal buffer covers the base lattice plus
-  trim-boundary and `scrv`-constraint vertices.
+  trim-boundary and `scrv`-constraint vertices. A `ctech cparm <res>`
+  curve-approximation directive (spec §"ctech technique resolution") in a
+  `cstype … end` block overrides the uniform tessellation budget for that
+  block: each `curv` is evaluated at `n = round(res × degree)`
+  subdivisions per the spec's constant-parametric formula (`res 0` ⇒ a
+  single line segment), with the effective count surfaced through
+  `Primitive::extras["obj:curve_samples"]` /
+  `["obj:curve_ctech_cparm_res"]`. The geometric `ctech cspace` /
+  `ctech curv` techniques (iterative chord-length / curvature refinement)
+  stay on the uniform budget.
 
 The companion **MTL** parser/serialiser handles:
 

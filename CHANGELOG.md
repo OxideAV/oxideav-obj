@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 328: `ctech cparm res` curve-approximation resolution now drives
+  the tessellated subdivision density. When a `cstype … end` block carries
+  a `ctech cparm <res>` directive (spec §"ctech technique resolution"),
+  `with_curve_tessellation(N)` evaluates each `curv` at `n = round(res ×
+  degree)` subdivisions per the spec's constant-parametric formula —
+  overriding the caller's uniform `N` budget for that block — with
+  `res = 0` collapsing each polynomial segment to a single line segment.
+  The effective count is reported in `Primitive::extras["obj:curve_samples"]`
+  and the source resolution in `["obj:curve_ctech_cparm_res"]`. Applies to
+  all 3D `curv` basis kinds (Bezier / B-spline / Cardinal / Taylor /
+  basis-matrix); the geometric `ctech cspace maxlength` / `ctech curv
+  maxdist maxangle` techniques (which need iterative chord-length /
+  curvature refinement) stay on the uniform budget. The directive sequence
+  still round-trips verbatim via `Scene3D::extras["obj:freeform_directives"]`.
+
 - Round 324: PBR-extension scalar-field texture-map siblings round-trip.
   `map_Ps` (sheen), `map_Pc` (clearcoat-thickness), `map_Pcr`
   (clearcoat-roughness), `map_aniso` and `map_anisor` now parse like the

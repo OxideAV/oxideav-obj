@@ -1243,6 +1243,17 @@ fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
     // between successive segment windows of control points.
     let mut bmat_u: Vec<f32> = Vec::new();
     let mut step_u: Option<u32> = None;
+    // Spec §"ctech technique resolution": when the block carries a
+    // `ctech cparm res` directive, the file is asking for a specific
+    // subdivision density — "each polynomial segment of the curve is
+    // subdivided n times in parameter space, where n is the resolution
+    // parameter multiplied by the degree of the curve". We honour the
+    // `cparm` technique (the parametric form whose density is a closed
+    // formula); the geometric `cspace` / `curv` techniques need
+    // iterative chord-length / curvature refinement and stay on the
+    // caller's uniform `samples` budget (reported as a docs/impl gap in
+    // the round notes). `None` ⇒ fall back to the global `samples`.
+    let mut ctech_cparm_res: Option<f32> = None;
     // `curv` directives queued for this block — evaluated on `end`.
     let mut pending_curves: Vec<&Vec<String>> = Vec::new();
 
@@ -1262,6 +1273,7 @@ fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     &parm_u,
                     &bmat_u,
                     step_u,
+                    ctech_cparm_res,
                     &pending_curves,
                     samples,
                 );
@@ -1269,6 +1281,7 @@ fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                 parm_u.clear();
                 bmat_u.clear();
                 step_u = None;
+                ctech_cparm_res = None;
                 active_degree = None;
 
                 // Spec §"Curve and surface type": `cstype [rat] type`.
@@ -1343,6 +1356,15 @@ fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
             "step" => {
                 step_u = entry.get(1).and_then(|t| t.parse::<u32>().ok());
             }
+            // Spec §"ctech technique resolution": `ctech cparm res`
+            // (constant parametric subdivision). The other two techniques
+            // (`cspace maxlength`, `curv maxdist maxangle`) are geometric
+            // and require iterative refinement, so we record only the
+            // parametric `cparm` resolution here. A non-`cparm` `ctech`
+            // line leaves the override unset (uniform `samples` budget).
+            "ctech" if entry.get(1).map(String::as_str) == Some("cparm") => {
+                ctech_cparm_res = entry.get(2).and_then(|t| t.parse::<f32>().ok());
+            }
             "curv" => {
                 // Defer evaluation until `end` — the body statement
                 // `parm u …` that supplies the B-spline knot vector
@@ -1358,6 +1380,7 @@ fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     &parm_u,
                     &bmat_u,
                     step_u,
+                    ctech_cparm_res,
                     &pending_curves,
                     samples,
                 );
@@ -1365,6 +1388,7 @@ fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                 parm_u.clear();
                 bmat_u.clear();
                 step_u = None;
+                ctech_cparm_res = None;
                 active_kind = None;
                 active_degree = None;
             }
@@ -1388,6 +1412,7 @@ fn tessellate_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
         &parm_u,
         &bmat_u,
         step_u,
+        ctech_cparm_res,
         &pending_curves,
         samples,
     );
@@ -1409,6 +1434,7 @@ fn flush_block(
     parm_u: &[f32],
     bmat_u: &[f32],
     step_u: Option<u32>,
+    ctech_cparm_res: Option<f32>,
     pending_curves: &[&Vec<String>],
     samples: u32,
 ) {
@@ -1457,6 +1483,36 @@ fn flush_block(
             continue;
         }
 
+        // Spec §"ctech cparm res": "each polynomial segment of the curve
+        // is subdivided n times in parameter space, where n is the
+        // resolution parameter multiplied by the degree of the curve. …
+        // If res has a value of 0, each polynomial curve segment is
+        // represented by a single line segment." The basis degree used
+        // for the multiply is the curve's actual degree: Bezier / Taylor
+        // ⇒ control-point count − 1, B-spline / basis-matrix ⇒ the `deg`
+        // value, Cardinal ⇒ 3 (cubic-only). Falls back to the caller's
+        // uniform `samples` when the block carried no `ctech cparm`.
+        let basis_degree = match kind {
+            "bezier" | "rat_bezier" => (control_points.len() as u32).saturating_sub(1),
+            "bspline" | "rat_bspline" | "bmatrix" => active_degree.unwrap_or(0),
+            "cardinal" => 3,
+            "taylor" => active_degree.unwrap_or((control_points.len() as u32).saturating_sub(1)),
+            _ => 0,
+        };
+        let effective_samples = match ctech_cparm_res {
+            Some(res) if basis_degree > 0 => {
+                // n = round(res × degree); res == 0 ⇒ one line segment
+                // (n == 1 subdivision ⇒ two endpoints).
+                let n = (res * basis_degree as f32).round();
+                if n.is_finite() && n >= 1.0 {
+                    (n as u32).min(samples.max(1).saturating_mul(64))
+                } else {
+                    1
+                }
+            }
+            _ => samples,
+        };
+
         let curve_points = match kind {
             "bezier" | "rat_bezier" => sample_bezier(
                 &control_points,
@@ -1464,7 +1520,7 @@ fn flush_block(
                 kind,
                 u_min,
                 u_max,
-                samples,
+                effective_samples,
             ),
             "bspline" | "rat_bspline" => {
                 // B-spline needs a knot vector and a degree. Spec
@@ -1487,7 +1543,7 @@ fn flush_block(
                     parm_u,
                     u_min,
                     u_max,
-                    samples,
+                    effective_samples,
                 )
             }
             "cardinal" => {
@@ -1507,7 +1563,7 @@ fn flush_block(
                 if control_points.len() < 4 {
                     continue;
                 }
-                sample_cardinal(&control_points, samples)
+                sample_cardinal(&control_points, effective_samples)
             }
             "taylor" => {
                 // Spec §"Taylor": basis function is t^i; control points
@@ -1522,7 +1578,7 @@ fn flush_block(
                 if control_points.len() != degree + 1 {
                     continue;
                 }
-                sample_taylor(&control_points, u_min, u_max, samples)
+                sample_taylor(&control_points, u_min, u_max, effective_samples)
             }
             "bmatrix" => {
                 // Spec §"Basis matrix": needs `deg n` + `bmat u <(n+1)²
@@ -1557,7 +1613,7 @@ fn flush_block(
                 if control_points.len() < n_plus_1 {
                     continue;
                 }
-                sample_bmatrix(&control_points, bmat_u, degree, step, samples)
+                sample_bmatrix(&control_points, bmat_u, degree, step, effective_samples)
             }
             _ => continue,
         };
@@ -1617,8 +1673,20 @@ fn flush_block(
             .insert("obj:curve_u_range".to_string(), range_arr);
         prim.extras.insert(
             "obj:curve_samples".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(samples as u64)),
+            serde_json::Value::Number(serde_json::Number::from(effective_samples as u64)),
         );
+        // When a `ctech cparm res` directive overrode the caller's
+        // uniform budget, record the source resolution so a consumer can
+        // tell the spec-driven density apart from the default (spec
+        // §"ctech cparm res").
+        if let Some(res) = ctech_cparm_res {
+            if effective_samples != samples {
+                prim.extras.insert(
+                    "obj:curve_ctech_cparm_res".to_string(),
+                    serde_json::Value::from(res as f64),
+                );
+            }
+        }
 
         out.push(prim);
     }
