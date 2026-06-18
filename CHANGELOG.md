@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 332: `stech cparma ures vres` / `stech cparmb uvres`
+  surface-approximation resolution now drives the tessellated lattice
+  density — the surface analog of the round-328 `ctech cparm` override.
+  When a `cstype … end` surface block carries a constant-parametric
+  `stech` directive (spec §"stech technique resolution"),
+  `with_curve_tessellation(N)` evaluates each `surf` patch at
+  `n = round(res × degree)` subdivisions per direction instead of the
+  caller's uniform `N` budget; the shared isotropic lattice is driven
+  from the finer (max) of the two per-direction counts, so the coarser
+  direction is never under-sampled. `cparmb`'s single value applies to
+  both directions; `cparma 0 0` collapses each patch to two triangles
+  (one subdivision). The effective count is reported in
+  `Primitive::extras["obj:surface_samples"]` and the source `[ures, vres]`
+  pair in `["obj:surface_stech_cparm_res"]`. Applies to every `surf`
+  basis kind (Bezier / B-spline / Cardinal / Taylor / basis-matrix); the
+  geometric `stech cspace maxlength` / `stech curv maxdist maxangle`
+  techniques (which need iterative spatial / curvature refinement) stay
+  on the uniform budget. The directive sequence still round-trips
+  verbatim via `Scene3D::extras["obj:freeform_directives"]`.
 - Round 328: `ctech cparm res` curve-approximation resolution now drives
   the tessellated subdivision density. When a `cstype … end` block carries
   a `ctech cparm <res>` directive (spec §"ctech technique resolution"),

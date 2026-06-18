@@ -95,7 +95,17 @@ modern loaders actually load):
   `Primitive::extras["obj:curve_samples"]` /
   `["obj:curve_ctech_cparm_res"]`. The geometric `ctech cspace` /
   `ctech curv` techniques (iterative chord-length / curvature refinement)
-  stay on the uniform budget.
+  stay on the uniform budget. Its surface analog, `stech cparma ures vres`
+  / `stech cparmb uvres` (spec §"stech technique resolution"), overrides
+  the surface lattice density the same way: each `surf` patch is evaluated
+  at `n = round(res × degree)` subdivisions per parametric direction, with
+  the shared isotropic lattice driven from the finer (max) of the two
+  per-direction counts so the coarser direction is never under-sampled
+  (`cparma 0 0` ⇒ two triangles per patch; `cparmb` applies its one value
+  to both directions). The effective count rides on
+  `Primitive::extras["obj:surface_samples"]` and the source `[ures, vres]`
+  pair on `["obj:surface_stech_cparm_res"]`; the geometric `stech cspace`
+  / `stech curv` techniques stay on the uniform budget.
 
 The companion **MTL** parser/serialiser handles:
 
@@ -237,7 +247,10 @@ B-spline / NURBS, Cardinal (Catmull-Rom), Taylor, and basis-matrix
 (`bmatrix`) — are evaluated to real `LineStrip` / `Triangles` geometry
 on synthetic meshes, including multi-patch decomposition, `trim` / `hole`
 sub-cell boundary re-meshing, `scrv` special-curve triangle-edge
-embedding, `sp` special points, and `con` connectivity seams. The
+embedding, `sp` special points, and `con` connectivity seams. A
+block-local `ctech cparm` (curves) or `stech cparma` / `cparmb`
+(surfaces) directive overrides the uniform subdivision budget with the
+spec's constant-parametric `n = round(res × degree)` density. The
 triangulated surfaces carry smooth per-vertex normals for direct
 smooth-shaded rendering. Typed
 decompositions of `parm` / `con` / `sp` / `trim`-loop / `ctech` /

@@ -3540,7 +3540,13 @@ fn collect_approximation_techniques(doc: &ObjDoc) -> Vec<serde_json::Value> {
 ///   * `obj:surface_degree` — `[degu, degv]`.
 ///   * `obj:surface_u_range` / `obj:surface_v_range` — `[s0, s1]` /
 ///     `[t0, t1]` from the `surf` directive.
-///   * `obj:surface_samples` — sample count per parametric direction.
+///   * `obj:surface_samples` — sample count per parametric direction
+///     (reflects the effective lattice density, including a `stech
+///     cparma` / `cparmb` override).
+///   * `obj:surface_stech_cparm_res` — `[ures, vres]`, emitted only when
+///     a `stech cparma ures vres` / `stech cparmb uvres` directive
+///     overrode the caller's uniform tessellation budget (spec §"stech
+///     cparma" / §"stech cparmb").
 fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
     let mut out: Vec<Primitive> = Vec::new();
     if samples == 0 {
@@ -3579,6 +3585,18 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
     // only for surfaces.
     let mut step_u: Option<u32> = None;
     let mut step_v: Option<u32> = None;
+    // Spec §"stech technique resolution": when the block carries a
+    // `stech cparma ures vres` (or the single-parameter `stech cparmb
+    // uvres`) directive, the file asks for a specific constant-parametric
+    // subdivision density rather than the caller's uniform `samples`
+    // budget. `n = round(res × degree)` per parametric direction, exactly
+    // like the `ctech cparm` curve analog. Only the closed-form `cparma`
+    // / `cparmb` techniques are honoured here; the geometric `cspace` /
+    // `curv` techniques (real-space length / curvature refinement) stay
+    // on the uniform budget. `None` ⇒ fall back to the global `samples`.
+    // The tuple is `(ures, vres)`; `cparmb` fills both slots with its one
+    // value.
+    let mut stech_cparm_res: Option<(f32, f32)> = None;
     let mut pending_surfs: Vec<&Vec<String>> = Vec::new();
     // Trim / hole loops accumulated for the current surface block —
     // each is a closed (u, v) polygon assembled from one or more
@@ -3645,6 +3663,7 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                  bmat_v: &[f32],
                  step_u: Option<u32>,
                  step_v: Option<u32>,
+                 stech_cparm_res: Option<(f32, f32)>,
                  surfs: &[&Vec<String>],
                  trims: &[Vec<[f32; 2]>],
                  holes: &[Vec<[f32; 2]>],
@@ -3654,8 +3673,22 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
         };
         for entry in surfs {
             if let Some(prim) = flush_surface(
-                doc, kind, deg_u, deg_v, parm_u, parm_v, bmat_u, bmat_v, step_u, step_v, entry,
-                samples, trims, holes, scrvs,
+                doc,
+                kind,
+                deg_u,
+                deg_v,
+                parm_u,
+                parm_v,
+                bmat_u,
+                bmat_v,
+                step_u,
+                step_v,
+                stech_cparm_res,
+                entry,
+                samples,
+                trims,
+                holes,
+                scrvs,
             ) {
                 out.push(prim);
             }
@@ -3679,6 +3712,7 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     &bmat_v,
                     step_u,
                     step_v,
+                    stech_cparm_res,
                     &pending_surfs,
                     &pending_trims,
                     &pending_holes,
@@ -3696,6 +3730,7 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                 bmat_v.clear();
                 step_u = None;
                 step_v = None;
+                stech_cparm_res = None;
                 // Spec §"Curve and surface type": `cstype [rat] type`.
                 let mut iter = entry.iter().skip(1);
                 let first = iter.next().map(String::as_str);
@@ -3782,6 +3817,25 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                 step_u = entry.get(1).and_then(|t| t.parse::<u32>().ok());
                 step_v = entry.get(2).and_then(|t| t.parse::<u32>().ok());
             }
+            // Spec §"stech technique resolution": capture the constant-
+            // parametric surface-subdivision density for the override.
+            // `stech cparma ures vres` carries one resolution per
+            // parametric direction; `stech cparmb uvres` carries one
+            // value used for both. A non-`cparma`/`cparmb` `stech`
+            // line (the geometric `cspace` / `curv` techniques) leaves
+            // the override unset (uniform `samples` budget).
+            "stech" if entry.get(1).map(String::as_str) == Some("cparma") => {
+                let ures = entry.get(2).and_then(|t| t.parse::<f32>().ok());
+                let vres = entry.get(3).and_then(|t| t.parse::<f32>().ok());
+                if let (Some(u), Some(v)) = (ures, vres) {
+                    stech_cparm_res = Some((u, v));
+                }
+            }
+            "stech" if entry.get(1).map(String::as_str) == Some("cparmb") => {
+                if let Some(uv) = entry.get(2).and_then(|t| t.parse::<f32>().ok()) {
+                    stech_cparm_res = Some((uv, uv));
+                }
+            }
             "surf" => pending_surfs.push(entry),
             // Spec §"trim u0 u1 curv2d u0 u1 curv2d …": outer trimming
             // loop assembled from one or more curv2 segments. Resolved
@@ -3827,6 +3881,7 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                     &bmat_v,
                     step_u,
                     step_v,
+                    stech_cparm_res,
                     &pending_surfs,
                     &pending_trims,
                     &pending_holes,
@@ -3845,6 +3900,7 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
                 bmat_v.clear();
                 step_u = None;
                 step_v = None;
+                stech_cparm_res = None;
             }
             _ => {}
         }
@@ -3861,6 +3917,7 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
         &bmat_v,
         step_u,
         step_v,
+        stech_cparm_res,
         &pending_surfs,
         &pending_trims,
         &pending_holes,
@@ -4713,6 +4770,7 @@ fn flush_surface(
     bmat_v: &[f32],
     step_u: Option<u32>,
     step_v: Option<u32>,
+    stech_cparm_res: Option<(f32, f32)>,
     entry: &[String],
     samples: u32,
     trims: &[Vec<[f32; 2]>],
@@ -4732,6 +4790,42 @@ fn flush_surface(
     // Spec §"surf": both degu and degv are required for a surface.
     let du = deg_u? as usize;
     let dv = deg_v? as usize;
+
+    // Spec §"stech cparma ures vres" / §"stech cparmb uvres": "Each patch
+    // of the surface is subdivided n times in parameter space, where n is
+    // the resolution parameter multiplied by the degree of the surface. …
+    // If you enter a value of 0 for both ures and vres, each patch is
+    // approximated by two triangles." We compute `n = round(res × degree)`
+    // independently per direction (matching the `ctech cparm` curve
+    // analog) and drive the shared isotropic lattice from the finer of the
+    // two so neither direction is under-sampled — the surface samplers
+    // walk a square `(n + 1)²` grid, so a single budget is selected. A
+    // `0, 0` request collapses to `n = 1` (two triangles per patch). The
+    // override is parametric-only; a `stech cspace` / `stech curv`
+    // technique leaves `stech_cparm_res == None` and the uniform `samples`
+    // budget stands.
+    let effective_samples = match stech_cparm_res {
+        Some((ures, vres)) if du > 0 || dv > 0 => {
+            let n_u = (ures * du as f32).round();
+            let n_v = (vres * dv as f32).round();
+            let n = n_u.max(n_v);
+            if n.is_finite() && n >= 1.0 {
+                // Mirror the `ctech cparm` cap so an attacker-supplied
+                // resolution can't request an unbounded lattice.
+                (n as u32).min(samples.max(1).saturating_mul(64))
+            } else {
+                // Both directions rounded to 0 (the spec's "two triangles
+                // per patch" case) — one subdivision ⇒ a 2×2 vertex cell.
+                1
+            }
+        }
+        _ => samples,
+    };
+    // Preserve the caller's uniform budget for provenance: the
+    // `obj:surface_stech_cparm_res` extra is only emitted when the `stech`
+    // override actually changed the lattice density.
+    let uniform_samples = samples;
+    let samples = effective_samples;
 
     let bspline = matches!(kind, "bspline" | "rat_bspline");
     let cardinal = kind == "cardinal";
@@ -5150,6 +5244,24 @@ fn flush_surface(
         "obj:surface_samples".to_string(),
         serde_json::Value::Number(serde_json::Number::from(samples as u64)),
     );
+    // Spec §"stech cparma" / §"stech cparmb": when a constant-parametric
+    // `stech` directive overrode the caller's uniform budget, surface the
+    // requested `[ures, vres]` resolution pair so a consumer can see the
+    // density came from the file rather than the tessellator setting (the
+    // effective lattice count is already reported through
+    // `obj:surface_samples`). `cparmb` reports its single value in both
+    // slots, exactly as it was applied.
+    if let Some((ures, vres)) = stech_cparm_res {
+        if samples != uniform_samples {
+            prim.extras.insert(
+                "obj:surface_stech_cparm_res".to_string(),
+                serde_json::Value::Array(vec![
+                    serde_json::Value::from(ures as f64),
+                    serde_json::Value::from(vres as f64),
+                ]),
+            );
+        }
+    }
     // Spec §"Bezier" multi-patch decomposition — when the synthesised
     // grid contains more than one patch per direction, surface the
     // per-direction patch count so downstream consumers can recognise
