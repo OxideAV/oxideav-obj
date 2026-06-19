@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Round 345: `vp` parameter-space-vertex re-emission is now
+  byte-faithful for lines whose trailing (or middle) coordinate is a
+  genuine zero. The decoder pads every `vp` entry to a `[u, v, w]`
+  triple with `0.0` (spec §"vp u v w" allows 1, 2, or 3 coordinates
+  depending on usage), which is indistinguishable from an
+  explicitly-written `0.0`; the encoder previously inferred the
+  original arity by stripping trailing zeros, so `vp 0.5 0.0` (a
+  surface special point on the `v = 0` edge) round-tripped to
+  `vp 0.5` and `vp 0.5 0.5 0.0` (a zero-weight rational trimming-curve
+  control point) to `vp 0.5 0.5`. The decoder now records each line's
+  source token width into `Scene3D::extras["obj:vp_widths"]` (a vector
+  parallel to `obj:vp`) and the encoder reproduces the exact arity.
+  Decode → encode is now a fixed point for the full 1D/2D/3D `vp` mix;
+  scenes assembled without going through the decoder (no `vp_widths`
+  key) keep the prior strip-trailing-zeros fallback.
+
 ### Added
 
 - Round 332: `stech cparma ures vres` / `stech cparmb uvres`

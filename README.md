@@ -76,7 +76,13 @@ modern loaders actually load):
   pool) and `Scene3D::extras["obj:freeform_directives"]` (sequence
   of `[keyword, arg1, arg2, …]` arrays). The encoder replays both
   after the polygonal section so a decode → encode round-trip
-  preserves the directive order and arguments. Verbatim by default;
+  preserves the directive order and arguments. Each `vp` line's
+  original token width (1, 2, or 3 coordinates per spec §"vp u v w")
+  rides on a parallel `Scene3D::extras["obj:vp_widths"]` vector so the
+  re-emit is byte-faithful even when a trailing coordinate is a genuine
+  zero (`vp 0.5 0.0` for a `v = 0` surface special point, or
+  `vp 0.5 0.5 0.0` for a zero-weight rational trim control point) rather
+  than collapsing on a strip-trailing-zeros heuristic. Verbatim by default;
   opt-in tessellation of `curv` 3D space curves, `curv2` 2D
   parameter-space trimming curves, and Bezier / B-spline / Cardinal /
   Taylor / basis-matrix `surf` surfaces is available via

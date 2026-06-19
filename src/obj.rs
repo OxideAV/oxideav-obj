@@ -138,6 +138,18 @@ struct ObjDoc {
     /// raw "what the file said" in extras and let the consumer
     /// interpret).
     vp: Vec<[f32; 3]>,
+    /// Original token width of each parallel `vp` entry (1, 2, or 3) —
+    /// how many coordinates the operator actually wrote on the `vp`
+    /// line. The `vp` storage above pads missing components with `0.0`,
+    /// which is indistinguishable from an explicitly-written `0.0`; the
+    /// encoder would otherwise have to guess the original arity by
+    /// stripping trailing zeros, corrupting any `vp` line whose
+    /// trailing component is a genuine zero (e.g. `vp 0.5 0.0` for a
+    /// v-on-the-edge surface special point, or `vp 0.5 0.5 0.0` for a
+    /// zero-weight rational trim control point). Tracking the real
+    /// width here makes the decode → encode round-trip byte-faithful
+    /// for those cases. Parallel to `vp` (1-based, same length).
+    vp_widths: Vec<u8>,
     /// Material library file names referenced by `mtllib`.
     mtllibs: Vec<String>,
     /// Texture-map library file names referenced by `maplib`. Spec
@@ -379,7 +391,14 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 let u = coords[0];
                 let v = coords.get(1).copied().unwrap_or(0.0);
                 let w = coords.get(2).copied().unwrap_or(0.0);
+                // Record how many coordinates the operator actually
+                // wrote (capped at 3 — extra tokens past `w` are not
+                // meaningful per spec §"vp u v w"). This drives a
+                // byte-faithful re-emit instead of the lossy
+                // strip-trailing-zeros heuristic. `vp 0.5 0.0` and
+                // `vp 0.5` are distinct on the wire and stay distinct.
                 doc.vp.push([u, v, w]);
+                doc.vp_widths.push(coords.len().min(3) as u8);
             }
             "cstype" | "deg" | "curv" | "curv2" | "surf" | "parm" | "trim" | "hole" | "scrv"
             | "sp" | "end" | "bzp" | "bsp" | "cdc" | "cdp" | "res" | "bmat" | "step" | "ctech"
@@ -1066,6 +1085,13 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         scene
             .extras
             .insert("obj:vp".to_string(), serde_json::to_value(&doc.vp).unwrap());
+        // Parallel original-token-width vector so the encoder re-emits
+        // each `vp` line at its source arity rather than inferring it
+        // from trailing zeros (which corrupts genuine-zero components).
+        scene.extras.insert(
+            "obj:vp_widths".to_string(),
+            serde_json::to_value(&doc.vp_widths).unwrap(),
+        );
     }
     if !doc.freeform_directives.is_empty() {
         scene.extras.insert(
@@ -7613,7 +7639,16 @@ pub fn serialize_obj_with_options(
     // mandate an ordering, but co-locating `vp` with the other vertex
     // pools keeps human diffs tidy).
     if let Some(serde_json::Value::Array(vps)) = scene.extras.get("obj:vp") {
-        for entry in vps {
+        // Parallel original-token-width vector (populated by the
+        // decoder). When present it gives the exact arity the operator
+        // wrote, so the encoder reproduces `vp 0.5 0.0` and
+        // `vp 0.5 0.5 0.0` faithfully instead of stripping the genuine
+        // trailing zero. Absent (e.g. a scene assembled by a caller
+        // without going through the decoder) ⇒ fall back to the
+        // strip-trailing-zeros heuristic below.
+        let widths: Option<&Vec<serde_json::Value>> =
+            scene.extras.get("obj:vp_widths").and_then(|v| v.as_array());
+        for (vi, entry) in vps.iter().enumerate() {
             if let serde_json::Value::Array(coords) = entry {
                 let parts: Vec<f32> = coords
                     .iter()
@@ -7622,18 +7657,25 @@ pub fn serialize_obj_with_options(
                 if parts.is_empty() {
                     continue;
                 }
-                // Emit only as many coordinates as carry meaningful
-                // information. The decoder padded with `0.0`, so a
-                // trailing `0` is a strong signal "the operator
-                // didn't supply this component". 1D / 2D / 3D `vp`
-                // statements are all valid per spec §"vp u v w".
-                let trim = if parts.len() >= 3 && parts[2] != 0.0 {
-                    3
-                } else if parts.len() >= 2 && parts[1] != 0.0 {
-                    2
-                } else {
-                    1
-                };
+                // Prefer the recorded source width; clamp into the
+                // available range. 1D / 2D / 3D `vp` statements are all
+                // valid per spec §"vp u v w".
+                let recorded = widths
+                    .and_then(|w| w.get(vi))
+                    .and_then(|v| v.as_u64())
+                    .map(|n| (n as usize).clamp(1, parts.len()));
+                // Fallback heuristic: emit only as many coordinates as
+                // carry meaningful information — a trailing `0` from the
+                // decoder's padding signals an omitted component.
+                let trim = recorded.unwrap_or_else(|| {
+                    if parts.len() >= 3 && parts[2] != 0.0 {
+                        3
+                    } else if parts.len() >= 2 && parts[1] != 0.0 {
+                        2
+                    } else {
+                        1
+                    }
+                });
                 let mut s = String::from("vp");
                 for coord in parts.iter().take(trim) {
                     s.push(' ');
