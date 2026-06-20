@@ -958,6 +958,17 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         Vec::new()
     };
 
+    // Spec §"Superseded statements" typed view: one object per `bzp` /
+    // `bsp` / `cdc` / `cdp` statement, carrying its raw control-point
+    // indices and the `res` segment counts active at its position.
+    // Parse-time-only — the encoder still drives emission off
+    // `obj:freeform_directives`.
+    let superseded_typed = if !doc.freeform_directives.is_empty() {
+        collect_superseded(&doc)
+    } else {
+        Vec::new()
+    };
+
     // Materials first so primitives can point at their MaterialId.
     // Insertion order is preserved (HashMap iteration order is
     // unspecified, so sort by name to keep round-trip deterministic).
@@ -1155,6 +1166,17 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
         scene.extras.insert(
             "obj:trim_loops".to_string(),
             serde_json::Value::Array(trim_loops_typed),
+        );
+    }
+    if !superseded_typed.is_empty() {
+        // Spec §"Superseded statements" typed view from the precomputed
+        // pass above. Skipped when no `bzp` / `bsp` / `cdc` / `cdp` line
+        // resolved cleanly (wrong control-point count or any index token
+        // failed to parse). The encoder still drives line emission off
+        // `obj:freeform_directives`.
+        scene.extras.insert(
+            "obj:superseded".to_string(),
+            serde_json::Value::Array(superseded_typed),
         );
     }
 
@@ -3647,6 +3669,116 @@ fn collect_parms(doc: &ObjDoc) -> Vec<serde_json::Value> {
             }
             _ => {}
         }
+    }
+    typed
+}
+
+/// Walk `doc.freeform_directives` for every superseded geometry statement
+/// (`bzp` / `bsp` Bezier / B-spline patch, `cdc` Cardinal curve, `cdp`
+/// Cardinal patch) and return a typed decomposition suitable for
+/// surfacing on `Scene3D::extras["obj:superseded"]`.
+///
+/// Spec §"Superseded statements": these four keywords list their control
+/// points directly as `v` vertex indices (no enclosing `cstype … end`
+/// block, no `parm` knot vector). The `bzp` / `bsp` / `cdp` patch forms
+/// require exactly sixteen indices; `cdc` requires a minimum of four with
+/// no maximum. The stateful `res useg vseg` reference/display statement
+/// (spec §"res useg vseg") sets the per-direction segment count for the
+/// patches/curves that follow it — this typed view pairs each statement
+/// with the `res` segments active at its position so a consumer sees the
+/// requested subdivision density without re-walking the directive stream.
+///
+/// The returned [`serde_json::Value`] is always an array of objects, one
+/// entry per superseded statement in source order; each carries:
+///
+/// * `keyword` — `String`, exactly `"bzp"` / `"bsp"` / `"cdc"` / `"cdp"`.
+/// * `kind` — `String`, the human-readable form: `"bezier_patch"` /
+///   `"bspline_patch"` / `"cardinal_curve"` / `"cardinal_patch"`.
+/// * `control_points` — array of `i64`, the raw 1-based / negative-from-end
+///   vertex indices exactly as written (resolution to absolute indices is
+///   left to the consumer, mirroring how the verbatim channel preserves
+///   them). Tokens that fail to parse as `i64` drop the whole statement
+///   from the typed view (lenient — the verbatim channel still replays it).
+/// * `res` — `[u64, u64]` `[useg, vseg]` segment counts active at this
+///   statement (each clamped to the spec's 3..=120 range, `vseg`
+///   defaulting to `useg`), or omitted when no `res` preceded the
+///   statement.
+///
+/// The encoder is still driven by the verbatim `obj:freeform_directives`
+/// channel; this typed view is parse-time-only.
+fn collect_superseded(doc: &ObjDoc) -> Vec<serde_json::Value> {
+    let mut typed: Vec<serde_json::Value> = Vec::new();
+    let mut res_seg: Option<(u64, u64)> = None;
+    for entry in &doc.freeform_directives {
+        let Some(keyword) = entry.first().map(String::as_str) else {
+            continue;
+        };
+        if keyword == "res" {
+            if let Some(useg) = entry.get(1).and_then(|t| t.parse::<u32>().ok()) {
+                let useg = useg.clamp(3, 120) as u64;
+                let vseg = entry
+                    .get(2)
+                    .and_then(|t| t.parse::<u32>().ok())
+                    .map(|v| v.clamp(3, 120) as u64)
+                    .unwrap_or(useg);
+                res_seg = Some((useg, vseg));
+            }
+            continue;
+        }
+        let kind = match keyword {
+            "bzp" => "bezier_patch",
+            "bsp" => "bspline_patch",
+            "cdc" => "cardinal_curve",
+            "cdp" => "cardinal_patch",
+            _ => continue,
+        };
+        // Spec §"Superseded statements": patches need exactly 16 indices,
+        // `cdc` needs a minimum of four. Statements that fall short are
+        // dropped from the typed view (the verbatim channel still replays
+        // them); over-long patch forms are likewise dropped as malformed.
+        let toks = &entry[1..];
+        let min = if keyword == "cdc" { 4 } else { 16 };
+        let max = if keyword == "cdc" { usize::MAX } else { 16 };
+        if toks.len() < min || toks.len() > max {
+            continue;
+        }
+        let mut control_points: Vec<serde_json::Value> = Vec::with_capacity(toks.len());
+        let mut bad = false;
+        for tok in toks {
+            match tok.parse::<i64>() {
+                Ok(v) => control_points.push(serde_json::Value::from(v)),
+                Err(_) => {
+                    bad = true;
+                    break;
+                }
+            }
+        }
+        if bad {
+            continue;
+        }
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "keyword".to_string(),
+            serde_json::Value::String(keyword.to_string()),
+        );
+        obj.insert(
+            "kind".to_string(),
+            serde_json::Value::String(kind.to_string()),
+        );
+        obj.insert(
+            "control_points".to_string(),
+            serde_json::Value::Array(control_points),
+        );
+        if let Some((useg, vseg)) = res_seg {
+            obj.insert(
+                "res".to_string(),
+                serde_json::Value::Array(vec![
+                    serde_json::Value::from(useg),
+                    serde_json::Value::from(vseg),
+                ]),
+            );
+        }
+        typed.push(serde_json::Value::Object(obj));
     }
     typed
 }

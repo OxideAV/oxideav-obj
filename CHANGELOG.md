@@ -27,6 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 353: typed `Scene3D::extras["obj:superseded"]` accessor — a
+  parse-time-only decomposition of every superseded geometry statement
+  (`bzp` / `bsp` Bezier / B-spline patch, `cdc` Cardinal curve, `cdp`
+  Cardinal patch; spec §"Superseded statements"). Each entry carries the
+  `keyword`, a human-readable `kind` (`bezier_patch` / `bspline_patch` /
+  `cardinal_curve` / `cardinal_patch`), the raw `control_points` vertex
+  indices (1-based / negative-from-end, as written), and the `res`
+  `[useg, vseg]` segment counts active at that statement (omitted when no
+  `res` preceded it). Covers all four forms — including the
+  verbatim-only `bsp` / `cdp` — so consumers can read the superseded
+  geometry without re-walking `obj:freeform_directives`; the encoder is
+  still driven by the verbatim channel.
 - Round 353: opt-in tessellation of the superseded `cdc` (Cardinal
   curve) and `bzp` (Bezier patch) statements (spec §"Superseded
   statements"). Previously these round-tripped verbatim only; with

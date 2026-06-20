@@ -471,3 +471,91 @@ fn tessellation_off_by_default_emits_no_synthetic_mesh() {
     assert!(mesh_named(&scene, "obj:superseded_surfaces").is_none());
     assert!(mesh_named(&scene, "obj:superseded_curves").is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Typed `obj:superseded` accessor — parse-time-only, no tessellation needed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn superseded_typed_view_decomposes_all_four_keywords() {
+    // The typed view covers ALL four superseded geometry statements,
+    // including the verbatim-only `bsp` / `cdp` forms, and is populated
+    // even without tessellation enabled.
+    let mut text = String::new();
+    text.push_str("v 0 0 0\n".repeat(16).as_str());
+    text.push_str("res 7 9\n");
+    text.push_str("bzp 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n");
+    text.push_str("bsp 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n");
+    text.push_str("cdp 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n");
+    text.push_str("cdc 1 2 3 4 5\n");
+
+    let scene = ObjDecoder::new().decode(text.as_bytes()).unwrap();
+    let arr = scene
+        .extras
+        .get("obj:superseded")
+        .and_then(|v| v.as_array())
+        .expect("obj:superseded typed view");
+    assert_eq!(arr.len(), 4, "one entry per superseded statement");
+
+    let kw = |i: usize| arr[i]["keyword"].as_str().unwrap();
+    let kind = |i: usize| arr[i]["kind"].as_str().unwrap();
+    assert_eq!((kw(0), kind(0)), ("bzp", "bezier_patch"));
+    assert_eq!((kw(1), kind(1)), ("bsp", "bspline_patch"));
+    assert_eq!((kw(2), kind(2)), ("cdp", "cardinal_patch"));
+    assert_eq!((kw(3), kind(3)), ("cdc", "cardinal_curve"));
+
+    // Control points preserved as raw indices.
+    let cp = arr[3]["control_points"].as_array().unwrap();
+    assert_eq!(cp.len(), 5);
+    assert_eq!(cp[0].as_i64(), Some(1));
+    assert_eq!(cp[4].as_i64(), Some(5));
+
+    // `res 7 9` active for every following statement → [7, 9].
+    for e in arr {
+        let r = e["res"].as_array().unwrap();
+        assert_eq!(r[0].as_u64(), Some(7));
+        assert_eq!(r[1].as_u64(), Some(9));
+    }
+}
+
+#[test]
+fn superseded_typed_view_omits_res_when_absent_and_drops_malformed() {
+    // No preceding `res` ⇒ the `res` key is omitted. A wrong-arity patch
+    // is dropped from the typed view entirely.
+    let mut text = String::new();
+    text.push_str("v 0 0 0\n".repeat(16).as_str());
+    text.push_str("cdc 1 2 3 4\n");
+    text.push_str("bzp 1 2 3\n"); // malformed: only 3 of 16 indices
+
+    let scene = ObjDecoder::new().decode(text.as_bytes()).unwrap();
+    let arr = scene
+        .extras
+        .get("obj:superseded")
+        .and_then(|v| v.as_array())
+        .unwrap();
+    assert_eq!(arr.len(), 1, "malformed bzp dropped from typed view");
+    assert_eq!(arr[0]["keyword"].as_str(), Some("cdc"));
+    assert!(
+        arr[0].get("res").is_none(),
+        "res omitted when no res preceded the statement"
+    );
+}
+
+#[test]
+fn superseded_typed_view_negative_indices_preserved_verbatim() {
+    // Raw indices are preserved as written (including negative-from-end);
+    // resolution is left to the consumer.
+    let mut text = String::new();
+    text.push_str("v 0 0 0\n".repeat(6).as_str());
+    text.push_str("cdc -6 -5 -4 -3 -2 -1\n");
+
+    let scene = ObjDecoder::new().decode(text.as_bytes()).unwrap();
+    let arr = scene
+        .extras
+        .get("obj:superseded")
+        .and_then(|v| v.as_array())
+        .unwrap();
+    let cp = arr[0]["control_points"].as_array().unwrap();
+    let got: Vec<i64> = cp.iter().map(|v| v.as_i64().unwrap()).collect();
+    assert_eq!(got, vec![-6, -5, -4, -3, -2, -1]);
+}

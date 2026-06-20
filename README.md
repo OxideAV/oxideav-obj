@@ -265,7 +265,9 @@ with the spec's constant-parametric `n = round(res × degree)` density. The
 triangulated surfaces carry smooth per-vertex normals for direct
 smooth-shaded rendering. Typed
 decompositions of `parm` / `con` / `sp` / `trim`-loop / `ctech` /
-`stech` body statements ride alongside the verbatim channel for
+`stech` body statements and of the superseded `bzp` / `bsp` / `cdc` /
+`cdp` geometry statements (`Scene3D::extras["obj:superseded"]`, paired
+with the active `res` segments) ride alongside the verbatim channel for
 consumers that don't want to re-parse positional tokens.
 
 A `cargo fuzz` harness (`fuzz/fuzz_targets/parse_obj.rs` and
