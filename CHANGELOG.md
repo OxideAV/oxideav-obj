@@ -27,6 +27,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 353: opt-in tessellation of the superseded `cdc` (Cardinal
+  curve) and `bzp` (Bezier patch) statements (spec §"Superseded
+  statements"). Previously these round-tripped verbatim only; with
+  `ObjDecoder::with_curve_tessellation(N)` a `cdc v1 v2 v3 v4 …` line
+  (minimum four control points) is now evaluated to a real
+  `Topology::LineStrip` polyline via the same cubic Catmull-Rom basis
+  as the modern `cstype cardinal` form, and a `bzp v1 … v16` 16-point
+  bicubic patch is evaluated to a triangulated `Topology::Triangles`
+  surface with smooth per-vertex normals via the shared
+  tensor-product de Casteljau evaluator. The `bzp` control-mesh layout
+  is taken directly from the spec's §"Comparison of 2.11 and 3.0
+  syntax" §"Bezier patch" worked example (which writes the same patch
+  as both `bzp 1 … 16` and the modern `surf … 13 14 15 16 …` form). The
+  superseded `res useg vseg` reference/display statement now modulates
+  subdivision density for the `cdc` / `bzp` lines that follow it
+  (per-direction segment count clamped to the spec's 3..=120 range;
+  surfaces drive the shared isotropic lattice from the finer of the two
+  directions). Synthetic geometry lands on dedicated
+  `obj:superseded_curves` / `obj:superseded_surfaces` meshes carrying
+  the shared `obj:tessellated_curve = true` sentinel, so the encoder
+  drops it on re-emit and the verbatim `cdc` / `bzp` / `res` lines in
+  `Scene3D::extras["obj:freeform_directives"]` remain the round-trip
+  source of truth. The superseded `bsp` (B-spline patch) and `cdp`
+  (Cardinal patch) 16-point forms still round-trip verbatim only — the
+  spec describes their control-point distribution prose-only ("four
+  distributed over the surface, the remainder around the perimeter")
+  without a comparison example pinning the basis/knot layout, so their
+  geometry is not synthesised.
 - Round 332: `stech cparma ures vres` / `stech cparmb uvres`
   surface-approximation resolution now drives the tessellated lattice
   density — the surface analog of the round-328 `ctech cparm` override.

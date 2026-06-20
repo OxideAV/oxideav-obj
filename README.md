@@ -253,10 +253,15 @@ B-spline / NURBS, Cardinal (Catmull-Rom), Taylor, and basis-matrix
 (`bmatrix`) — are evaluated to real `LineStrip` / `Triangles` geometry
 on synthetic meshes, including multi-patch decomposition, `trim` / `hole`
 sub-cell boundary re-meshing, `scrv` special-curve triangle-edge
-embedding, `sp` special points, and `con` connectivity seams. A
-block-local `ctech cparm` (curves) or `stech cparma` / `cparmb`
-(surfaces) directive overrides the uniform subdivision budget with the
-spec's constant-parametric `n = round(res × degree)` density. The
+embedding, `sp` special points, and `con` connectivity seams. The
+superseded `cdc` (Cardinal curve) and `bzp` (16-point bicubic Bezier
+patch) statements tessellate too — to `obj:superseded_curves` /
+`obj:superseded_surfaces` meshes — reusing the modern Cardinal / Bezier
+evaluators, with the superseded `res useg vseg` statement modulating
+their subdivision density (segment count clamped to the spec's 3..=120
+range). A block-local `ctech cparm` (curves) or `stech cparma` /
+`cparmb` (surfaces) directive overrides the uniform subdivision budget
+with the spec's constant-parametric `n = round(res × degree)` density. The
 triangulated surfaces carry smooth per-vertex normals for direct
 smooth-shaded rendering. Typed
 decompositions of `parm` / `con` / `sp` / `trim`-loop / `ctech` /

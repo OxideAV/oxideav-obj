@@ -1718,6 +1718,327 @@ fn flush_block(
     }
 }
 
+/// Tessellate the superseded `cdc` (Cardinal curve) statements into real
+/// `LineStrip` polylines.
+///
+/// Spec §"Superseded statements" §"cdc v1 v2 v3 v4 v5 …": "Specifies a
+/// Cardinal curve. Cardinal curves have a minimum of four control points,
+/// defined as vertices. … There is no limit on the maximum. Positive
+/// values indicate absolute vertex numbers. Negative values indicate
+/// relative vertex numbers." Unlike the modern `cstype cardinal` + `curv`
+/// form, `cdc` is a single self-contained statement that lists its `v`
+/// control-point indices directly — there is no enclosing `cstype … end`
+/// block, no `deg`, and no `parm` knot vector. The basis is the same cubic
+/// Catmull-Rom evaluated by [`sample_cardinal`] (spec §"Cardinal":
+/// "Cardinal splines are only defined for the cubic case"), so we reuse
+/// that evaluator unchanged: a `cdc` with `K` control points yields
+/// `K − 3` cubic segments interpolating every interior control point.
+///
+/// Subdivision density honours the superseded `res useg vseg` statement
+/// (spec §"res useg vseg": "Sets the number of segments for Bezier,
+/// B-spline and Cardinal patches that follow it. … The minimum setting is
+/// 3 and the maximum setting is 120. The default is 4."). `res` is a
+/// stateful reference/display statement: the most-recent `res` seen before
+/// a `cdc` line sets that curve's per-cubic-segment subdivision count
+/// (`useg`, clamped to the spec's 3..=120 range). With no preceding `res`
+/// the caller's uniform `samples` budget drives the density (so the
+/// opt-in tessellator behaves consistently with the modern curve passes).
+/// Although the spec phrases `res` for "patches", the same statement is
+/// the only segment-count control the superseded format offers for
+/// Cardinal *curves* too, and the worked listings apply it to both — we
+/// therefore let it modulate `cdc` density.
+///
+/// Provenance / round-trip: the synthetic polylines land on a dedicated
+/// `obj:superseded_curves` mesh and carry `obj:tessellated_curve = true`
+/// plus `obj:curve_kind = "cdc"`, so the encoder's shared synthetic-mesh
+/// filter drops them on re-emit and the verbatim `cdc` / `res` lines in
+/// `Scene3D::extras["obj:freeform_directives"]` remain the source of
+/// truth for serialisation.
+fn tessellate_superseded_curves(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
+    let mut out: Vec<Primitive> = Vec::new();
+    if samples == 0 {
+        return out;
+    }
+    let n_pos = doc.positions.len() as i64;
+    // Active `res useg` segment count (spec clamps to 3..=120); `None`
+    // until the first `res` line, in which case the uniform budget is used.
+    let mut res_useg: Option<u32> = None;
+
+    for entry in &doc.freeform_directives {
+        let Some(keyword) = entry.first().map(String::as_str) else {
+            continue;
+        };
+        match keyword {
+            "res" => {
+                // Spec §"res useg vseg": `useg` is the u-direction segment
+                // count; for a 1D curve only `useg` is meaningful. Clamp to
+                // the documented 3..=120 range; an out-of-range or
+                // unparsable value leaves the prior state untouched (lenient
+                // loader — the verbatim line still round-trips).
+                if let Some(useg) = entry.get(1).and_then(|t| t.parse::<u32>().ok()) {
+                    res_useg = Some(useg.clamp(3, 120));
+                }
+            }
+            "cdc" => {
+                // Resolve the listed control points; negative indices are
+                // relative-from-end per spec §"cdc".
+                let mut control_points: Vec<[f32; 3]> = Vec::new();
+                let mut bad = false;
+                for tok in &entry[1..] {
+                    let Ok(raw) = tok.parse::<i64>() else {
+                        bad = true;
+                        break;
+                    };
+                    let resolved = if raw < 0 { n_pos + 1 + raw } else { raw };
+                    if resolved <= 0 || resolved > n_pos {
+                        bad = true;
+                        break;
+                    }
+                    control_points.push(doc.positions[(resolved as usize) - 1]);
+                }
+                // Spec §"cdc": "A minimum of four vertex numbers are
+                // required." Fewer than four control points (or a bad
+                // index) ⇒ malformed; skip silently (the verbatim line
+                // still round-trips).
+                if bad || control_points.len() < 4 {
+                    continue;
+                }
+                let effective_samples = res_useg.unwrap_or(samples);
+                let curve_points = sample_cardinal(&control_points, effective_samples);
+                if curve_points.len() < 2 {
+                    continue;
+                }
+
+                let mut prim = Primitive::new(Topology::LineStrip);
+                let n = curve_points.len() as u32;
+                prim.positions = curve_points;
+                if n > u16::MAX as u32 {
+                    prim.indices = Some(Indices::U32((0..n).collect()));
+                } else {
+                    prim.indices = Some(Indices::U16((0..n).map(|i| i as u16).collect()));
+                }
+                prim.extras.insert(
+                    "obj:tessellated_curve".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                prim.extras.insert(
+                    "obj:curve_kind".to_string(),
+                    serde_json::Value::String("cdc".to_string()),
+                );
+                // Spec §"Cardinal": cubic-only ⇒ degree 3.
+                prim.extras.insert(
+                    "obj:curve_degree".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(3u64)),
+                );
+                prim.extras.insert(
+                    "obj:curve_samples".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(effective_samples as u64)),
+                );
+                // When a `res` statement overrode the caller's uniform
+                // budget, surface the source `useg` so a consumer can tell
+                // the spec-driven density apart from the default (spec
+                // §"res useg vseg").
+                if let Some(useg) = res_useg {
+                    prim.extras.insert(
+                        "obj:curve_res_useg".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(useg as u64)),
+                    );
+                }
+                out.push(prim);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Tessellate the superseded `bzp` (Bezier patch) statements into real
+/// triangulated [`Topology::Triangles`] surfaces with smooth per-vertex
+/// normals.
+///
+/// Spec §"Superseded statements" §"bzp v1 v2 … v16": "Specifies a Bezier
+/// patch. Bezier patches have sixteen control points, defined as vertices.
+/// The control points are distributed uniformly over its surface. … Sixteen
+/// vertex numbers are required. Positive values indicate absolute vertex
+/// numbers. Negative values indicate relative vertex numbers."
+///
+/// The spec's §"Comparison of 2.11 and 3.0 syntax" §"Bezier patch" pins
+/// the exact geometry: it shows the **same** patch written both as
+/// `bzp 1 2 3 … 16` and as the modern `cstype bezier` / `deg 3 3` /
+/// `surf … 13 14 15 16 9 10 11 12 5 6 7 8 1 2 3 4` form. The `bzp` list is
+/// therefore a 4 × 4 bicubic control mesh whose sixteen points are grouped
+/// as four consecutive rows of four (`v1..v4`, `v5..v8`, `v9..v12`,
+/// `v13..v16`). The modern `surf` re-lists those same rows in reverse,
+/// which only flips the v-parameter direction of the symmetric tensor
+/// product — the surface geometry is identical, so we feed the natural
+/// `bzp` row-major order straight into the shared
+/// [`sample_bezier_surface`] evaluator (cols = 4, rows = 4, degree 3 in
+/// both directions).
+///
+/// Subdivision density honours the superseded `res useg vseg` statement
+/// (spec §"res useg vseg": "Sets the number of segments for Bezier,
+/// B-spline and Cardinal patches that follow it. … The minimum setting is
+/// 3 and the maximum setting is 120. The default is 4."). The most-recent
+/// `res` before a `bzp` line sets the per-direction lattice density; the
+/// shared isotropic lattice is driven from the finer (max) of `useg` /
+/// `vseg`, both clamped to the spec's 3..=120 range, so the coarser
+/// direction is never under-sampled (mirrors the `stech cparma` handling
+/// in [`tessellate_surfaces`]). With no preceding `res`, the caller's
+/// uniform `samples` budget drives the lattice.
+///
+/// Provenance / round-trip: the synthetic surfaces land on a dedicated
+/// `obj:superseded_surfaces` mesh and carry `obj:tessellated_surface =
+/// true` plus `obj:surface_kind = "bzp"`, so the encoder's shared
+/// synthetic-mesh filter drops them on re-emit and the verbatim `bzp` /
+/// `res` lines in `Scene3D::extras["obj:freeform_directives"]` remain the
+/// source of truth for serialisation.
+fn tessellate_superseded_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
+    let mut out: Vec<Primitive> = Vec::new();
+    if samples == 0 {
+        return out;
+    }
+    let n_pos = doc.positions.len() as i64;
+    // Active `res useg vseg` segment counts (spec clamps to 3..=120);
+    // `None` until the first `res`, in which case the uniform budget drives
+    // the lattice.
+    let mut res_seg: Option<(u32, u32)> = None;
+
+    for entry in &doc.freeform_directives {
+        let Some(keyword) = entry.first().map(String::as_str) else {
+            continue;
+        };
+        match keyword {
+            "res" => {
+                // Spec §"res useg vseg": `useg` u-direction, `vseg`
+                // v-direction. `vseg` defaults to `useg` when absent (a
+                // single-value `res` applies isotropically). Clamp each to
+                // the documented 3..=120 range; an unparsable `useg` leaves
+                // the prior state untouched (lenient — verbatim still
+                // round-trips).
+                if let Some(useg) = entry.get(1).and_then(|t| t.parse::<u32>().ok()) {
+                    let useg = useg.clamp(3, 120);
+                    let vseg = entry
+                        .get(2)
+                        .and_then(|t| t.parse::<u32>().ok())
+                        .map(|v| v.clamp(3, 120))
+                        .unwrap_or(useg);
+                    res_seg = Some((useg, vseg));
+                }
+            }
+            "bzp" => {
+                // Spec §"bzp": exactly sixteen control-point indices.
+                let toks = &entry[1..];
+                if toks.len() != 16 {
+                    continue;
+                }
+                let mut grid: Vec<[f32; 3]> = Vec::with_capacity(16);
+                let mut bad = false;
+                for tok in toks {
+                    let Ok(raw) = tok.parse::<i64>() else {
+                        bad = true;
+                        break;
+                    };
+                    let resolved = if raw < 0 { n_pos + 1 + raw } else { raw };
+                    if resolved <= 0 || resolved > n_pos {
+                        bad = true;
+                        break;
+                    }
+                    grid.push(doc.positions[(resolved as usize) - 1]);
+                }
+                if bad || grid.len() != 16 {
+                    continue;
+                }
+
+                // `res` ⇒ isotropic lattice driven from the finer (max) of
+                // the per-direction segment counts; falls back to the
+                // uniform budget when no `res` preceded this patch.
+                let effective_samples = match res_seg {
+                    Some((useg, vseg)) => useg.max(vseg),
+                    None => samples,
+                };
+                // Non-rational ⇒ unit weights; cols = rows = 4 (bicubic).
+                let weights = [1.0f32; 16];
+                let lattice =
+                    sample_bezier_surface(&grid, &weights, "bezier", 4, 4, effective_samples);
+                if lattice.is_empty() {
+                    continue;
+                }
+
+                // Triangulate the (effective_samples + 1)² lattice: two CCW
+                // triangles per cell, spec-front winding (matches the
+                // modern surface tessellator's untrimmed path).
+                let stride = effective_samples as usize + 1;
+                let mut indices: Vec<u32> =
+                    Vec::with_capacity(effective_samples as usize * effective_samples as usize * 6);
+                for sv in 0..effective_samples as usize {
+                    for su in 0..effective_samples as usize {
+                        let i00 = (sv * stride + su) as u32;
+                        let i10 = (sv * stride + su + 1) as u32;
+                        let i01 = ((sv + 1) * stride + su) as u32;
+                        let i11 = ((sv + 1) * stride + su + 1) as u32;
+                        indices.push(i00);
+                        indices.push(i10);
+                        indices.push(i11);
+                        indices.push(i00);
+                        indices.push(i11);
+                        indices.push(i01);
+                    }
+                }
+                let normals = surface_vertex_normals(&lattice, &indices);
+
+                let mut prim = Primitive::new(Topology::Triangles);
+                let n_verts = lattice.len() as u32;
+                prim.positions = lattice;
+                prim.normals = Some(normals);
+                prim.indices = if n_verts > u16::MAX as u32 {
+                    Some(Indices::U32(indices))
+                } else {
+                    Some(Indices::U16(indices.iter().map(|&i| i as u16).collect()))
+                };
+                prim.extras.insert(
+                    "obj:tessellated_curve".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                prim.extras.insert(
+                    "obj:tessellated_surface".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                prim.extras.insert(
+                    "obj:surface_kind".to_string(),
+                    serde_json::Value::String("bzp".to_string()),
+                );
+                // Spec §"bzp": bicubic ⇒ degree 3 in both directions.
+                prim.extras.insert(
+                    "obj:surface_degree".to_string(),
+                    serde_json::Value::Array(vec![
+                        serde_json::Value::from(3u64),
+                        serde_json::Value::from(3u64),
+                    ]),
+                );
+                prim.extras.insert(
+                    "obj:surface_samples".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(effective_samples as u64)),
+                );
+                // When a `res` statement overrode the uniform budget,
+                // surface the source `[useg, vseg]` so a consumer can tell
+                // the spec-driven density apart from the default.
+                if let Some((useg, vseg)) = res_seg {
+                    prim.extras.insert(
+                        "obj:surface_res_seg".to_string(),
+                        serde_json::Value::Array(vec![
+                            serde_json::Value::from(useg as u64),
+                            serde_json::Value::from(vseg as u64),
+                        ]),
+                    );
+                }
+                out.push(prim);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Tessellate every `curv2` 2D trimming / special / connectivity curve
 /// (spec §"curv2") that sits under a supported `cstype` header into a
 /// parameter-space polyline ([`Topology::LineStrip`]).
@@ -7230,6 +7551,34 @@ where
         Vec::new()
     };
 
+    // Superseded Cardinal-curve (`cdc`) tessellation pass (round 353) —
+    // evaluates every superseded `cdc` statement into a cubic Catmull-Rom
+    // LineStrip polyline, honouring the `res useg` segment count (spec
+    // §"Superseded statements" §"cdc", §"res useg vseg"). Gated on the
+    // same `curve_tessellation_samples` knob as the modern curve passes.
+    // The verbatim `cdc` / `res` lines still ride on
+    // `Scene3D::extras["obj:freeform_directives"]` for round-trip; the
+    // encoder filters the synthetic primitives out via the shared
+    // `obj:tessellated_curve` sentinel.
+    let tessellated_superseded_curves = if options.curve_tessellation_samples > 0 {
+        tessellate_superseded_curves(&doc, options.curve_tessellation_samples)
+    } else {
+        Vec::new()
+    };
+
+    // Superseded Bezier-patch (`bzp`) tessellation pass (round 353) —
+    // evaluates every superseded `bzp` 16-point bicubic Bezier patch into
+    // a triangulated `Triangles` mesh with smooth per-vertex normals,
+    // honouring the `res useg vseg` segment counts (spec §"Superseded
+    // statements" §"bzp", §"res useg vseg"). Gated on the same knob as
+    // the modern surface pass; verbatim lines still round-trip via
+    // `obj:freeform_directives`.
+    let tessellated_superseded_surfaces = if options.curve_tessellation_samples > 0 {
+        tessellate_superseded_surfaces(&doc, options.curve_tessellation_samples)
+    } else {
+        Vec::new()
+    };
+
     let mut scene = build_scene(doc)?;
 
     if !tessellated.is_empty() {
@@ -7275,6 +7624,22 @@ where
     if !tessellated_con.is_empty() {
         let mut mesh = Mesh::new(Some("obj:cons".to_string()));
         for prim in tessellated_con {
+            mesh.primitives.push(prim);
+        }
+        scene.add_mesh(mesh);
+    }
+
+    if !tessellated_superseded_curves.is_empty() {
+        let mut mesh = Mesh::new(Some("obj:superseded_curves".to_string()));
+        for prim in tessellated_superseded_curves {
+            mesh.primitives.push(prim);
+        }
+        scene.add_mesh(mesh);
+    }
+
+    if !tessellated_superseded_surfaces.is_empty() {
+        let mut mesh = Mesh::new(Some("obj:superseded_surfaces".to_string()));
+        for prim in tessellated_superseded_surfaces {
             mesh.primitives.push(prim);
         }
         scene.add_mesh(mesh);
