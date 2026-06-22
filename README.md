@@ -55,7 +55,18 @@ modern loaders actually load):
 - `s 1` / `s off` / `s 0` smoothing groups → preserved verbatim in
   `Primitive::extras["obj:smoothing_group"]`; a smoothing-group change
   mid-object splits the primitive so each one carries a single
-  consistent assignment.
+  consistent assignment. The spec calls smoothing groups "a quick way
+  to specify vertex normals", so
+  `ObjDecoder::with_normal_generation(NormalGeneration::FromSmoothingGroups)`
+  (opt-in) synthesises vertex normals for `vn`-less faces: an active
+  group (`s 1`, …) gives smooth area-weighted averaged normals across
+  shared vertices, while smoothing off (`s off` / `s 0` / no `s`) gives
+  faceted per-face normals (vertices de-shared so the hard edge between
+  adjacent faces survives). Explicit `vn` data supersede smoothing
+  groups, so those primitives are untouched. Generated normals are
+  flagged `Primitive::extras["obj:generated_normals"]` (`"smooth"` /
+  `"flat"`) and the encoder skips them, keeping the round-trip
+  `vn`-free.
 - `mtllib <file.mtl> [<file2.mtl> …]` and `usemtl <name>` — each
   `usemtl` switch starts a fresh `Primitive` so a multi-material OBJ
   becomes a `Mesh` with N primitives, each with its own `MaterialId`.
@@ -230,7 +241,10 @@ index syntaxes (1-based, negative-from-end), `l` line elements
 `bevel` / `c_interp` / `d_interp` / `lod` display attributes,
 `mtllib` / `usemtl`, and `maplib` / `usemap`. State-setter directives
 split a primitive on mid-stream change; original n-gon arities are
-preserved so the encoder re-emits polygons rather than triangles.
+preserved so the encoder re-emits polygons rather than triangles. With
+`ObjDecoder::with_normal_generation(…)`, `vn`-less faces get vertex
+normals synthesised from their smoothing-group state (smooth-averaged
+inside a group, faceted when smoothing is off) for direct rendering.
 
 **MTL:** Phong colours (`Ka` / `Kd` / `Ks` / `Ke`, each in plain-RGB /
 `spectral` / `xyz` forms), transparency (`d` / `Tr`, including

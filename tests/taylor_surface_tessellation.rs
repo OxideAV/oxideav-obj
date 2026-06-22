@@ -336,6 +336,7 @@ fn parse_obj_with_options_tessellates_taylor_surface() {
         BILINEAR_TAYLOR_SURF,
         &obj::ParseOptions {
             curve_tessellation_samples: 2,
+            ..Default::default()
         },
         |_| Ok(Vec::new()),
     )

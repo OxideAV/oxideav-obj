@@ -29,6 +29,10 @@ pub struct ObjDecoder {
     /// Free-form curve tessellation sample count (default 0 —
     /// disabled). See [`Self::with_curve_tessellation`].
     curve_tessellation_samples: u32,
+    /// Vertex-normal synthesis policy for `vn`-less polygonal faces.
+    /// Default [`obj::NormalGeneration::Disabled`]. See
+    /// [`Self::with_normal_generation`].
+    generate_normals: obj::NormalGeneration,
 }
 
 impl ObjDecoder {
@@ -80,6 +84,32 @@ impl ObjDecoder {
         self.curve_tessellation_samples = samples;
         self
     }
+
+    /// Synthesise vertex normals for polygonal face primitives that
+    /// carry no `vn` references, honouring the OBJ smoothing-group
+    /// state (spec §"Grouping": smoothing groups are "a quick way to
+    /// specify vertex normals").
+    ///
+    /// Faces in an active smoothing group (`s 1`, `s 2`, …) receive
+    /// smooth, area-weighted averaged normals; faces with smoothing off
+    /// (`s off` / `s 0`, or no `s` directive) receive faceted per-face
+    /// normals (the primitive's vertices are de-shared so the hard edge
+    /// between adjacent faces survives). Primitives that already carry
+    /// explicit `vn` data are left untouched — the spec states explicit
+    /// normals "supersede smoothing groups".
+    ///
+    /// Synthesised normals are flagged `obj:generated_normals` on the
+    /// primitive (value `"smooth"` / `"flat"`) so the encoder re-emits
+    /// the original `vn`-free face syntax rather than fabricating `vn`
+    /// lines on a round-trip.
+    ///
+    /// The default ([`obj::NormalGeneration::Disabled`]) leaves
+    /// `vn`-less primitives with `normals == None`, matching the
+    /// historical behaviour.
+    pub fn with_normal_generation(mut self, mode: obj::NormalGeneration) -> Self {
+        self.generate_normals = mode;
+        self
+    }
 }
 
 impl Mesh3DDecoder for ObjDecoder {
@@ -88,6 +118,7 @@ impl Mesh3DDecoder for ObjDecoder {
             .map_err(|_| oxideav_mesh3d::Error::invalid("OBJ input contained non-UTF-8 bytes"))?;
         let options = obj::ParseOptions {
             curve_tessellation_samples: self.curve_tessellation_samples,
+            generate_normals: self.generate_normals,
         };
         obj::parse_obj_with_options(text, &options, |_path| Ok(Vec::new()))
     }

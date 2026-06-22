@@ -890,7 +890,7 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
 /// per-primitive interleaved-attribute model). Original face arities
 /// are stored in `Mesh::extras["obj:original_face_arities"]` so the
 /// encoder can reconstruct the n-gons.
-fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
+fn build_scene(doc: ObjDoc, generate_normals: NormalGeneration) -> Result<Scene3D> {
     use oxideav_mesh3d::{Axis, Material, Unit};
 
     let mut scene = Scene3D::new();
@@ -1006,6 +1006,7 @@ fn build_scene(doc: ObjDoc) -> Result<Scene3D> {
                 &doc.texcoords,
                 &doc.normals,
                 &material_ids,
+                generate_normals,
             )?;
             // Skip primitives that never accumulated any element.
             if primitive.positions.is_empty() {
@@ -7170,6 +7171,7 @@ fn single_line_topology(elements: &[Element]) -> Topology {
 /// per face (3 for a triangle, 4 for a quad, ≥5 for an n-gon). Lines
 /// don't contribute arity entries (the encoder switches on topology
 /// instead).
+#[allow(clippy::too_many_arguments)]
 fn build_primitive(
     prim_acc: &PrimAccum,
     positions: &[[f32; 3]],
@@ -7178,6 +7180,7 @@ fn build_primitive(
     texcoords: &[[f32; 2]],
     normals: &[[f32; 3]],
     material_ids: &HashMap<String, oxideav_mesh3d::MaterialId>,
+    generate_normals: NormalGeneration,
 ) -> Result<(Primitive, Vec<u32>)> {
     // Decide topology + attribute presence by looking at the first
     // element. Mixed-element primitives (lines + faces under one
@@ -7485,7 +7488,152 @@ fn build_primitive(
         );
     }
 
+    // Smoothing-group-driven normal synthesis (opt-in). Only applies to
+    // polygonal `Triangles` primitives that carry no `vn` data of their
+    // own — explicit normals "supersede smoothing groups" per spec
+    // §"Vertex normals", so `has_normal` primitives are never touched.
+    if generate_normals == NormalGeneration::FromSmoothingGroups
+        && topology == Topology::Triangles
+        && !has_normal
+        && !prim.positions.is_empty()
+    {
+        let smooth = smoothing_is_active(prim_acc.smoothing_group.as_deref());
+        generate_face_normals(&mut prim, smooth);
+        // Flag the synthesised normals so a decode → encode round-trip
+        // doesn't fabricate `vn` lines the source file never carried.
+        // The encoder skips the `vn` pool contribution for primitives
+        // bearing this marker, re-emitting the original `vn`-free face
+        // syntax. The `"smooth"` / `"flat"` value records which shading
+        // mode produced them for consumers that want to know.
+        prim.extras.insert(
+            "obj:generated_normals".to_string(),
+            serde_json::Value::String(if smooth { "smooth" } else { "flat" }.to_string()),
+        );
+    }
+
     Ok((prim, arities))
+}
+
+/// Decide whether a smoothing-group token enables smooth shading.
+///
+/// Per spec §"Grouping", `s 0` and `s off` both turn smoothing off; any
+/// non-zero integer group enables it. `None` (no `s` directive seen)
+/// also means faceted shading — the spec default group is off.
+fn smoothing_is_active(token: Option<&str>) -> bool {
+    match token {
+        None => false,
+        Some(t) => {
+            let t = t.trim();
+            !(t.eq_ignore_ascii_case("off") || t == "0")
+        }
+    }
+}
+
+/// Synthesise vertex normals for a triangulated `Primitive` that has no
+/// `vn` data, per the smoothing-group state.
+///
+/// * `smooth == true`: accumulate area-weighted face normals onto the
+///   existing shared vertices and renormalise. Positions shared between
+///   triangles receive one averaged normal — the smooth-shaded look.
+///
+/// * `smooth == false`: faceted. The index buffer is rebuilt so every
+///   triangle owns three unique vertices (positions / uvs / colours are
+///   duplicated as needed), then each corner gets that triangle's own
+///   geometric normal. Adjacent faces no longer share a vertex, so a
+///   hard edge is preserved.
+fn generate_face_normals(prim: &mut Primitive, smooth: bool) {
+    let tri_indices: Vec<u32> = match &prim.indices {
+        Some(Indices::U16(v)) => v.iter().map(|&i| i as u32).collect(),
+        Some(Indices::U32(v)) => v.clone(),
+        None => (0..prim.positions.len() as u32).collect(),
+    };
+    if tri_indices.len() < 3 {
+        return;
+    }
+
+    if smooth {
+        let normals = surface_vertex_normals(&prim.positions, &tri_indices);
+        prim.normals = Some(normals);
+        return;
+    }
+
+    // Faceted: re-expand to one vertex per triangle corner so the hard
+    // edge between adjacent faces survives. Build fresh parallel
+    // attribute buffers indexed [0, 1, 2, …].
+    let has_uv = !prim.uvs.is_empty();
+    let has_color = !prim.colors.is_empty();
+
+    let mut new_positions: Vec<[f32; 3]> = Vec::with_capacity(tri_indices.len());
+    let mut new_uvs: Vec<[f32; 2]> = Vec::with_capacity(if has_uv { tri_indices.len() } else { 0 });
+    let mut new_colors: Vec<[f32; 4]> =
+        Vec::with_capacity(if has_color { tri_indices.len() } else { 0 });
+    let mut new_normals: Vec<[f32; 3]> = Vec::with_capacity(tri_indices.len());
+    let mut new_indices: Vec<u32> = Vec::with_capacity(tri_indices.len());
+
+    for tri in tri_indices.chunks_exact(3) {
+        let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        let (Some(&pa), Some(&pb), Some(&pc)) = (
+            prim.positions.get(a),
+            prim.positions.get(b),
+            prim.positions.get(c),
+        ) else {
+            continue;
+        };
+        let e1 = [
+            (pb[0] - pa[0]) as f64,
+            (pb[1] - pa[1]) as f64,
+            (pb[2] - pa[2]) as f64,
+        ];
+        let e2 = [
+            (pc[0] - pa[0]) as f64,
+            (pc[1] - pa[1]) as f64,
+            (pc[2] - pa[2]) as f64,
+        ];
+        let n = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        let fn_unit = if len > 1e-12 {
+            [
+                (n[0] / len) as f32,
+                (n[1] / len) as f32,
+                (n[2] / len) as f32,
+            ]
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+
+        for &src in &[a, b, c] {
+            let base = new_positions.len() as u32;
+            new_positions.push(prim.positions[src]);
+            if has_uv {
+                new_uvs.push(prim.uvs[0][src]);
+            }
+            if has_color {
+                new_colors.push(prim.colors[0][src]);
+            }
+            new_normals.push(fn_unit);
+            new_indices.push(base);
+        }
+    }
+
+    prim.positions = new_positions;
+    if has_uv {
+        prim.uvs[0] = new_uvs;
+    }
+    if has_color {
+        prim.colors[0] = new_colors;
+    }
+    prim.normals = Some(new_normals);
+    if new_indices.iter().any(|&i| i >= u16::MAX as u32) {
+        prim.indices = Some(Indices::U32(new_indices));
+    } else {
+        prim.indices = Some(Indices::U16(
+            new_indices.into_iter().map(|i| i as u16).collect(),
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7520,6 +7668,65 @@ pub struct ParseOptions {
     ///
     /// `0` disables tessellation (the default; back-compat with r1-r6).
     pub curve_tessellation_samples: u32,
+
+    /// Synthesise vertex normals for polygonal face primitives that
+    /// carry no `vn` references of their own.
+    ///
+    /// The spec (§"Grouping", `s group_number`) describes smoothing
+    /// groups as "a quick way to specify vertex normals": elements in
+    /// the same smoothing group have their normals interpolated to give
+    /// a smooth, non-faceted appearance, while elements with smoothing
+    /// turned off (`s off` / `s 0`, or no `s` directive at all) are
+    /// rendered faceted. Explicit `vn` data "supersede smoothing
+    /// groups" (§"Vertex normals") so a primitive that already carries
+    /// normals is left untouched regardless of this knob.
+    ///
+    /// See [`NormalGeneration`] for the per-mode behaviour.
+    /// [`NormalGeneration::Disabled`] (the default) preserves the
+    /// historical behaviour of leaving `Primitive::normals == None`
+    /// for `vn`-less faces.
+    pub generate_normals: NormalGeneration,
+}
+
+/// Vertex-normal synthesis policy for polygonal faces with no `vn`
+/// data, honouring the OBJ smoothing-group state.
+///
+/// Each [`Primitive`] is already split so it carries one consistent
+/// smoothing-group token in `extras["obj:smoothing_group"]` (a change
+/// mid-object starts a fresh primitive), so the synthesis decision is
+/// per-primitive: a primitive whose smoothing group is active gets
+/// smooth normals; one with smoothing off (or no `s` directive) gets
+/// faceted normals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NormalGeneration {
+    /// Leave `Primitive::normals == None` for faces with no `vn`
+    /// references (the default; back-compat with the captured-only
+    /// behaviour through round 360).
+    #[default]
+    Disabled,
+
+    /// Generate vertex normals from face geometry, switching between
+    /// smooth and faceted shading per the primitive's smoothing-group
+    /// token:
+    ///
+    ///   * **Smoothing active** (`s 1`, `s 2`, … — any non-zero group):
+    ///     area-weighted face normals are accumulated onto each shared
+    ///     vertex and renormalised, so positions shared between
+    ///     triangles receive a single averaged normal. This is the
+    ///     spec's "normals are interpolated to give a smooth,
+    ///     non-faceted appearance".
+    ///
+    ///   * **Smoothing off** (`s off`, `s 0`, or no `s` directive): the
+    ///     primitive is faceted. Triangles no longer share vertices —
+    ///     each triangle's three corners receive that triangle's own
+    ///     geometric normal — so a hard edge is preserved between
+    ///     adjacent faces. Index/position/uv/colour buffers are
+    ///     re-expanded to one vertex per triangle corner.
+    ///
+    /// Only `Topology::Triangles` primitives without `vn` data are
+    /// affected; lines, points, and primitives that already carry
+    /// explicit normals are left exactly as before.
+    FromSmoothingGroups,
 }
 
 /// Parse an OBJ document (no MTL resolution).
@@ -7711,7 +7918,7 @@ where
         Vec::new()
     };
 
-    let mut scene = build_scene(doc)?;
+    let mut scene = build_scene(doc, options.generate_normals)?;
 
     if !tessellated.is_empty() {
         let mut mesh = Mesh::new(Some("obj:curves".to_string()));
@@ -8045,7 +8252,13 @@ pub fn serialize_obj_with_options(
                 continue;
             }
             let has_uv = !prim.uvs.is_empty();
-            let has_normal = prim.normals.is_some();
+            // Normals synthesised at decode time from smoothing groups
+            // (flagged `obj:generated_normals`) are derived data — the
+            // source file carried no `vn`, so we must not re-emit them
+            // or the round-trip would fabricate `vn` lines and `v//vn`
+            // face syntax that never existed in the input.
+            let has_normal =
+                prim.normals.is_some() && !prim.extras.contains_key("obj:generated_normals");
             let has_color = !prim.colors.is_empty();
             // Per-vertex bitmap saying "did the source spell out RGB on
             // this vertex?". Missing extras / no-colors-set means every
@@ -8283,7 +8496,11 @@ pub fn serialize_obj_with_options(
 
             let prim_globals = &global_indices[mi][pi];
             let has_uv = !prim.uvs.is_empty();
-            let has_normal = prim.normals.is_some();
+            // Mirror the global-pool guard: decode-time synthesised
+            // normals (flagged `obj:generated_normals`) are not re-emitted,
+            // so the faces keep their original `vn`-free syntax.
+            let has_normal =
+                prim.normals.is_some() && !prim.extras.contains_key("obj:generated_normals");
 
             // Build the per-element index iterator. For Triangles topology
             // re-shape into n-gons via `arities` if present; otherwise emit

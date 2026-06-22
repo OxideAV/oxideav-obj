@@ -27,6 +27,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 361: opt-in vertex-normal synthesis from smoothing groups via
+  `ObjDecoder::with_normal_generation(NormalGeneration::FromSmoothingGroups)`
+  (or `ParseOptions::generate_normals`). The spec (§"Grouping",
+  `s group_number`) describes smoothing groups as "a quick way to
+  specify vertex normals": for a polygonal face primitive carrying no
+  `vn` data of its own, an active smoothing group (`s 1`, `s 2`, …)
+  yields smooth, area-weighted averaged normals across shared vertices,
+  while smoothing off (`s off` / `s 0`, or no `s` directive) yields
+  faceted per-face normals — the primitive's vertices are de-shared so
+  the hard edge between adjacent faces survives. Explicit `vn` data
+  "supersede smoothing groups" (§"Vertex normals"), so primitives that
+  already carry normals are left untouched. Synthesised normals are
+  flagged `Primitive::extras["obj:generated_normals"]` (`"smooth"` /
+  `"flat"`); the encoder skips them so a decode → encode round-trip
+  keeps the original `vn`-free face syntax rather than fabricating `vn`
+  lines. The default (`NormalGeneration::Disabled`) preserves the prior
+  behaviour of leaving `vn`-less primitives with `normals == None`.
+
 - Round 353: typed `Scene3D::extras["obj:superseded"]` accessor — a
   parse-time-only decomposition of every superseded geometry statement
   (`bzp` / `bsp` Bezier / B-spline patch, `cdc` Cardinal curve, `cdp`
