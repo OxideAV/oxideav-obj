@@ -43,7 +43,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"flat"`); the encoder skips them so a decode → encode round-trip
   keeps the original `vn`-free face syntax rather than fabricating `vn`
   lines. The default (`NormalGeneration::Disabled`) preserves the prior
-  behaviour of leaving `vn`-less primitives with `normals == None`.
+  behaviour of leaving `vn`-less primitives with `normals == None`. The
+  same opt-in also backfills the degenerate `[0,0,0]` placeholder
+  normals left for a primitive that mixes `vn`-bearing and `vn`-less
+  faces (spec-illegal per §"f" but produced by lenient tools): the zero
+  placeholders are filled from the triangulated face geometry while
+  explicit normals are preserved exactly, so the buffer carries no
+  degenerate normals for rendering.
 
 - Round 353: typed `Scene3D::extras["obj:superseded"]` accessor — a
   parse-time-only decomposition of every superseded geometry statement

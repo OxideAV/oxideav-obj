@@ -274,3 +274,50 @@ f 3 4 6 5
     assert!(!scene2.meshes.is_empty());
     assert!(scene2.meshes[0].primitives[0].normals.is_none());
 }
+
+/// A primitive that mixes `vn`-bearing and `vn`-less faces (spec-illegal
+/// per §"f", but produced by lenient tools) leaves `[0,0,0]` placeholder
+/// normals by default. With normal generation enabled, the zero
+/// placeholders are backfilled from geometry while explicit normals are
+/// preserved exactly.
+#[test]
+fn partial_normals_backfilled_without_generation_default_leaves_zeros() {
+    let text = "\
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 2 0 0
+v 2 1 0
+vn 0 0 1
+f 1//1 2//1 3//1
+f 2 4 5
+";
+    // Default decoder: the `vn`-less face's vertices carry a zero normal.
+    let scene = obj::parse_obj(text).unwrap();
+    let prim = &scene.meshes[0].primitives[0];
+    let normals = prim.normals.as_ref().expect("has_normal primitive");
+    assert!(
+        normals.contains(&[0.0, 0.0, 0.0]),
+        "expected a zero placeholder normal in the default decode",
+    );
+
+    // With generation: zeros are backfilled, explicit (0,0,1) preserved.
+    let scene2 = ObjDecoder::new()
+        .with_normal_generation(NormalGeneration::FromSmoothingGroups)
+        .decode(text.as_bytes())
+        .unwrap();
+    let prim2 = &scene2.meshes[0].primitives[0];
+    let normals2 = prim2.normals.as_ref().unwrap();
+    assert!(
+        !normals2.contains(&[0.0, 0.0, 0.0]),
+        "zero placeholders should be backfilled: {normals2:?}",
+    );
+    // The explicitly-specified normal is still present unchanged.
+    assert!(
+        normals2.contains(&[0.0, 0.0, 1.0]),
+        "explicit normal must be preserved: {normals2:?}",
+    );
+    // Backfilled mixed primitive is NOT flagged generated (round-trip
+    // still emits `v//vn` because explicit normals exist).
+    assert!(!prim2.extras.contains_key("obj:generated_normals"));
+}

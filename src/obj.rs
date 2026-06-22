@@ -7494,21 +7494,36 @@ fn build_primitive(
     // §"Vertex normals", so `has_normal` primitives are never touched.
     if generate_normals == NormalGeneration::FromSmoothingGroups
         && topology == Topology::Triangles
-        && !has_normal
         && !prim.positions.is_empty()
     {
-        let smooth = smoothing_is_active(prim_acc.smoothing_group.as_deref());
-        generate_face_normals(&mut prim, smooth);
-        // Flag the synthesised normals so a decode → encode round-trip
-        // doesn't fabricate `vn` lines the source file never carried.
-        // The encoder skips the `vn` pool contribution for primitives
-        // bearing this marker, re-emitting the original `vn`-free face
-        // syntax. The `"smooth"` / `"flat"` value records which shading
-        // mode produced them for consumers that want to know.
-        prim.extras.insert(
-            "obj:generated_normals".to_string(),
-            serde_json::Value::String(if smooth { "smooth" } else { "flat" }.to_string()),
-        );
+        if !has_normal {
+            let smooth = smoothing_is_active(prim_acc.smoothing_group.as_deref());
+            generate_face_normals(&mut prim, smooth);
+            // Flag the synthesised normals so a decode → encode round-trip
+            // doesn't fabricate `vn` lines the source file never carried.
+            // The encoder skips the `vn` pool contribution for primitives
+            // bearing this marker, re-emitting the original `vn`-free face
+            // syntax. The `"smooth"` / `"flat"` value records which shading
+            // mode produced them for consumers that want to know.
+            prim.extras.insert(
+                "obj:generated_normals".to_string(),
+                serde_json::Value::String(if smooth { "smooth" } else { "flat" }.to_string()),
+            );
+        } else {
+            // Partial-normal primitive: some face-vertices referenced a
+            // `vn` and others didn't (each `vn == 0` placeholder pushed a
+            // zero normal). The spec calls this an illegal mix
+            // (§"f" — "it is illegal to give vertex normals for some
+            // vertices, but not all"), but lenient real-world files do
+            // it. Backfill only the zero-length placeholders from the
+            // triangulated face geometry so the primitive has no
+            // degenerate `[0,0,0]` normals for rendering; the explicit
+            // normals are left untouched. Round-trip of an
+            // already-illegal file is best-effort (the encoder still
+            // emits the primitive in `v//vn` form once any normal is
+            // present), so no `obj:generated_normals` flag is set here.
+            backfill_zero_normals(&mut prim);
+        }
     }
 
     Ok((prim, arities))
@@ -7633,6 +7648,40 @@ fn generate_face_normals(prim: &mut Primitive, smooth: bool) {
         prim.indices = Some(Indices::U16(
             new_indices.into_iter().map(|i| i as u16).collect(),
         ));
+    }
+}
+
+/// Replace zero-length placeholder normals (the `[0,0,0]` pushed for a
+/// `vn == 0` face-vertex inside an otherwise-normal-bearing primitive)
+/// with smooth area-weighted normals derived from the triangulated
+/// geometry. Explicit, already-non-zero normals are preserved exactly.
+///
+/// Used for the spec-illegal "some vertices have normals, some don't"
+/// case (§"f") under opt-in normal generation, so a lenient input
+/// doesn't leave degenerate `[0,0,0]` normals in the buffer.
+fn backfill_zero_normals(prim: &mut Primitive) {
+    let Some(existing) = prim.normals.as_ref() else {
+        return;
+    };
+    let zero_present = existing
+        .iter()
+        .any(|n| n[0] == 0.0 && n[1] == 0.0 && n[2] == 0.0);
+    if !zero_present {
+        return;
+    }
+    let tri_indices: Vec<u32> = match &prim.indices {
+        Some(Indices::U16(v)) => v.iter().map(|&i| i as u32).collect(),
+        Some(Indices::U32(v)) => v.clone(),
+        None => (0..prim.positions.len() as u32).collect(),
+    };
+    let geo = surface_vertex_normals(&prim.positions, &tri_indices);
+    let normals = prim.normals.as_mut().unwrap();
+    for (i, n) in normals.iter_mut().enumerate() {
+        if n[0] == 0.0 && n[1] == 0.0 && n[2] == 0.0 {
+            if let Some(&g) = geo.get(i) {
+                *n = g;
+            }
+        }
     }
 }
 
