@@ -128,6 +128,24 @@ struct ObjDoc {
     /// as the canonical "widely used but never standardised" extension.
     position_colors: Vec<Option<[f32; 4]>>,
     texcoords: Vec<[f32; 2]>,
+    /// Original token width of each parallel `vt` entry (1, 2, or 3) —
+    /// how many coordinates the operator actually wrote on the `vt`
+    /// line. Spec §"vt u v w": `v` and `w` are both optional and both
+    /// default to `0`. The `texcoords` storage above keeps only the
+    /// 2D `[u, v]` pair the polygonal renderer needs, so a 1D `vt u`
+    /// line (which collapses to `vt u 0`) and a 3D `vt u v w` line
+    /// (whose `w` depth coordinate is otherwise discarded) would both
+    /// re-emit as `vt u v`, corrupting the round-trip. Tracking the
+    /// real width here — paired with `texcoord_w` for the dropped 3rd
+    /// component — makes decode → encode byte-faithful for the full
+    /// 1D / 2D / 3D `vt` mix. Parallel to `texcoords` (same length).
+    texcoord_widths: Vec<u8>,
+    /// The optional 3rd `w` (depth) component of each `vt u v w` line
+    /// (spec §"vt u v w"), captured verbatim so a 3D texture coordinate
+    /// re-emits exactly. `0.0` for the 1D / 2D forms that omitted it
+    /// (the spec default). Parallel to `texcoords` (same length); only
+    /// meaningful where the parallel `texcoord_widths` entry is `3`.
+    texcoord_w: Vec<f32>,
     normals: Vec<[f32; 3]>,
     /// Parameter-space vertices (`vp u v [w]`) from the free-form
     /// geometry portion of the spec — 1-based numbering, parallel to
@@ -352,8 +370,19 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 }
                 let u = coords[0];
                 let v = coords.get(1).copied().unwrap_or(0.0);
-                // Drop optional 3rd `w` — meaningless to glTF UV.
+                // The polygonal pool keeps only `[u, v]` — the 3rd `w`
+                // depth coordinate is meaningless to a glTF UV. But spec
+                // §"vt u v w" makes both `v` and `w` optional (default
+                // `0`), so a 1D `vt u` and a 3D `vt u v w` would both
+                // collapse to `vt u v` on re-emit. Record the source
+                // token width (clamped to the 1..=3 the spec allows) and
+                // the dropped `w` so the encoder reproduces the exact
+                // arity. Parallel to `texcoords`.
+                let width = coords.len().clamp(1, 3) as u8;
+                let w = coords.get(2).copied().unwrap_or(0.0);
                 doc.texcoords.push([u, v]);
+                doc.texcoord_widths.push(width);
+                doc.texcoord_w.push(w);
             }
             "vn" => {
                 let coords: Vec<f32> = tokens
@@ -1082,6 +1111,38 @@ fn build_scene(doc: ObjDoc, generate_normals: NormalGeneration) -> Result<Scene3
             scene.extras.insert(
                 "obj:position_colors".to_string(),
                 serde_json::to_value(&doc.position_colors).unwrap(),
+            );
+        }
+    }
+
+    // Byte-faithful `vt` re-emission side-channel. The encoder dedupes
+    // texture coordinates into a 2D `[u, v]` pool, which loses both the
+    // original token width (1D `vt u` / 2D `vt u v` / 3D `vt u v w`)
+    // and the 3rd `w` depth coordinate. When any source `vt` line was
+    // 1D or 3D (i.e. not the canonical 2-token form), surface the full
+    // source pool — the 1-based parallel `[u, v]` values plus a
+    // parallel width vector and the dropped `w` vector — so the encoder
+    // can reproduce the exact arity instead of normalising every line
+    // to `vt u v`. A scene whose `vt` lines were all 2D leaves the keys
+    // absent and the encoder's canonical 2-token emit stays faithful.
+    if !doc.texcoords.is_empty() && doc.texcoord_widths.iter().any(|&w| w != 2) {
+        scene.extras.insert(
+            "obj:texcoords".to_string(),
+            serde_json::to_value(&doc.texcoords).unwrap(),
+        );
+        scene.extras.insert(
+            "obj:texcoord_widths".to_string(),
+            serde_json::to_value(&doc.texcoord_widths).unwrap(),
+        );
+        if doc
+            .texcoord_widths
+            .iter()
+            .zip(doc.texcoord_w.iter())
+            .any(|(&width, &w)| width == 3 && w != 0.0)
+        {
+            scene.extras.insert(
+                "obj:texcoord_w".to_string(),
+                serde_json::to_value(&doc.texcoord_w).unwrap(),
             );
         }
     }
@@ -8278,6 +8339,59 @@ pub fn serialize_obj_with_options(
         }
     }
 
+    // Seed the texcoord pool with `obj:texcoords` if present — the
+    // 1-based source `vt` coordinates captured on decode. Only emitted
+    // when the source carried a non-2D `vt` line (1D `vt u` or 3D
+    // `vt u v w`), which the canonical `vt u v` emit can't reproduce.
+    // Seeding here keeps the 1-based numbering identical to the source
+    // so `f v/vt` references stay valid, and lets the emit loop below
+    // reproduce each line's exact arity from the parallel width / w
+    // vectors. (`obj:texcoord_w` is omitted when every 3D line's `w`
+    // was a genuine `0`, so it can be absent even with widths present.)
+    let src_texcoord_widths: Vec<u8> = scene
+        .extras
+        .get("obj:texcoord_widths")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|v| v.as_u64().map(|n| n as u8).unwrap_or(2))
+                .collect()
+        })
+        .unwrap_or_default();
+    let src_texcoord_w: Vec<f32> = scene
+        .extras
+        .get("obj:texcoord_w")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|v| v.as_f64().map(|f| f as f32).unwrap_or(0.0))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(serde_json::Value::Array(src_texcoords)) = scene.extras.get("obj:texcoords") {
+        // Seed the pool 1:1 with the source `vt` order (no dedup) so the
+        // parallel `src_texcoord_widths` / `src_texcoord_w` vectors line
+        // up index-for-index with the pool — two `vt` lines that share
+        // `[u, v]` but differ in `w` (3D depth) must stay distinct slots
+        // or the width/w vectors would drift. `tex_map` registers only
+        // the *first* slot per `[u, v]` so face-UV lookups below still
+        // resolve to a canonical index (rendering treats UVs by value,
+        // not by source line).
+        for tv in src_texcoords {
+            let serde_json::Value::Array(coords) = tv else {
+                continue;
+            };
+            let mut t = [0.0_f32; 2];
+            for (j, c) in coords.iter().enumerate().take(2) {
+                t[j] = c.as_f64().map(|f| f as f32).unwrap_or(0.0);
+            }
+            texcoords.push(t);
+            tex_map
+                .entry(KeyVec2::from(t))
+                .or_insert(texcoords.len() as u32);
+        }
+    }
+
     // First pass: emit `v` / `vt` / `vn` lists and remember the global
     // indices for each (mesh, primitive, vertex) triple.
     //
@@ -8444,8 +8558,27 @@ pub fn serialize_obj_with_options(
             }
         }
     }
-    for t in &texcoords {
-        writeln!(out, "vt {} {}", fmt_float(t[0]), fmt_float(t[1])).unwrap();
+    for (ti, t) in texcoords.iter().enumerate() {
+        // Source-recorded arity wins for the seeded entries (the leading
+        // run of the pool that came from `obj:texcoords`); pooled
+        // texcoords beyond that — interned only from primitive UVs, with
+        // no source `vt` line — default to the canonical 2-token form.
+        let width = src_texcoord_widths.get(ti).copied().unwrap_or(2);
+        match width {
+            1 => writeln!(out, "vt {}", fmt_float(t[0])).unwrap(),
+            3 => {
+                let w = src_texcoord_w.get(ti).copied().unwrap_or(0.0);
+                writeln!(
+                    out,
+                    "vt {} {} {}",
+                    fmt_float(t[0]),
+                    fmt_float(t[1]),
+                    fmt_float(w)
+                )
+                .unwrap()
+            }
+            _ => writeln!(out, "vt {} {}", fmt_float(t[0]), fmt_float(t[1])).unwrap(),
+        }
     }
     for n in &normals {
         writeln!(

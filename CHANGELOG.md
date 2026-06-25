@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Round 370: `vt` texture-coordinate re-emission is now byte-faithful
+  for the 1D and 3D forms. Spec §"vt u v w" makes both `v` and `w`
+  optional (each defaulting to `0`): a 1D texture writes `vt u`, a 2D
+  texture `vt u v`, and a 3D texture `vt u v w`. The polygonal pool
+  keeps only the `[u, v]` pair a glTF UV can carry, so the decoder
+  previously collapsed every line to the canonical `vt u v` form — a
+  `vt 0.25` re-emitted as `vt 0.25 0` and a `vt u v w` dropped its `w`
+  depth coordinate entirely. The decoder now records each line's source
+  token width into `Scene3D::extras["obj:texcoord_widths"]` (a vector
+  parallel to the new `obj:texcoords` source pool) and the dropped 3rd
+  `w` into `["obj:texcoord_w"]`; the encoder seeds its texture-coordinate
+  pool from that source pool (1:1, un-deduplicated so two `vt` lines that
+  share `[u, v]` but differ in `w` stay distinct slots) and re-emits each
+  line at its exact arity. Decode → encode is now a fixed point for the
+  full 1D / 2D / 3D `vt` mix. Files whose `vt` lines were all 2D leave
+  the new keys absent and keep the prior canonical 2-token emit, so the
+  common case is unchanged; scenes assembled without going through the
+  decoder (no `obj:texcoords` key) likewise keep the 2-token emit.
+
 - Round 345: `vp` parameter-space-vertex re-emission is now
   byte-faithful for lines whose trailing (or middle) coordinate is a
   genuine zero. The decoder pads every `vp` entry to a `[u, v, w]`

@@ -12,7 +12,14 @@ modern loaders actually load):
 - `v` / `vt` / `vn` vertex data — with the optional `w` 4th component on
   positions (rational weight per spec §"v x y z w" — preserved verbatim
   through `Primitive::extras["obj:vertex_weight"]`) and the optional
-  `v` / `w` extra components on UVs. The widely-deployed MeshLab /
+  `v` / `w` extra components on UVs. Texture coordinates round-trip
+  byte-faithfully across the full 1D / 2D / 3D range per spec §"vt u v w"
+  (both `v` and `w` are optional, defaulting to `0`): each `vt` line's
+  source token width rides on `Scene3D::extras["obj:texcoord_widths"]`
+  (parallel to the `obj:texcoords` source pool) and the otherwise-dropped
+  3rd `w` depth coordinate on `["obj:texcoord_w"]`, so a `vt 0.25` (1D)
+  re-emits as one token and a `vt u v w` (3D) keeps its depth rather than
+  both collapsing onto the canonical `vt u v`. The widely-deployed MeshLab /
   libigl / Meshroom / OpenCV `v x y z r g b` per-vertex-colour
   extension is accepted at parse time, surfaced through
   `Primitive::colors[0]` (alpha pinned to 1.0 since the extension only
