@@ -20,10 +20,15 @@
 //! mixing the directive families this crate handles: header comments,
 //! `v` (3/4/6/7-wide), `vt` (1/2/3-wide), `vn`, faces in all four index
 //! syntaxes with both positive and negative indices, `l` / `p` elements,
-//! `g` / `o` / `s` / `usemtl` / `usemap` / `mg` state-setters, the
-//! display attributes, and a free-form `vp` + `cstype … end` block. Seeds
-//! 0..N give a broad, reproducible corpus; any failure prints the exact
-//! generating seed and the diverging document for a one-line repro.
+//! `g` / `o` / `s` / `usemtl` / `usemap` (incl. `off`) / `mg` /
+//! `c_interp` / `d_interp` / `bevel` / `lod` state-setters, and a
+//! free-form `vp` + `cstype … end` block spanning every basis kind
+//! (`bezier` / `bspline` / `cardinal` / `taylor`, rational and not) with
+//! `curv` / `surf` / `parm` / `scrv` / `sp` / `trim` / `hole` body
+//! statements. The 2000-seed corpus is reproducible; any failure prints
+//! the exact generating seed and the diverging document for a one-line
+//! repro. This harness has already caught two real round-trip bugs (the
+//! duplicate-value `vt` index drift and the `g` state-setting split).
 
 use oxideav_obj::obj;
 
@@ -202,9 +207,11 @@ fn gen_obj(seed: u64) -> String {
         }
     }
 
-    // Optional free-form block: parameter-space vertices + a cstype curve.
+    // Optional free-form block: parameter-space vertices + a cstype
+    // curve or surface, with assorted body statements (these ride on the
+    // verbatim `obj:freeform_directives` channel and must replay exactly).
     if r.chance(2) {
-        let n_vp = 2 + r.below(3);
+        let n_vp = 2 + r.below(4);
         for _ in 0..n_vp {
             match r.below(3) {
                 0 => doc.push_str(&format!("vp {}\n", r.coord())),
@@ -212,16 +219,49 @@ fn gen_obj(seed: u64) -> String {
                 _ => doc.push_str(&format!("vp {} {} {}\n", r.coord(), r.coord(), r.coord())),
             }
         }
-        doc.push_str("cstype bezier\n");
-        doc.push_str("deg 3\n");
-        doc.push_str(&format!(
-            "curv 0.0 1.0 {} {} {} {}\n",
-            pick(&mut r, n_v),
-            pick(&mut r, n_v),
-            pick(&mut r, n_v),
-            pick(&mut r, n_v)
-        ));
-        doc.push_str("parm u 0.0 1.0\n");
+        let rat = if r.chance(2) { "rat " } else { "" };
+        let basis = match r.below(4) {
+            0 => "bezier",
+            1 => "bspline",
+            2 => "cardinal",
+            _ => "taylor",
+        };
+        doc.push_str(&format!("cstype {rat}{basis}\n"));
+        doc.push_str(&format!("deg {}\n", 1 + r.below(3)));
+        if r.chance(2) {
+            // A 3D space curve plus a couple of body statements.
+            doc.push_str(&format!(
+                "curv 0.0 1.0 {} {} {} {}\n",
+                pick(&mut r, n_v),
+                pick(&mut r, n_v),
+                pick(&mut r, n_v),
+                pick(&mut r, n_v)
+            ));
+            doc.push_str("parm u 0.0 0.5 1.0\n");
+            if r.chance(2) {
+                doc.push_str(&format!("scrv 0.1 0.9 {}\n", pick(&mut r, n_vp)));
+            }
+            if r.chance(2) {
+                doc.push_str(&format!("sp {}\n", pick(&mut r, n_vp)));
+            }
+        } else {
+            // A surface plus a trim / hole loop referencing curv2 indices.
+            doc.push_str(&format!(
+                "surf 0.0 1.0 0.0 1.0 {} {} {} {}\n",
+                pick(&mut r, n_v),
+                pick(&mut r, n_v),
+                pick(&mut r, n_v),
+                pick(&mut r, n_v)
+            ));
+            doc.push_str("parm u 0.0 1.0\n");
+            doc.push_str("parm v 0.0 1.0\n");
+            if r.chance(2) {
+                doc.push_str(&format!("trim 0.0 1.0 {}\n", 1 + r.below(2)));
+            }
+            if r.chance(3) {
+                doc.push_str(&format!("hole 0.0 1.0 {}\n", 1 + r.below(2)));
+            }
+        }
         doc.push_str("end\n");
     }
 
@@ -232,7 +272,8 @@ fn gen_obj(seed: u64) -> String {
 fn decode_encode_is_a_textual_fixed_point_over_generated_corpus() {
     let mut checked = 0u32;
     let mut decodable = 0u32;
-    for seed in 0..600u64 {
+    const SEEDS: u64 = 2000;
+    for seed in 0..SEEDS {
         let input = gen_obj(seed);
         // The input is decodable by construction; if it isn't, that's a
         // generator bug we want to see surfaced, not silently skipped —
@@ -259,10 +300,13 @@ fn decode_encode_is_a_textual_fixed_point_over_generated_corpus() {
         checked += 1;
     }
     // Sanity: the generator must actually exercise the codec, not produce
-    // an all-rejected corpus that vacuously passes.
+    // an all-rejected corpus that vacuously passes. Empirically the
+    // generator yields a decodable document for the large majority of
+    // seeds; require a healthy fraction so a regression that starts
+    // rejecting valid inputs can't make the test pass vacuously.
     assert!(
-        decodable > 500,
-        "generator produced too few decodable documents ({decodable}/600)"
+        decodable > SEEDS as u32 * 3 / 4,
+        "generator produced too few decodable documents ({decodable}/{SEEDS})"
     );
-    assert!(checked > 500, "too few fixed-point checks ran ({checked})");
+    assert!(checked == decodable, "every decodable doc must be checked");
 }
