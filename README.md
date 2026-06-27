@@ -59,6 +59,9 @@ modern loaders actually load):
   file has no `o`).
 - `g name1 name2 …` → multiple group names per line, captured in
   `Primitive::extras["obj:groups"]` and re-emitted on a single `g` line.
+  `g` is state-setting (spec §"Grouping"): a mid-stream membership change
+  splits the primitive so the new groups apply only to subsequent
+  elements, not the ones already accumulated.
 - `s 1` / `s off` / `s 0` smoothing groups → preserved verbatim in
   `Primitive::extras["obj:smoothing_group"]`; a smoothing-group change
   mid-object splits the primitive so each one carries a single

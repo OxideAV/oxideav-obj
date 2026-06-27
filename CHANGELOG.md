@@ -30,6 +30,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Round 376: a mid-stream `g` group directive is now correctly
+  state-setting (spec §"Grouping": elements following a `g` statement are
+  assigned to the named groups). The decoder appended the new group names
+  onto the *current* primitive even when it already held faces, so a `g`
+  that appeared after some elements retroactively re-tagged them; on
+  round-trip the encoder then emitted the `g` line one element too early
+  and decode → encode wasn't a fixed point. A `g` whose membership differs
+  from the open primitive's now splits into a fresh primitive (mirroring
+  the `s` / `usemtl` / `mg` state-setters), inheriting the other active
+  state, so the group applies only to subsequent elements. A `g` before
+  any element still tags the first primitive with no split. Surfaced by
+  the new round-trip property test; pinned in `tests/group_state_split.rs`.
+
 - Round 376: a face that references the *later* of two `vt` lines sharing
   a `[u, v]` value now keeps its exact `vt` index on round-trip. The typed
   model stores only the UV *value* on `Primitive::uvs`, so two source `vt`

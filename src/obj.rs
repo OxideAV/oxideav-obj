@@ -812,16 +812,57 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                 // on one line: `g group_name1 group_name2 …`. Each
                 // whitespace-separated token is its own group; the
                 // following elements belong to ALL listed groups.
-                let names: Vec<String> = tokens.map(|t| t.to_string()).collect();
+                //
+                // `g` is *state-setting* (spec §"Grouping": "Elements …
+                // following a g statement … are assigned to the named
+                // groups"): the membership applies to subsequent
+                // elements, not the ones already accumulated. So a `g`
+                // change once the current primitive holds elements must
+                // split into a fresh primitive — mirroring the `s` /
+                // `usemtl` / `mg` state-setters — rather than retroactively
+                // re-tagging the elements already emitted. The earlier
+                // append-to-current behaviour mis-assigned a trailing `g`
+                // back onto the preceding primitive, which then re-emitted
+                // the `g` line one element too early on round-trip.
+                let mut names: Vec<String> = Vec::new();
+                for t in tokens {
+                    if !names.iter().any(|g| g == t) {
+                        names.push(t.to_string());
+                    }
+                }
                 if names.is_empty() {
                     continue;
                 }
                 let mesh = doc.meshes.last_mut().unwrap();
-                let prim = mesh.current_or_new();
-                for name in names {
-                    if !prim.groups.iter().any(|g| g == &name) {
-                        prim.groups.push(name);
-                    }
+                let last = mesh.current_or_new();
+                if last.elements.is_empty() {
+                    // No elements yet — this `g` simply (re)sets the
+                    // pending group membership for the open primitive.
+                    last.groups = names;
+                } else if last.groups != names {
+                    // Membership changed mid-stream — open a fresh
+                    // primitive carrying the new groups and inheriting the
+                    // other active state-setters.
+                    let mat = last.material.clone();
+                    let smoothing = last.smoothing_group.clone();
+                    let merging = last.merging_group.clone();
+                    let bevel = last.bevel.clone();
+                    let c_interp = last.c_interp.clone();
+                    let d_interp = last.d_interp.clone();
+                    let lod = last.lod.clone();
+                    let usemap = last.usemap.clone();
+                    mesh.primitives.push(PrimAccum {
+                        material: mat,
+                        smoothing_group: smoothing,
+                        groups: names,
+                        merging_group: merging,
+                        bevel,
+                        c_interp,
+                        d_interp,
+                        lod,
+                        usemap,
+                        elements: Vec::new(),
+                    });
                 }
             }
             "s" => {

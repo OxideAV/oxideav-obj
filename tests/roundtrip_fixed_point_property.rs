@@ -130,7 +130,7 @@ fn gen_obj(seed: u64) -> String {
             // Faces (triangles) in various index syntaxes, with optional
             // state-setters interleaved.
             0 => {
-                match r.below(12) {
+                match r.below(15) {
                     0 => doc.push_str(&format!("s {}\n", r.below(4))),
                     1 => doc.push_str("s off\n"),
                     2 => doc.push_str(&format!("usemtl mat{}\n", r.below(3))),
@@ -138,25 +138,49 @@ fn gen_obj(seed: u64) -> String {
                     4 => doc.push_str("bevel on\n"),
                     5 => doc.push_str(&format!("lod {}\n", r.below(10))),
                     6 => doc.push_str(&format!("usemap map{}\n", r.below(2))),
+                    7 => doc.push_str("usemap off\n"),
+                    8 => doc.push_str(if r.chance(2) {
+                        "c_interp on\n"
+                    } else {
+                        "c_interp off\n"
+                    }),
+                    9 => doc.push_str(if r.chance(2) {
+                        "d_interp on\n"
+                    } else {
+                        "d_interp off\n"
+                    }),
+                    10 => doc.push_str(&format!("g grp{} grp{}\n", r.below(3), r.below(3))),
                     _ => {}
                 }
+                // A face whose every component is spelled with the same
+                // sign — the spec allows -k relative-from-end on each of
+                // the geometric / texture / normal slots independently,
+                // and the decoder resolves each against its own pool. We
+                // keep one sign per face to stay grep-readable.
                 let negative = r.chance(4);
+                // Render an index (1-based positive `idx` into a pool of
+                // `n` entries) as either the absolute form or, when
+                // `negative`, the -k relative-from-end form (`n - idx + 1`
+                // is in `1..=n`, so the negative reference is always in
+                // range).
+                let render = |negative: bool, idx: u32, n: u32| -> String {
+                    if negative {
+                        format!("-{}", n - idx + 1)
+                    } else {
+                        format!("{idx}")
+                    }
+                };
                 let mut verts = Vec::new();
                 for _ in 0..3 {
                     let (vi, ti, ni) = (pick(&mut r, n_v), pick(&mut r, n_vt), pick(&mut r, n_vn));
+                    let vs = render(negative, vi, n_v);
+                    let ts = render(negative, ti, n_vt);
+                    let ns = render(negative, ni, n_vn);
                     let tok = match r.below(4) {
-                        0 => {
-                            if negative {
-                                // -k counts back from the current pool end;
-                                // n_v - vi + 1 is in 1..=n_v so always valid.
-                                format!("-{}", n_v - vi + 1)
-                            } else {
-                                format!("{vi}")
-                            }
-                        }
-                        1 => format!("{vi}/{ti}"),
-                        2 => format!("{vi}//{ni}"),
-                        _ => format!("{vi}/{ti}/{ni}"),
+                        0 => vs,
+                        1 => format!("{vs}/{ts}"),
+                        2 => format!("{vs}//{ns}"),
+                        _ => format!("{vs}/{ts}/{ns}"),
                     };
                     verts.push(tok);
                 }
