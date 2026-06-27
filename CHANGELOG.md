@@ -30,6 +30,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Round 376: a face that references the *later* of two `vt` lines sharing
+  a `[u, v]` value now keeps its exact `vt` index on round-trip. The typed
+  model stores only the UV *value* on `Primitive::uvs`, so two source `vt`
+  lines with identical `[u, v]` but different source indices (e.g. a 1D
+  `vt 0` padded to `[0, 0]` and a `vt 0 0`) collapse to one value; the
+  encoder's value-keyed `tex_map` then re-resolved every face UV to the
+  *first* matching slot, silently rewriting an `f v/10` reference to
+  `f v/3`. The decoder now records the original 1-based `vt` index per
+  primitive vertex into `Primitive::extras["obj:vt_src_index"]` — but only
+  when the texcoord pool actually holds a duplicate value (the sole
+  ambiguous case), keeping the common distinct-valued case free of the
+  channel — and the encoder restores the exact source slot whenever the
+  pool was seeded 1:1 from `obj:texcoords`. Found by a new generative
+  property test (`tests/roundtrip_fixed_point_property.rs`) that asserts
+  the decode → encode → decode textual fixed point over a 600-seed corpus
+  of valid OBJ documents; the specific case is pinned in
+  `tests/vt_duplicate_value_index_fidelity.rs`.
+
 - Round 370: `vt` texture-coordinate re-emission is now byte-faithful
   for the 1D and 3D forms. Spec §"vt u v w" makes both `v` and `w`
   optional (each defaulting to `0`): a 1D texture writes `vt u`, a 2D

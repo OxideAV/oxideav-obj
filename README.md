@@ -300,6 +300,18 @@ separator lines are preserved; trailing blanks are dropped so repeated
 round-trips stay a fixed point. Comments after the first directive aren't
 positionally anchored by the line-oriented parser and are discarded.
 
+The encoder reaches a textual fixed point after one round-trip: a
+600-seed generative property test (`tests/roundtrip_fixed_point_property.rs`)
+asserts `serialize(parse(serialize(parse(x)))) == serialize(parse(x))`
+across documents mixing every directive family. This caught a `vt`
+index-fidelity bug: two `vt` lines sharing a `[u, v]` value but different
+source indices (a 1D `vt 0` padded to `[0, 0]` and a `vt 0 0`) collapse to
+one UV in the typed model, so a face referencing the later duplicate was
+re-resolved by value to the first slot (`f v/10` → `f v/3`). The decoder
+now records the per-vertex source index in
+`Primitive::extras["obj:vt_src_index"]` whenever the pool holds a duplicate
+value, and the encoder restores the exact slot.
+
 A `cargo fuzz` harness (`fuzz/fuzz_targets/parse_obj.rs` and
 `parse_mtl.rs`) asserts panic-freedom across the public decoder entry
 points; regression cases are pinned in `tests/fuzz_regressions.rs`.

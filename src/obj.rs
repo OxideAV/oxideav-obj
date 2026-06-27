@@ -7306,6 +7306,22 @@ fn single_line_topology(elements: &[Element]) -> Topology {
     }
 }
 
+/// Does the global texcoord pool hold two entries with the same `[u, v]`
+/// value? When it does, the encoder's value-keyed `tex_map` can re-resolve
+/// a face's `vt` reference to the first matching slot rather than the
+/// originally-referenced one — so the decoder records the per-vertex source
+/// index to disambiguate. Keyed identically to the encoder's `KeyVec2`
+/// (exact `to_bits`) so the two stay in agreement.
+fn texcoords_have_duplicate_value(texcoords: &[[f32; 2]]) -> bool {
+    let mut seen: std::collections::HashSet<KeyVec2> = std::collections::HashSet::new();
+    for &t in texcoords {
+        if !seen.insert(KeyVec2::from(t)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Build one [`Primitive`] from an accumulated [`PrimAccum`].
 ///
 /// Returns the primitive plus a per-element arity vector — one entry
@@ -7407,6 +7423,17 @@ fn build_primitive(
     // parallel to `prim.positions` after interning completes.
     let mut color_present: Vec<bool> = Vec::new();
     let mut weights_seen: Vec<Option<f32>> = Vec::new();
+    // Per-interned-vertex original 1-based `vt` source index (0 = none).
+    // The typed model only stores the UV *value* on `prim.uvs`, so two
+    // source `vt` lines that share `[u, v]` but live at different indices
+    // (e.g. `vt 0` at slot 3 and `vt 0 0` at slot 10 — distinct widths,
+    // identical value) collapse to a single UV. When a face references
+    // the later duplicate, the encoder's value-keyed `tex_map` would
+    // re-resolve it to the *first* matching slot, silently rewriting the
+    // `f v/vt` index and breaking the round-trip. Recording the original
+    // index here lets the encoder restore the exact source slot. Parallel
+    // to `prim.positions` after interning.
+    let mut vt_src: Vec<u32> = Vec::new();
 
     // De-duplicate face-vertices into a single interleaved buffer.
     let mut indexer: HashMap<FaceVert, u32> = HashMap::new();
@@ -7417,7 +7444,8 @@ fn build_primitive(
                   prim: &mut Primitive,
                   indexer: &mut HashMap<FaceVert, u32>,
                   color_present: &mut Vec<bool>,
-                  weights_seen: &mut Vec<Option<f32>>|
+                  weights_seen: &mut Vec<Option<f32>>,
+                  vt_src: &mut Vec<u32>|
      -> Result<u32> {
         if let Some(&idx) = indexer.get(&fv) {
             return Ok(idx);
@@ -7463,6 +7491,7 @@ fn build_primitive(
             );
         }
         weights_seen.push(position_weights.get((fv.v - 1) as usize).copied().flatten());
+        vt_src.push(fv.vt);
         let new_idx = (prim.positions.len() - 1) as u32;
         indexer.insert(fv, new_idx);
         Ok(new_idx)
@@ -7482,6 +7511,7 @@ fn build_primitive(
                             &mut indexer,
                             &mut color_present,
                             &mut weights_seen,
+                            &mut vt_src,
                         )
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -7502,6 +7532,7 @@ fn build_primitive(
                             &mut indexer,
                             &mut color_present,
                             &mut weights_seen,
+                            &mut vt_src,
                         )
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -7539,6 +7570,7 @@ fn build_primitive(
                         &mut indexer,
                         &mut color_present,
                         &mut weights_seen,
+                        &mut vt_src,
                     )?;
                     local_indices.push(idx);
                 }
@@ -7570,6 +7602,18 @@ fn build_primitive(
         prim.extras.insert(
             "obj:vertex_weight".to_string(),
             serde_json::to_value(&weights_seen).unwrap(),
+        );
+    }
+    // Stash the per-vertex original `vt` index, but only when the
+    // texcoord pool actually contains a duplicate value — that's the
+    // sole condition under which the encoder's value-keyed re-resolution
+    // could pick the wrong source slot. In the common case (every `vt`
+    // line a distinct value, or no UVs at all) the value lookup is
+    // already unambiguous and we keep the extras free of this channel.
+    if has_uv && vt_src.iter().any(|&i| i != 0) && texcoords_have_duplicate_value(texcoords) {
+        prim.extras.insert(
+            "obj:vt_src_index".to_string(),
+            serde_json::to_value(&vt_src).unwrap(),
         );
     }
 
@@ -8488,6 +8532,11 @@ pub fn serialize_obj_with_options(
                 .or_insert(texcoords.len() as u32);
         }
     }
+    // Number of pool slots seeded directly from `obj:texcoords`. A
+    // `obj:vt_src_index` entry is only meaningful within this prefix —
+    // beyond it the pool grows from interned primitive UVs whose ordering
+    // doesn't match source `vt` numbering.
+    let seeded_tex_len = texcoords.len() as u32;
 
     // First pass: emit `v` / `vt` / `vn` lists and remember the global
     // indices for each (mesh, primitive, vertex) triple.
@@ -8536,6 +8585,25 @@ pub fn serialize_obj_with_options(
                 .and_then(serde_json::Value::as_array)
                 .map(|arr| arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect())
                 .unwrap_or_default();
+            // Original per-vertex `vt` source index (1-based, 0 = none),
+            // captured by the decoder only when the texcoord pool held a
+            // duplicate value (see `texcoords_have_duplicate_value`). When
+            // present and the source pool was seeded 1:1 from
+            // `obj:texcoords` (so slot k == source index k), we re-emit the
+            // exact original slot rather than letting the value-keyed
+            // `tex_map` collapse a face onto the first matching duplicate.
+            // The index is validated against the seeded pool length; an
+            // out-of-range or absent entry falls back to the value lookup.
+            let vt_src_index: Vec<u32> = prim
+                .extras
+                .get("obj:vt_src_index")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .map(|v| v.as_u64().map(|n| n as u32).unwrap_or(0))
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut prim_globals: Vec<GlobalTriple> = Vec::with_capacity(prim.positions.len());
             for vi in 0..prim.positions.len() {
                 let colour = if has_color && color_present.get(vi).copied().unwrap_or(false) {
@@ -8554,7 +8622,14 @@ pub fn serialize_obj_with_options(
                     &mut pos_map,
                 );
                 let vt_idx = if has_uv {
-                    intern_tex(prim.uvs[0][vi], &mut texcoords, &mut tex_map)
+                    // Prefer the recorded source slot when it is in range
+                    // of the seeded pool; otherwise resolve by value.
+                    let src = vt_src_index.get(vi).copied().unwrap_or(0);
+                    if src != 0 && src <= seeded_tex_len {
+                        src
+                    } else {
+                        intern_tex(prim.uvs[0][vi], &mut texcoords, &mut tex_map)
+                    }
                 } else {
                     0
                 };
