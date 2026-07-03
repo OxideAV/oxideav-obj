@@ -1,5 +1,7 @@
 # oxideav-obj
 
+[![CI](https://github.com/OxideAV/oxideav-obj/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-obj/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-obj.svg)](https://crates.io/crates/oxideav-obj) [![docs.rs](https://docs.rs/oxideav-obj/badge.svg)](https://docs.rs/oxideav-obj) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust Wavefront OBJ + MTL 3D mesh codec. Implements the
 `oxideav_mesh3d::Mesh3DDecoder` and `Mesh3DEncoder` traits, plugging into
 the wider OxideAV codec ecosystem.
