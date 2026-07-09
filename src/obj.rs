@@ -107,6 +107,27 @@ struct MeshAccum {
 }
 
 impl PrimAccum {
+    /// True when two primitives carry byte-identical state (material,
+    /// groups, smoothing / merging groups, display attributes, usemap).
+    /// Two adjacent primitives with equal state were split by a
+    /// transient directive that carried no elements of its own (e.g.
+    /// `s off` immediately followed by `s 1`, which reverts the state
+    /// without any face in between); coalescing them keeps the decoder's
+    /// output a round-trip fixed point, since the encoder emits one
+    /// state block for the merged primitive and a re-parse can't
+    /// reconstruct the vanished transient.
+    fn same_state(&self, other: &PrimAccum) -> bool {
+        self.material == other.material
+            && self.groups == other.groups
+            && self.smoothing_group == other.smoothing_group
+            && self.merging_group == other.merging_group
+            && self.bevel == other.bevel
+            && self.c_interp == other.c_interp
+            && self.d_interp == other.d_interp
+            && self.lod == other.lod
+            && self.usemap == other.usemap
+    }
+
     /// A fresh primitive that inherits this one's active state
     /// (material / groups / smoothing / merging / display attributes /
     /// usemap) but starts with an empty element list. Used to split a
@@ -158,6 +179,52 @@ impl MeshAccum {
         } else {
             prim.elements.push(elt);
         }
+    }
+
+    /// Merge consecutive primitives that carry identical state and the
+    /// same topology, after dropping empty ones.
+    ///
+    /// A state directive that binds no element of its own leaves an empty
+    /// primitive behind, and a later directive can revert the state so
+    /// that the primitives on either side match. Two cases both break the
+    /// decode → encode fixed point:
+    ///
+    ///  * `s off` immediately followed by `s 1` overwrites an empty
+    ///    primitive's state in place, leaving two adjacent same-state
+    ///    primitives.
+    ///  * `usemtl m2` followed by `usemtl m0` (reverting) leaves an empty
+    ///    `m2` primitive wedged between two `m0` primitives.
+    ///
+    /// The encoder drops empty primitives ([`build_scene`] skips any with
+    /// no positions) and emits a state block per surviving primitive, so
+    /// a re-parse would collapse the now-adjacent same-state pair. Drop
+    /// empty primitives here and merge adjacent same-state / same-topology
+    /// survivors so the decoder's own output is already normalised.
+    /// Primitives of different topology kinds are never merged (that would
+    /// recreate a rejected mixed-kind primitive).
+    fn coalesce_primitives(&mut self) {
+        if self.primitives.len() < 2 {
+            return;
+        }
+        let mut merged: Vec<PrimAccum> = Vec::with_capacity(self.primitives.len());
+        for prim in std::mem::take(&mut self.primitives) {
+            // An element-less primitive carries no geometry — the encoder
+            // skips it, so keeping it here would desynchronise the
+            // round-trip.
+            if prim.elements.is_empty() {
+                continue;
+            }
+            if let Some(last) = merged.last_mut() {
+                let same_topology = last.elements.first().map(Element::kind)
+                    == prim.elements.first().map(Element::kind);
+                if same_topology && last.same_state(&prim) {
+                    last.elements.extend(prim.elements);
+                    continue;
+                }
+            }
+            merged.push(prim);
+        }
+        self.primitives = merged;
     }
 }
 
@@ -1035,6 +1102,13 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
             // silently skipped per spec lenient-loader convention.
             _ => {}
         }
+    }
+
+    // Normalise away primitive splits left behind by transient state
+    // directives (a state change with no elements that a later directive
+    // reverts) so a decode → encode round-trip is a fixed point.
+    for mesh in &mut doc.meshes {
+        mesh.coalesce_primitives();
     }
 
     Ok(doc)
