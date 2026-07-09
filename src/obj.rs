@@ -1736,7 +1736,9 @@ fn flush_block(
                 // (n == 1 subdivision ⇒ two endpoints).
                 let n = (res * basis_degree as f32).round();
                 if n.is_finite() && n >= 1.0 {
-                    (n as u32).min(samples.max(1).saturating_mul(64))
+                    (n as u32)
+                        .min(samples.max(1).saturating_mul(64))
+                        .min(MAX_TESSELLATION_SAMPLES)
                 } else {
                     1
                 }
@@ -7915,6 +7917,21 @@ fn backfill_zero_normals(prim: &mut Primitive) {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Upper bound on the per-direction tessellation subdivision count.
+///
+/// [`ParseOptions::curve_tessellation_samples`] is a caller-supplied
+/// budget, so a hostile or careless caller can request an absurd count
+/// (up to `u32::MAX`). Two things go wrong when the raw value flows
+/// unchecked into the evaluators: the `samples + 1` sample-index bound
+/// overflows `u32` (a debug-build arithmetic panic), and a surface
+/// lattice of `(samples + 1)²` vertices demands an unsatisfiable
+/// allocation. Both are contained by clamping the effective count to
+/// this ceiling before any evaluator runs. `4096` intervals give a
+/// `4097`-point curve or a `4097²` (≈ 16.8 M-vertex) surface lattice —
+/// already far denser than any diagnostic display needs, while keeping
+/// every downstream `+ 1` / `× 64` arithmetic well clear of overflow.
+pub(crate) const MAX_TESSELLATION_SAMPLES: u32 = 4096;
+
 /// Parser configuration knobs.
 ///
 /// The default leaves free-form geometry as captured-only extras
@@ -7922,7 +7939,10 @@ fn backfill_zero_normals(prim: &mut Primitive) {
 /// [`ParseOptions::curve_tessellation_samples`] to a non-zero value
 /// to enable evaluation of `cstype bezier` / `cstype bspline`
 /// (rational + non-rational) curves into real `LineStrip` primitives
-/// (see [`crate::ObjDecoder::with_curve_tessellation`]).
+/// (see [`crate::ObjDecoder::with_curve_tessellation`]). Values above
+/// [`MAX_TESSELLATION_SAMPLES`] are clamped to that ceiling so an
+/// oversized budget can neither overflow the sample-index arithmetic
+/// nor demand an unbounded lattice allocation.
 #[derive(Clone, Debug, Default)]
 pub struct ParseOptions {
     /// When > 0, every `curv` directive under an active `cstype bezier`
@@ -8089,13 +8109,23 @@ where
         }
     }
 
+    // Clamp the caller-supplied tessellation budget to a sane ceiling
+    // before it reaches any evaluator. The raw knob is untrusted (a
+    // caller can pass `u32::MAX`); an unclamped value overflows the
+    // `samples + 1` sample-index bound inside the curve evaluators and
+    // asks for an unbounded surface lattice. Every tessellation pass
+    // below reads this clamped `samples` instead of the raw option.
+    let samples = options
+        .curve_tessellation_samples
+        .min(MAX_TESSELLATION_SAMPLES);
+
     // Curve tessellation pass — captures the curve directives still in
     // `doc.freeform_directives` and synthesises `LineStrip` primitives
     // on a dedicated mesh. Skipped when samples == 0 (the default).
     // Supports `cstype bezier` / `rat bezier` (round 7) and
     // `cstype bspline` / `rat bspline` (round 8).
-    let tessellated = if options.curve_tessellation_samples > 0 {
-        tessellate_curves(&doc, options.curve_tessellation_samples)
+    let tessellated = if samples > 0 {
+        tessellate_curves(&doc, samples)
     } else {
         Vec::new()
     };
@@ -8106,8 +8136,8 @@ where
     // a dedicated `obj:curves2` mesh. The directives still ride on
     // `Scene3D::extras["obj:freeform_directives"]` for verbatim
     // round-trip; the encoder filters the synthetic primitives out.
-    let tessellated_curve2 = if options.curve_tessellation_samples > 0 {
-        tessellate_curve2(&doc, options.curve_tessellation_samples)
+    let tessellated_curve2 = if samples > 0 {
+        tessellate_curve2(&doc, samples)
     } else {
         Vec::new()
     };
@@ -8116,8 +8146,8 @@ where
     // `surf` tensor-product evaluation (round 11). Synthesises a
     // `Topology::Triangles` mesh; the directives still ride on
     // `Scene3D::extras["obj:freeform_directives"]` for round-trip.
-    let tessellated_surfaces = if options.curve_tessellation_samples > 0 {
-        tessellate_surfaces(&doc, options.curve_tessellation_samples)
+    let tessellated_surfaces = if samples > 0 {
+        tessellate_surfaces(&doc, samples)
     } else {
         Vec::new()
     };
@@ -8128,8 +8158,8 @@ where
     // directives still ride on `Scene3D::extras["obj:freeform_directives"]`
     // for verbatim round-trip; the encoder filters the synthetic
     // primitives out via the shared `obj:tessellated_curve` sentinel.
-    let tessellated_scrv = if options.curve_tessellation_samples > 0 {
-        tessellate_scrv(&doc, options.curve_tessellation_samples)
+    let tessellated_scrv = if samples > 0 {
+        tessellate_scrv(&doc, samples)
     } else {
         Vec::new()
     };
@@ -8143,7 +8173,7 @@ where
     // still ride on `Scene3D::extras["obj:freeform_directives"]` for
     // verbatim round-trip; the encoder filters the synthetic primitives
     // out via the shared `obj:tessellated_curve` sentinel.
-    let tessellated_sp = if options.curve_tessellation_samples > 0 {
+    let tessellated_sp = if samples > 0 {
         tessellate_special_points(&doc)
     } else {
         Vec::new()
@@ -8159,8 +8189,8 @@ where
     // `Scene3D::extras["obj:freeform_directives"]` for verbatim
     // round-trip; the encoder filters the synthetic seams out via the
     // shared `obj:tessellated_curve` sentinel.
-    let tessellated_con = if options.curve_tessellation_samples > 0 {
-        tessellate_connectivity(&doc, options.curve_tessellation_samples)
+    let tessellated_con = if samples > 0 {
+        tessellate_connectivity(&doc, samples)
     } else {
         Vec::new()
     };
@@ -8174,8 +8204,8 @@ where
     // `Scene3D::extras["obj:freeform_directives"]` for round-trip; the
     // encoder filters the synthetic primitives out via the shared
     // `obj:tessellated_curve` sentinel.
-    let tessellated_superseded_curves = if options.curve_tessellation_samples > 0 {
-        tessellate_superseded_curves(&doc, options.curve_tessellation_samples)
+    let tessellated_superseded_curves = if samples > 0 {
+        tessellate_superseded_curves(&doc, samples)
     } else {
         Vec::new()
     };
@@ -8187,8 +8217,8 @@ where
     // statements" §"bzp", §"res useg vseg"). Gated on the same knob as
     // the modern surface pass; verbatim lines still round-trip via
     // `obj:freeform_directives`.
-    let tessellated_superseded_surfaces = if options.curve_tessellation_samples > 0 {
-        tessellate_superseded_surfaces(&doc, options.curve_tessellation_samples)
+    let tessellated_superseded_surfaces = if samples > 0 {
+        tessellate_superseded_surfaces(&doc, samples)
     } else {
         Vec::new()
     };

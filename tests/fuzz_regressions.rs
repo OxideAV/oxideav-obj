@@ -101,3 +101,61 @@ fn parse_obj_bmatrix_with_huge_deg_does_not_overflow_basis_size() {
     let mut dec = ObjDecoder::new().with_curve_tessellation(4);
     let _ = dec.decode(input);
 }
+
+/// Round 402 hardening: the tessellation *budget* itself is a
+/// caller-supplied knob, not a file-derived count. A caller passing a
+/// near-`u32::MAX` sample count drove the curve evaluators'
+/// `let n_samples = samples + 1;` bound past `u32::MAX`, panicking with
+/// "attempt to add with overflow" in debug builds (and requesting a
+/// multi-gigabyte lattice allocation in release). The parser now clamps
+/// the effective count to `MAX_TESSELLATION_SAMPLES` before any
+/// evaluator runs, so even the maximum budget resolves cleanly.
+///
+/// `curv` (1D Bezier evaluator, the direct `samples + 1` overflow site).
+#[test]
+fn parse_obj_curve_with_max_budget_does_not_overflow() {
+    let input: &[u8] = b"v 0 0 0\nv 1 0 0\ncstype bezier\ncurv 0 1 1 2\nend\n";
+    let mut dec = ObjDecoder::new().with_curve_tessellation(u32::MAX);
+    let scene = dec.decode(input).expect("max-budget curve decodes cleanly");
+    // The clamp keeps the synthesised polyline bounded rather than
+    // attempting a `u32::MAX + 1`-vertex buffer.
+    let curve_verts: usize = scene
+        .meshes
+        .iter()
+        .filter(|m| m.name.as_deref() == Some("obj:curves"))
+        .flat_map(|m| m.primitives.iter())
+        .map(|p| p.positions.len())
+        .sum();
+    assert!(
+        curve_verts > 0 && curve_verts <= 4097,
+        "curve lattice clamped to the ceiling, got {curve_verts} vertices"
+    );
+}
+
+/// Companion of the above via the surface evaluator: a `(samples + 1)²`
+/// tensor-product lattice at `samples == u32::MAX` is both an
+/// arithmetic overflow and an unsatisfiable allocation. The clamp keeps
+/// the decode a clean `Result`.
+#[test]
+fn parse_obj_surface_with_max_budget_does_not_overflow() {
+    let input: &[u8] =
+        b"v 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\ncstype bezier\nsurf 0 1 0 1 1 2 3 4\nend\n";
+    let mut dec = ObjDecoder::new().with_curve_tessellation(u32::MAX);
+    let _ = dec
+        .decode(input)
+        .expect("max-budget surface decodes cleanly");
+}
+
+/// The `ctech cparm` / `stech cparma` resolution overrides multiply the
+/// budget by the curve/surface degree and cap the result at `budget ×
+/// 64`; with a huge budget that cap alone still overflows downstream, so
+/// the effective count is additionally clamped to the absolute ceiling.
+#[test]
+fn parse_obj_ctech_override_with_max_budget_does_not_overflow() {
+    let input: &[u8] =
+        b"v 0 0 0\nv 1 0 0\ncstype bezier\nctech cparm 1000000\ncurv 0 1 1 2 3\nend\n";
+    let mut dec = ObjDecoder::new().with_curve_tessellation(u32::MAX);
+    let _ = dec
+        .decode(input)
+        .expect("max-budget ctech override decodes cleanly");
+}
