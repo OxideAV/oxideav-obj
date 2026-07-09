@@ -47,7 +47,11 @@ modern loaders actually load):
   polyline rather than emitting one `l v1 v2` per pair.
 - `p` point elements → `Topology::Points`. Multi-vertex `p v1 v2 v3 …`
   lines pack onto one element list; mixing point and face/line elements
-  under one `usemtl` splits into one primitive per topology.
+  under one `usemtl` splits into one primitive per topology. The split
+  is topology-driven, so face / line / point elements interleaved under
+  one material with no separating state directive decode into
+  consecutive per-kind primitives rather than being rejected — the
+  decoder never fails on an element mix the encoder could itself emit.
 - `mg <group_number> [res]` merging-group state-setting → preserved
   verbatim in `Primitive::extras["obj:merging_group"]`; a change
   mid-stream splits the primitive (mirrors `s` behaviour).
@@ -315,11 +319,27 @@ one UV in the typed model, so a face referencing the later duplicate was
 re-resolved by value to the first slot (`f v/10` → `f v/3`). The decoder
 now records the per-vertex source index in
 `Primitive::extras["obj:vt_src_index"]` whenever the pool holds a duplicate
-value, and the encoder restores the exact slot.
+value, and the encoder restores the exact slot. Two further fixed-point
+hazards are handled at decode time: a transient state directive that
+binds no element and is then reverted (`s off` then `s 1`, or
+`usemtl m2` then `usemtl m0`) leaves adjacent primitives with matching
+state, which the decoder coalesces (and empties are dropped, matching
+the encoder) so the emitted document is idempotent; and face / line /
+point elements interleaved under one material split by topology so the
+encoder can never emit a mix its own decoder would reject. The
+companion MTL serialiser has its own generative fixed-point property
+(`tests/mtl_roundtrip_fixed_point_property.rs`) covering the full
+material-statement matrix (this caught a `map_Pr`/`map_Pm`
+double-emission and an unstable pass-through map order).
 
 A `cargo fuzz` harness (`fuzz/fuzz_targets/parse_obj.rs` and
 `parse_mtl.rs`) asserts panic-freedom across the public decoder entry
 points; regression cases are pinned in `tests/fuzz_regressions.rs`.
+Free-form curve/surface tessellation is a caller-supplied budget
+(`ObjDecoder::with_curve_tessellation`), clamped to
+`obj::MAX_TESSELLATION_SAMPLES` so an oversized value can neither
+overflow the internal sample-index arithmetic nor demand an unbounded
+lattice allocation.
 
 The `.mod` binary form remains out of scope.
 
