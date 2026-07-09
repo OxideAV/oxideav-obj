@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-obj/compare/v0.0.4...v0.0.5) - 2026-07-09
+
+### Other
+
+- document round-402 fidelity + hardening guarantees
+- coalesce reverted-state primitive splits for a round-trip fixed point
+- split f/l/p on topology change so mixed-kind documents decode
+- fix two serialiser round-trip fidelity bugs (map_Pr/Pm dup + order)
+- publish MAX_TESSELLATION_SAMPLES + document/pin the clamp invariant
+- clamp caller tessellation budget to a ceiling (fix samples+1 overflow)
+- add CI / crates.io / docs.rs / MIT-license badges
+- broaden round-trip property corpus to free-form + 2000 seeds
+- `g` group directive is state-setting — split primitive on mid-stream change
+- fix vt index drift for duplicate-value texcoords + add fixed-point property test
+- preserve leading header comment block on round-trip (spec §Comments)
+- round 370 — byte-faithful vt re-emission for 1D / 3D texture coords
+- round 361 — backfill degenerate normals on partial-vn primitives
+- round 361 — synthesise vertex normals from smoothing groups (opt-in)
+- round 353 — typed obj:superseded accessor for bzp/bsp/cdc/cdp
+- round 353 — tessellate superseded cdc Cardinal curve + bzp Bezier patch
+- byte-faithful vp re-emit via parallel obj:vp_widths token-width vector
+- stech cparma/cparmb surface-approximation resolution drives tessellation
+- honour ctech cparm res curve-approximation resolution in tessellation
+- round 324 — MTL PBR scalar-field texture-map siblings round-trip
+- round 320 — variable-arity -o/-s/-t texture-map option flags
+- Round 315: smooth per-vertex normals on tessellated surf surfaces
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 - Round 376: the file's leading comment block now round-trips verbatim
