@@ -1306,13 +1306,24 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
             textures,
             &mat.extras,
         );
-        write_tex_ref(
-            &mut out,
-            "map_Pr",
-            mat.metallic_roughness_texture,
-            textures,
-            &mat.extras,
-        );
+        // The metallic-roughness texture round-trips through the
+        // `mtl:map_Pr` / `mtl:map_Pm` extras, which the pass-through loop
+        // below re-emits with the operator's *original* keyword spelling
+        // and options. Only emit the typed slot directly when neither
+        // extra is present (a programmatically-constructed `Material`),
+        // otherwise the map double-emits — and a `map_Pm`-only source
+        // grows a spurious `map_Pr` on every round-trip, since this slot
+        // is hardwired to the `map_Pr` keyword regardless of which of the
+        // two the source actually used.
+        if !mat.extras.contains_key("mtl:map_Pr") && !mat.extras.contains_key("mtl:map_Pm") {
+            write_tex_ref(
+                &mut out,
+                "map_Pr",
+                mat.metallic_roughness_texture,
+                textures,
+                &mat.extras,
+            );
+        }
         write_tex_ref(
             &mut out,
             "map_Ke",
@@ -1377,7 +1388,17 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
         }
 
         // Pass-through extras — `mtl:*` keys we didn't consume above.
-        for (k, v) in &mat.extras {
+        // `Material::extras` is a `HashMap`, whose iteration order is
+        // randomised per instance; emitting in raw order makes the
+        // output depend on the map's seed, so `serialize(parse(x))`
+        // isn't a fixed point (a re-parse builds a fresh map with a
+        // different order). Sort the keys so the pass-through maps
+        // (`map_Ka` / `map_Ks` / `decal` / …) emit in a stable,
+        // reproducible order regardless of insertion history.
+        let mut extra_keys: Vec<&String> = mat.extras.keys().collect();
+        extra_keys.sort_unstable();
+        for k in extra_keys {
+            let v = &mat.extras[k];
             if !k.starts_with("mtl:") {
                 continue;
             }
