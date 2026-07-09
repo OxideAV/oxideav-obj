@@ -7930,7 +7930,7 @@ fn backfill_zero_normals(prim: &mut Primitive) {
 /// `4097`-point curve or a `4097²` (≈ 16.8 M-vertex) surface lattice —
 /// already far denser than any diagnostic display needs, while keeping
 /// every downstream `+ 1` / `× 64` arithmetic well clear of overflow.
-pub(crate) const MAX_TESSELLATION_SAMPLES: u32 = 4096;
+pub const MAX_TESSELLATION_SAMPLES: u32 = 4096;
 
 /// Parser configuration knobs.
 ///

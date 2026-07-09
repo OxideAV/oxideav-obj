@@ -80,6 +80,14 @@ impl ObjDecoder {
     /// the round 1-6 behaviour. Bezier / B-spline / Cardinal / Taylor
     /// `surf` surfaces are tessellated; basis-matrix surfaces remain
     /// captured-only.
+    ///
+    /// The budget is a caller-supplied knob, so it is clamped to
+    /// [`obj::MAX_TESSELLATION_SAMPLES`] before it reaches any
+    /// evaluator: an oversized value can neither overflow the internal
+    /// `samples + 1` sample-index arithmetic nor demand an unbounded
+    /// `(samples + 1)²` surface lattice. Values at or below the ceiling
+    /// pass through unchanged, so this never affects a realistic
+    /// diagnostic-density request.
     pub fn with_curve_tessellation(mut self, samples: u32) -> Self {
         self.curve_tessellation_samples = samples;
         self

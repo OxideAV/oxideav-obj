@@ -159,3 +159,38 @@ fn parse_obj_ctech_override_with_max_budget_does_not_overflow() {
         .decode(input)
         .expect("max-budget ctech override decodes cleanly");
 }
+
+/// The clamp is idempotent at the ceiling: any budget at or above
+/// `MAX_TESSELLATION_SAMPLES` produces byte-for-byte the same synthesised
+/// geometry as the ceiling itself, so callers can pass an arbitrarily
+/// large value without changing the output shape (only the resource
+/// bound is enforced).
+#[test]
+fn tessellation_budget_saturates_at_the_ceiling() {
+    let input: &[u8] =
+        b"v 0 0 0\nv 1 0 0\nv 2 1 0\nv 3 0 0\ncstype bezier\ncurv 0 1 1 2 3 4\nend\n";
+
+    let curve_len = |budget: u32| -> usize {
+        let mut dec = ObjDecoder::new().with_curve_tessellation(budget);
+        let scene = dec.decode(input).expect("decodes cleanly");
+        scene
+            .meshes
+            .iter()
+            .filter(|m| m.name.as_deref() == Some("obj:curves"))
+            .flat_map(|m| m.primitives.iter())
+            .map(|p| p.positions.len())
+            .sum()
+    };
+
+    let at_ceiling = curve_len(oxideav_obj::obj::MAX_TESSELLATION_SAMPLES);
+    assert_eq!(
+        at_ceiling,
+        oxideav_obj::obj::MAX_TESSELLATION_SAMPLES as usize + 1
+    );
+    // Above the ceiling collapses onto the same result.
+    assert_eq!(
+        curve_len(oxideav_obj::obj::MAX_TESSELLATION_SAMPLES + 1),
+        at_ceiling
+    );
+    assert_eq!(curve_len(u32::MAX), at_ceiling);
+}
