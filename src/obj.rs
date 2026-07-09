@@ -48,6 +48,19 @@ enum Element {
     Point(Vec<FaceVert>),
 }
 
+impl Element {
+    /// Topology discriminant. A primitive can only hold elements of one
+    /// kind (each maps to a distinct `Topology`), so an incoming element
+    /// of a different kind opens a fresh primitive.
+    fn kind(&self) -> u8 {
+        match self {
+            Element::Face(_) => 0,
+            Element::Line(_) => 1,
+            Element::Point(_) => 2,
+        }
+    }
+}
+
 /// One open primitive — accumulates face/line elements while a single
 /// `usemtl` (or "no material") is active.
 #[derive(Debug, Default)]
@@ -93,12 +106,58 @@ struct MeshAccum {
     primitives: Vec<PrimAccum>,
 }
 
+impl PrimAccum {
+    /// A fresh primitive that inherits this one's active state
+    /// (material / groups / smoothing / merging / display attributes /
+    /// usemap) but starts with an empty element list. Used to split a
+    /// primitive when an element of an incompatible topology arrives
+    /// under unchanged state.
+    fn inherit_state(&self) -> PrimAccum {
+        PrimAccum {
+            elements: Vec::new(),
+            material: self.material.clone(),
+            smoothing_group: self.smoothing_group.clone(),
+            groups: self.groups.clone(),
+            merging_group: self.merging_group.clone(),
+            bevel: self.bevel.clone(),
+            c_interp: self.c_interp.clone(),
+            d_interp: self.d_interp.clone(),
+            lod: self.lod.clone(),
+            usemap: self.usemap.clone(),
+        }
+    }
+}
+
 impl MeshAccum {
     fn current_or_new(&mut self) -> &mut PrimAccum {
         if self.primitives.is_empty() {
             self.primitives.push(PrimAccum::default());
         }
         self.primitives.last_mut().unwrap()
+    }
+
+    /// Append an element (`f` / `l` / `p`), opening a fresh
+    /// state-inheriting primitive when the current one already holds an
+    /// element of a different topology kind. A single primitive maps to
+    /// a single `Topology`, so face / line / point elements never share
+    /// one — they split into one primitive per kind (spec-lenient: a
+    /// document that interleaves them under one `usemtl` is decoded
+    /// rather than rejected). This keeps the decoder's output a fixed
+    /// point: the encoder re-emits the per-topology primitives in order,
+    /// and a re-parse re-splits them identically.
+    fn push_element(&mut self, elt: Element) {
+        let prim = self.current_or_new();
+        if prim
+            .elements
+            .first()
+            .is_some_and(|e| e.kind() != elt.kind())
+        {
+            let mut fresh = prim.inherit_state();
+            fresh.elements.push(elt);
+            self.primitives.push(fresh);
+        } else {
+            prim.elements.push(elt);
+        }
     }
 }
 
@@ -617,7 +676,7 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                     )));
                 }
                 let mesh = doc.meshes.last_mut().unwrap();
-                mesh.current_or_new().elements.push(Element::Face(verts));
+                mesh.push_element(Element::Face(verts));
             }
             "l" => {
                 let n_pos = doc.positions.len() as i64;
@@ -633,13 +692,13 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                     )));
                 }
                 let mesh = doc.meshes.last_mut().unwrap();
-                mesh.current_or_new().elements.push(Element::Line(verts));
+                mesh.push_element(Element::Line(verts));
             }
             "p" => {
                 // Point elements are state-incompatible with face/line
-                // primitives (different `Topology`); mirror the `usemtl`
-                // pattern and split into a fresh primitive whenever the
-                // current one already holds incompatible elements.
+                // primitives (different `Topology`); `push_element`
+                // opens a fresh state-inheriting primitive whenever the
+                // current one already holds an incompatible-kind element.
                 let n_pos = doc.positions.len() as i64;
                 let n_tex = doc.texcoords.len() as i64;
                 let n_norm = doc.normals.len() as i64;
@@ -653,39 +712,7 @@ fn parse_obj_doc(text: &str) -> Result<ObjDoc> {
                     return Err(Error::invalid("p: needs ≥1 vertex"));
                 }
                 let mesh = doc.meshes.last_mut().unwrap();
-                let prim = mesh.current_or_new();
-                if prim
-                    .elements
-                    .iter()
-                    .any(|e| !matches!(e, Element::Point(_)))
-                {
-                    // Mixed-kind elements aren't representable; open a
-                    // fresh primitive that inherits material + groups +
-                    // smoothing/merging/display-attr state.
-                    let mat = prim.material.clone();
-                    let groups = prim.groups.clone();
-                    let smoothing = prim.smoothing_group.clone();
-                    let merging = prim.merging_group.clone();
-                    let bevel = prim.bevel.clone();
-                    let c_interp = prim.c_interp.clone();
-                    let d_interp = prim.d_interp.clone();
-                    let lod = prim.lod.clone();
-                    let usemap = prim.usemap.clone();
-                    mesh.primitives.push(PrimAccum {
-                        material: mat,
-                        groups,
-                        smoothing_group: smoothing,
-                        merging_group: merging,
-                        bevel,
-                        c_interp,
-                        d_interp,
-                        lod,
-                        usemap,
-                        elements: vec![Element::Point(verts)],
-                    });
-                } else {
-                    prim.elements.push(Element::Point(verts));
-                }
+                mesh.push_element(Element::Point(verts));
             }
             "bevel" | "c_interp" | "d_interp" | "lod" => {
                 // Display-attribute state-setting — `bevel on/off`,
