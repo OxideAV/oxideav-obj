@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95; fuzz target `parse_obj` sets the `generate_normals` option (harness had drifted from `ParseOptions`)
+
 ### Added
 
 - Round 376: the file's leading comment block now round-trips verbatim

@@ -1241,17 +1241,17 @@ pub fn serialize_mtl(materials: &[Material], textures: &[Texture]) -> Result<Vec
             } else {
                 writeln!(out, "Tf spectral {file} {}", fmt_f(factor)).unwrap();
             }
-        } else if let Some(serde_json::Value::Array(v)) = mat.extras.get("mtl:Tf:xyz") {
-            if let [a, b, c] = v.as_slice() {
-                writeln!(
-                    out,
-                    "Tf xyz {} {} {}",
-                    fmt_f(a.as_f64().unwrap_or(0.0) as f32),
-                    fmt_f(b.as_f64().unwrap_or(0.0) as f32),
-                    fmt_f(c.as_f64().unwrap_or(0.0) as f32)
-                )
-                .unwrap();
-            }
+        } else if let Some(serde_json::Value::Array(v)) = mat.extras.get("mtl:Tf:xyz")
+            && let [a, b, c] = v.as_slice()
+        {
+            writeln!(
+                out,
+                "Tf xyz {} {} {}",
+                fmt_f(a.as_f64().unwrap_or(0.0) as f32),
+                fmt_f(b.as_f64().unwrap_or(0.0) as f32),
+                fmt_f(c.as_f64().unwrap_or(0.0) as f32)
+            )
+            .unwrap();
         }
         // sharpness — scalar, MTL spec §"sharpness value".
         if let Some(v) = mat.extras.get("mtl:sharpness").and_then(|v| v.as_f64()) {
@@ -1540,17 +1540,17 @@ fn emit_color_statement(
             )
             .unwrap();
         }
-    } else if let Some(serde_json::Value::Array(v)) = extras.get(&rgb_key) {
-        if let [a, b, c] = v.as_slice() {
-            writeln!(
-                out,
-                "{keyword} {} {} {}",
-                fmt_f(a.as_f64().unwrap_or(0.0) as f32),
-                fmt_f(b.as_f64().unwrap_or(0.0) as f32),
-                fmt_f(c.as_f64().unwrap_or(0.0) as f32)
-            )
-            .unwrap();
-        }
+    } else if let Some(serde_json::Value::Array(v)) = extras.get(&rgb_key)
+        && let [a, b, c] = v.as_slice()
+    {
+        writeln!(
+            out,
+            "{keyword} {} {} {}",
+            fmt_f(a.as_f64().unwrap_or(0.0) as f32),
+            fmt_f(b.as_f64().unwrap_or(0.0) as f32),
+            fmt_f(c.as_f64().unwrap_or(0.0) as f32)
+        )
+        .unwrap();
     }
 }
 

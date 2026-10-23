@@ -2,7 +2,7 @@
 name = "oxideav-obj"
 version = "0.0.4"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 license = "MIT"
 authors = ["Mark Karpeles <admin@echelle.co.jp>"]
 description = "Pure-Rust Wavefront OBJ + MTL 3D mesh codec — implements oxideav-mesh3d's Decoder/Encoder traits"

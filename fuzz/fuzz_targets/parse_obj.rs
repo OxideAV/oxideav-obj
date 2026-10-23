@@ -73,7 +73,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_mesh3d::Mesh3DDecoder;
-use oxideav_obj::{obj, ObjDecoder};
+use oxideav_obj::{ObjDecoder, obj};
 
 fuzz_target!(|data: &[u8]| {
     // 1. High-level decoder via the trait surface. This is the path a
@@ -107,6 +107,7 @@ fuzz_target!(|data: &[u8]| {
         //    the separate `parse_mtl` fuzz target.
         let opts = obj::ParseOptions {
             curve_tessellation_samples: 4,
+            generate_normals: true,
         };
         let _ = obj::parse_obj_with_options(text, &opts, |_libname| Ok(Vec::new()));
     }

@@ -2013,13 +2013,13 @@ fn flush_block(
         // uniform budget, record the source resolution so a consumer can
         // tell the spec-driven density apart from the default (spec
         // §"ctech cparm res").
-        if let Some(res) = ctech_cparm_res {
-            if effective_samples != samples {
-                prim.extras.insert(
-                    "obj:curve_ctech_cparm_res".to_string(),
-                    serde_json::Value::from(res as f64),
-                );
-            }
+        if let Some(res) = ctech_cparm_res
+            && effective_samples != samples
+        {
+            prim.extras.insert(
+                "obj:curve_ctech_cparm_res".to_string(),
+                serde_json::Value::from(res as f64),
+            );
         }
 
         out.push(prim);
@@ -4392,7 +4392,7 @@ fn tessellate_surfaces(doc: &ObjDoc, samples: u32) -> Vec<Primitive> {
         // curv2d) triples after the keyword. Build the closed loop by
         // concatenating each segment in source order.
         let toks = &entry[1..];
-        if toks.len() < 3 || toks.len() % 3 != 0 {
+        if toks.len() < 3 || !toks.len().is_multiple_of(3) {
             return None;
         }
         let mut polygon: Vec<[f32; 2]> = Vec::new();
@@ -5472,7 +5472,7 @@ impl ScrvConstraint<'_> {
 /// The output is one normal per entry in `positions`.
 fn surface_vertex_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
     let mut acc = vec![[0.0f64; 3]; positions.len()];
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
         let (Some(&pa), Some(&pb), Some(&pc)) =
             (positions.get(a), positions.get(b), positions.get(c))
@@ -5670,7 +5670,7 @@ fn flush_surface(
         };
         let rows = if parm_v.len() > 2 {
             parm_v.len() + 1
-        } else if cols != 0 && total % cols == 0 {
+        } else if cols != 0 && total.is_multiple_of(cols) {
             total / cols
         } else {
             return None;
@@ -6016,16 +6016,16 @@ fn flush_surface(
     // effective lattice count is already reported through
     // `obj:surface_samples`). `cparmb` reports its single value in both
     // slots, exactly as it was applied.
-    if let Some((ures, vres)) = stech_cparm_res {
-        if samples != uniform_samples {
-            prim.extras.insert(
-                "obj:surface_stech_cparm_res".to_string(),
-                serde_json::Value::Array(vec![
-                    serde_json::Value::from(ures as f64),
-                    serde_json::Value::from(vres as f64),
-                ]),
-            );
-        }
+    if let Some((ures, vres)) = stech_cparm_res
+        && samples != uniform_samples
+    {
+        prim.extras.insert(
+            "obj:surface_stech_cparm_res".to_string(),
+            serde_json::Value::Array(vec![
+                serde_json::Value::from(ures as f64),
+                serde_json::Value::from(vres as f64),
+            ]),
+        );
     }
     // Spec §"Bezier" multi-patch decomposition — when the synthesised
     // grid contains more than one patch per direction, surface the
@@ -7914,7 +7914,7 @@ fn generate_face_normals(prim: &mut Primitive, smooth: bool) {
     let mut new_normals: Vec<[f32; 3]> = Vec::with_capacity(tri_indices.len());
     let mut new_indices: Vec<u32> = Vec::with_capacity(tri_indices.len());
 
-    for tri in tri_indices.chunks_exact(3) {
+    for tri in tri_indices.as_chunks::<3>().0 {
         let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
         let (Some(&pa), Some(&pb), Some(&pc)) = (
             prim.positions.get(a),
@@ -8006,10 +8006,12 @@ fn backfill_zero_normals(prim: &mut Primitive) {
     let geo = surface_vertex_normals(&prim.positions, &tri_indices);
     let normals = prim.normals.as_mut().unwrap();
     for (i, n) in normals.iter_mut().enumerate() {
-        if n[0] == 0.0 && n[1] == 0.0 && n[2] == 0.0 {
-            if let Some(&g) = geo.get(i) {
-                *n = g;
-            }
+        if n[0] == 0.0
+            && n[1] == 0.0
+            && n[2] == 0.0
+            && let Some(&g) = geo.get(i)
+        {
+            *n = g;
         }
     }
 }
@@ -8459,12 +8461,12 @@ pub fn serialize_obj_with_options(
     }
     // Replay any mtllib refs preserved on the scene itself when no
     // explicit basename was supplied.
-    if mtl_basename.is_none() {
-        if let Some(serde_json::Value::Array(list)) = scene.extras.get("obj:mtllibs") {
-            for entry in list {
-                if let Some(s) = entry.as_str() {
-                    writeln!(out, "mtllib {s}").unwrap();
-                }
+    if mtl_basename.is_none()
+        && let Some(serde_json::Value::Array(list)) = scene.extras.get("obj:mtllibs")
+    {
+        for entry in list {
+            if let Some(s) = entry.as_str() {
+                writeln!(out, "mtllib {s}").unwrap();
             }
         }
     }
@@ -8487,15 +8489,15 @@ pub fn serialize_obj_with_options(
     // `mtllib` and the vertex pool, so we mirror that. `Scene3D::extras`
     // carries plain strings populated by the decoder; absent keys leave
     // the preamble unchanged.
-    if let Some(serde_json::Value::String(name)) = scene.extras.get("obj:shadow_obj") {
-        if !name.is_empty() {
-            writeln!(out, "shadow_obj {name}").unwrap();
-        }
+    if let Some(serde_json::Value::String(name)) = scene.extras.get("obj:shadow_obj")
+        && !name.is_empty()
+    {
+        writeln!(out, "shadow_obj {name}").unwrap();
     }
-    if let Some(serde_json::Value::String(name)) = scene.extras.get("obj:trace_obj") {
-        if !name.is_empty() {
-            writeln!(out, "trace_obj {name}").unwrap();
-        }
+    if let Some(serde_json::Value::String(name)) = scene.extras.get("obj:trace_obj")
+        && !name.is_empty()
+    {
+        writeln!(out, "trace_obj {name}").unwrap();
     }
 
     // Spec §"General statement" — replay any captured `call` /
@@ -9146,7 +9148,7 @@ pub fn serialize_obj_with_options(
                         writeln!(out, "l {}", parts.join(" ")).unwrap();
                         chain.clear();
                     };
-                    for w in line_indices.chunks_exact(2) {
+                    for w in line_indices.as_chunks::<2>().0 {
                         let (a, b) = (w[0], w[1]);
                         if chain.is_empty() {
                             chain.push(a);
