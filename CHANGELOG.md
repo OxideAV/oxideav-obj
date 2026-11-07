@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-obj/compare/v0.0.5...v0.0.6) - 2026-11-07
+
+### Other
+
+- move the API-hygiene entry under [Unreleased]
+- API hygiene: non_exhaustive parse / serialize options and NormalGeneration
+
 ### Changed
 
 - `#[non_exhaustive]`: `obj::ParseOptions`, `obj::SerializeOptions` and `obj::NormalGeneration`. Code outside the crate builds the option records with `Default` plus the `with_*` setters and needs a `_ =>` arm when matching `NormalGeneration`.
