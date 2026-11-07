@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]`: `obj::ParseOptions`, `obj::SerializeOptions` and `obj::NormalGeneration`. Code outside the crate builds the option records with `Default` plus the `with_*` setters and needs a `_ =>` arm when matching `NormalGeneration`.
+
+### Added
+
+- `ParseOptions::with_curve_tessellation_samples` / `with_generate_normals`; `SerializeOptions::with_mtl_basename` / `with_negative_indices`.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-obj/compare/v0.0.4...v0.0.5) - 2026-10-23
 
 ### Fixed
@@ -39,14 +47,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - round 320 — variable-arity -o/-s/-t texture-map option flags
 - Round 315: smooth per-vertex normals on tessellated surf surfaces
 - refresh to current status, drop per-round changelog cruft
-
-### Changed
-
-- `#[non_exhaustive]`: `obj::ParseOptions`, `obj::SerializeOptions` and `obj::NormalGeneration`. Code outside the crate builds the option records with `Default` plus the `with_*` setters and needs a `_ =>` arm when matching `NormalGeneration`.
-
-### Added
-
-- `ParseOptions::with_curve_tessellation_samples` / `with_generate_normals`; `SerializeOptions::with_mtl_basename` / `with_negative_indices`.
 
 ### Changed
 
