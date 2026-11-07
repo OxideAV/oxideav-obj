@@ -105,10 +105,9 @@ fuzz_target!(|data: &[u8]| {
         //    iteration cost linearly with the number of `mtllib`
         //    lines). The MTL parse path gets its own coverage from
         //    the separate `parse_mtl` fuzz target.
-        let opts = obj::ParseOptions {
-            curve_tessellation_samples: 4,
-            generate_normals: obj::NormalGeneration::FromSmoothingGroups,
-        };
+        let opts = obj::ParseOptions::default()
+            .with_curve_tessellation_samples(4)
+            .with_generate_normals(obj::NormalGeneration::FromSmoothingGroups);
         let _ = obj::parse_obj_with_options(text, &opts, |_libname| Ok(Vec::new()));
     }
 

@@ -42,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `#[non_exhaustive]`: `obj::ParseOptions`, `obj::SerializeOptions` and `obj::NormalGeneration`. Code outside the crate builds the option records with `Default` plus the `with_*` setters and needs a `_ =>` arm when matching `NormalGeneration`.
+
+### Added
+
+- `ParseOptions::with_curve_tessellation_samples` / `with_generate_normals`; `SerializeOptions::with_mtl_basename` / `with_negative_indices`.
+
+### Changed
+
 - edition 2024, MSRV 1.95; fuzz target `parse_obj` sets the `generate_normals` option (harness had drifted from `ParseOptions`)
 
 ### Added

@@ -8047,6 +8047,7 @@ pub const MAX_TESSELLATION_SAMPLES: u32 = 4096;
 /// oversized budget can neither overflow the sample-index arithmetic
 /// nor demand an unbounded lattice allocation.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct ParseOptions {
     /// When > 0, every `curv` directive under an active `cstype bezier`
     /// / `cstype rat bezier` / `cstype bspline` / `cstype rat bspline`
@@ -8086,6 +8087,20 @@ pub struct ParseOptions {
     pub generate_normals: NormalGeneration,
 }
 
+impl ParseOptions {
+    /// Set `curve_tessellation_samples`.
+    pub fn with_curve_tessellation_samples(mut self, curve_tessellation_samples: u32) -> Self {
+        self.curve_tessellation_samples = curve_tessellation_samples;
+        self
+    }
+
+    /// Set `generate_normals`.
+    pub fn with_generate_normals(mut self, generate_normals: NormalGeneration) -> Self {
+        self.generate_normals = generate_normals;
+        self
+    }
+}
+
 /// Vertex-normal synthesis policy for polygonal faces with no `vn`
 /// data, honouring the OBJ smoothing-group state.
 ///
@@ -8096,6 +8111,7 @@ pub struct ParseOptions {
 /// smooth normals; one with smoothing off (or no `s` directive) gets
 /// faceted normals.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NormalGeneration {
     /// Leave `Primitive::normals == None` for faces with no `vn`
     /// references (the default; back-compat with the captured-only
@@ -8399,6 +8415,7 @@ where
 /// stable while letting the [`crate::ObjEncoder`] thread richer options
 /// through.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct SerializeOptions<'a> {
     /// Reference an external MTL file via an `mtllib <basename>.mtl`
     /// header line. Equivalent to the `mtl_basename` parameter on
@@ -8410,6 +8427,20 @@ pub struct SerializeOptions<'a> {
     /// caller wants their re-encoded OBJ to mirror an input that used
     /// negative indices throughout.
     pub negative_indices: bool,
+}
+
+impl<'a> SerializeOptions<'a> {
+    /// Set `mtl_basename`.
+    pub fn with_mtl_basename(mut self, mtl_basename: Option<&'a str>) -> Self {
+        self.mtl_basename = mtl_basename;
+        self
+    }
+
+    /// Set `negative_indices`.
+    pub fn with_negative_indices(mut self, negative_indices: bool) -> Self {
+        self.negative_indices = negative_indices;
+        self
+    }
 }
 
 /// Serialise a [`Scene3D`] to OBJ format.

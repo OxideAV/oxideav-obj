@@ -334,10 +334,7 @@ fn taylor_surface_roundtrip_emits_original_directive_block() {
 fn parse_obj_with_options_tessellates_taylor_surface() {
     let scene = obj::parse_obj_with_options(
         BILINEAR_TAYLOR_SURF,
-        &obj::ParseOptions {
-            curve_tessellation_samples: 2,
-            ..Default::default()
-        },
+        &obj::ParseOptions::default().with_curve_tessellation_samples(2),
         |_| Ok(Vec::new()),
     )
     .unwrap();
